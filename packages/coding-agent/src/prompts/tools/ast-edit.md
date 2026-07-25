@@ -1,4 +1,4 @@
-Structural AST-aware rewrites via ast-grep. Use for codemods where text replace is unsafe. Narrow each call to one language.
+Structural AST-aware rewrites via ast-grep. Use for codemods where text replace is unsafe. Mixed-language paths are fine: each file is parsed in its own language, and a pattern only rewrites files it parses in.
 
 - Metavariables in `pat` (`$A`, `$$$ARGS`) substitute into `out`.
 - **Patterns match AST structure, not text.** `$NAME` = one node; `$_` = unbound; `$$$NAME` = zero-or-more.

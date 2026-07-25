@@ -121,7 +121,7 @@ export class HashlineFilesystem extends Filesystem {
 			throw error;
 		}
 		// Refuse edits against generated files (lockfiles, models.json, …).
-		assertEditableFileContent(content, relativePath);
+		assertEditableFileContent(content, relativePath, this.session.settings);
 		return content;
 	}
 

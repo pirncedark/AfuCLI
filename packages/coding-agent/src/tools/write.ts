@@ -1215,7 +1215,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 
 			// Check if file exists and is auto-generated before overwriting
 			if (await fs.exists(absolutePath)) {
-				await assertEditableFile(absolutePath, path);
+				await assertEditableFile(absolutePath, path, this.session.settings);
 			}
 
 			const displayPath = formatPathRelativeToCwd(absolutePath, this.session.cwd);

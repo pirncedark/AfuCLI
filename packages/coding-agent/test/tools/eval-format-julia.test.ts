@@ -101,7 +101,7 @@ describe("formatJuliaForDisplay", () => {
 
 	it("never changes committed lines while a source prefix grows", () => {
 		const source =
-			String.raw`function stream();if ready;message = "end; $(join(["a;b"], ";"))";` +
+			`function stream();if ready;message = "end; $(join(["a;b"], ";"))";` +
 			"\n#= outer #= ; end =# catch =#\nwork();else;wait();end;end";
 		let prefix = "";
 		let committed = "";

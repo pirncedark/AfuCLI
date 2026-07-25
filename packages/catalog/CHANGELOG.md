@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [17.1.3] - 2026-07-24
+
+### Fixed
+
+- Disabled the first-event watchdog for local OpenAI-compatible backends while retaining the 300-second inter-event watchdog, so long llama.cpp prompt prefill is not canceled and retried ([#6524](https://github.com/can1357/oh-my-pi/issues/6524)).
+
 ## [17.1.1] - 2026-07-24
 
 ### Added

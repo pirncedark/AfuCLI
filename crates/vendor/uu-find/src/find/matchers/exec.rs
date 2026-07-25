@@ -82,7 +82,10 @@ impl Matcher for SingleExecMatcher {
 			// operand-relative `{}` against the shell cwd, not the host cwd.
 			command.current_dir(pi_uutils_ctx::cwd());
 		}
-		match command.status() {
+		command.env_clear().envs(pi_uutils_ctx::env_snapshot());
+		// The host process's stdio belongs to the embedding TUI; route the
+		// child's output through the scope streams instead of inheriting.
+		match pi_uutils_ctx::run_captured(&mut command) {
 			Ok(status) => status.success(),
 			Err(e) => {
 				writeln!(&mut stderr(), "Failed to run {}: {}", self.executable, e).unwrap();
@@ -132,7 +135,17 @@ impl MultiExecMatcher {
 	}
 
 	fn run_command(&self, command: &mut argmax::Command, matcher_io: &mut MatcherIO) {
-		match command.status() {
+		// `argmax::Command` only Derefs immutably into `std::process::Command`,
+		// so rebuild a std command from its accumulated state to attach the
+		// scope environment and context-captured stdio — the host process's
+		// stdio belongs to the embedding TUI and must never be inherited.
+		let mut std_command = Command::new(command.get_program());
+		std_command.args(command.get_args());
+		if let Some(dir) = command.get_current_dir() {
+			std_command.current_dir(dir);
+		}
+		std_command.env_clear().envs(pi_uutils_ctx::env_snapshot());
+		match pi_uutils_ctx::run_captured(&mut std_command) {
 			Ok(status) => {
 				if !status.success() {
 					matcher_io.set_exit_code(1);

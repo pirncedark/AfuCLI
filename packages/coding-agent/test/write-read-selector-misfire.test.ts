@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -32,12 +32,6 @@ async function makeWorkspace(): Promise<string> {
 }
 
 describe("write refuses read-selector misfires", () => {
-	beforeAll(async () => {
-		// assertEditableFile (auto-generated guard) reads the global settings proxy
-		// when overwriting an existing file.
-		await Settings.init({ inMemory: true });
-	});
-
 	it("fails closed on a missing selector-suffixed target with empty content and points at read()", async () => {
 		const dir = await makeWorkspace();
 		const write = new WriteTool(session(dir));

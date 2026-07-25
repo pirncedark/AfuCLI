@@ -1816,7 +1816,7 @@ export async function executePatchSingle(
 	const resolvedPath = resolvePlanPath(session, path);
 	const resolvedRename = rename ? resolvePlanPath(session, rename) : undefined;
 
-	await assertEditableFile(resolvedPath, path);
+	await assertEditableFile(resolvedPath, path, session.settings);
 
 	// Capture pre-edit content so we can verify the write actually hit disk.
 	// `LspFileSystem.writeFile` delegates to a writethrough callback that, in

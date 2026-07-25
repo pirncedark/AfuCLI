@@ -342,6 +342,45 @@ pub fn stdin() -> CtxStdin {
 	CtxStdin
 }
 
+/// Runs `command` with stdin from the null device and stdout/stderr piped
+/// back into the context streams, returning the child's exit status.
+///
+/// The context streams are in-process `Write` handles (pipes or in-memory
+/// buffers), not inheritable file descriptors, and the host process's own
+/// fd 0/1/2 belong to the TUI — a child must never inherit stdio. Child
+/// stdout streams into the context stdout on the calling thread while a
+/// helper thread drains stderr into a buffer (the context streams are
+/// thread-local to the scope thread, so the helper cannot write directly);
+/// the buffered stderr is forwarded once the child exits.
+///
+/// Callers remain responsible for `current_dir` and the scope environment
+/// (`env_clear().envs(env_snapshot())`).
+pub fn run_captured(command: &mut std::process::Command) -> io::Result<std::process::ExitStatus> {
+	command
+		.stdin(std::process::Stdio::null())
+		.stdout(std::process::Stdio::piped())
+		.stderr(std::process::Stdio::piped());
+	let mut child = command.spawn()?;
+
+	let mut child_err = child.stderr.take();
+	let stderr_thread = std::thread::spawn(move || {
+		let mut buf = Vec::new();
+		if let Some(err) = child_err.as_mut() {
+			let _ = err.read_to_end(&mut buf);
+		}
+		buf
+	});
+
+	if let Some(mut out) = child.stdout.take() {
+		let _ = io::copy(&mut out, &mut stdout());
+	}
+	let status = child.wait();
+	if let Ok(buf) = stderr_thread.join() {
+		let _ = stderr().write_all(&buf);
+	}
+	status
+}
+
 /// Generate the usage string for clap without evaluating argv-dependent
 /// statics.
 ///

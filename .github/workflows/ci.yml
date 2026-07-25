@@ -214,7 +214,9 @@ jobs:
 
    # Linux x64 baseline + modern: required by `test`, so it runs on every PR
    # unless native_artifact_lookup found a cached run. Release runs always
-   # rebuild for fresh artifacts.
+   # rebuild for fresh artifacts but skip clippy + Rust tests (skip_validation):
+   # the bump commit only changes version strings over content that already
+   # passed validation on its main-push run.
    native_linux_x64:
       name: "Native: Linux x64 (${{ matrix.variant }})"
       needs: [release_metadata, native_artifact_lookup]
@@ -236,6 +238,7 @@ jobs:
               variant: ${{ matrix.variant }}
               glibc: ${{ env.GLIBC_FLOOR }}
               rust_checks: ${{ matrix.rust_checks && 'true' || 'false' }}
+              skip_validation: ${{ needs.release_metadata.outputs.is-release }}
               save_cache: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
    # Pre-warm the cross-platform native build cache on `main`, in addition to

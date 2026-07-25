@@ -3023,6 +3023,25 @@ mod tests {
 			"-exec {{}} should be operand-relative and run in the shell cwd"
 		);
 
+		// -exec children must write through the scope streams — an inherited
+		// process stdout would bypass the shell redirect and spam the host
+		// TUI's terminal — and must see the shell's exported environment.
+		session
+			.shell
+			.run_string(
+				"export PI_EXEC_ENV=zed; find . -name keep.log -exec sh -c 'echo \"$PI_EXEC_ENV $1\"' \
+				 sh {} ';' > cap.txt",
+				&si,
+				&params,
+			)
+			.await
+			.expect("exec capture");
+		assert_eq!(
+			read("cap.txt"),
+			"zed ./keep.log\n",
+			"-exec child stdout must flow through the shell redirect with the shell's exported env"
+		);
+
 		let _ = std::fs::remove_dir_all(&tmp);
 	}
 

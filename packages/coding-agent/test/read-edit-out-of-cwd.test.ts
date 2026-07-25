@@ -1,9 +1,9 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
-import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EditTool, type ExecuteHashlineSingleOptions, executeHashlineSingle } from "@oh-my-pi/pi-coding-agent/edit";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import type { ReadToolDetails } from "@oh-my-pi/pi-coding-agent/tools/read";
@@ -16,12 +16,6 @@ function textOutput(result: AgentToolResult<ReadToolDetails>): string {
 		.map(c => c.text)
 		.join("\n");
 }
-
-beforeAll(async () => {
-	// The edit path's auto-generated-file guard reads the global Settings proxy.
-	resetSettingsForTest();
-	await Settings.init({ inMemory: true, cwd: process.cwd() });
-});
 
 function createSession(cwd: string, approvedPlan?: { artifactsDir: string; planFilePath: string }): ToolSession {
 	const settings = Settings.isolated();

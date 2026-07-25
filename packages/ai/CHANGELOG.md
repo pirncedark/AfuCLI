@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [17.1.3] - 2026-07-24
+
+### Fixed
+
+- Fixed Cursor sessions exposing `ast_edit` (and other staged-preview `xd://` devices) without a reachable resolver: the built-in `write` tool — which carries the `xd://resolve` / `xd://reject` transport that finalizes a staged preview — was filtered out of Cursor's forwarded catalog, so previews could never be resolved and the session aborted after three forced `write` turns. `write` is now re-included in the forwarded catalog whenever pi-agent devices are advertised ([#6536](https://github.com/can1357/oh-my-pi/issues/6536)).
+- Fixed OpenAI Responses and chat-completions streams honoring per-model first-event watchdog policy, allowing local llama.cpp-style backends to process arbitrarily large prompts without a premature client cancellation ([#6524](https://github.com/can1357/oh-my-pi/issues/6524)).
+
 ## [17.1.2] - 2026-07-24
 
 ### Added

@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [17.1.3] - 2026-07-24
+
+### Changed
+
+- `astEdit` without an explicit `lang` now rewrites mixed-language paths per file (each file parsed in its own inferred language, patterns compiled per language) instead of erroring when the path/glob spans multiple languages. A pattern that parses in no discovered language is still reported (or fails the call under `failOnParseError`); files whose language cannot be inferred surface as per-file parse errors instead of aborting the whole call.
+
 ## [17.1.2] - 2026-07-24
 
 ### Fixed

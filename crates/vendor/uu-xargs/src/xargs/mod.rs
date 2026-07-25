@@ -11,7 +11,7 @@ use std::{
 	fmt::Display,
 	fs,
 	io::{self, BufRead, BufReader, Read, Write},
-	process::{Command, ExitStatus, Stdio},
+	process::Command,
 };
 
 use clap::{Arg, ArgAction, crate_version, error::ErrorKind};
@@ -410,7 +410,7 @@ impl CommandBuilder<'_> {
 					.current_dir(pi_uutils_ctx::cwd())
 					.env_clear()
 					.envs(&self.options.env);
-				match run_command_captured(&mut command) {
+				match pi_uutils_ctx::run_captured(&mut command) {
 					Ok(status) => {
 						if status.success() {
 							Ok(CommandResult::Success)
@@ -456,42 +456,6 @@ impl CommandBuilder<'_> {
 			},
 		}
 	}
-}
-
-/// Runs `command` with stdin from the null device and stdout/stderr piped
-/// back into the context streams, returning the child's exit status.
-///
-/// The context streams are in-process `Write` handles (pipes or in-memory
-/// buffers), not inheritable file descriptors, and the host process's own
-/// fd 0/1/2 belong to the TUI — a child must never inherit stdio. Child
-/// stdout streams into the context stdout on the calling thread while a
-/// helper thread drains stderr into a buffer (the context streams are
-/// thread-local to the scope thread, so the helper cannot write directly);
-/// the buffered stderr is forwarded once the child exits.
-fn run_command_captured(command: &mut Command) -> io::Result<ExitStatus> {
-	command
-		.stdin(Stdio::null())
-		.stdout(Stdio::piped())
-		.stderr(Stdio::piped());
-	let mut child = command.spawn()?;
-
-	let mut child_err = child.stderr.take();
-	let stderr_thread = std::thread::spawn(move || {
-		let mut buf = Vec::new();
-		if let Some(err) = child_err.as_mut() {
-			let _ = err.read_to_end(&mut buf);
-		}
-		buf
-	});
-
-	if let Some(mut out) = child.stdout.take() {
-		let _ = io::copy(&mut out, &mut pi_uutils_ctx::stdout());
-	}
-	let status = child.wait();
-	if let Ok(buf) = stderr_thread.join() {
-		let _ = pi_uutils_ctx::stderr().write_all(&buf);
-	}
-	status
 }
 
 trait ArgumentReader {

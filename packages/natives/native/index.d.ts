@@ -246,7 +246,7 @@ export declare function __ompInstallTokioRuntime(): void
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV17_1_2(): void
+export declare function __piNativesV17_1_3(): void
 
 /**
  * Apply ast-grep rewrite rules to matching files; honors `dryRun` and returns
@@ -440,7 +440,10 @@ export interface AstReplaceFileChange {
 export interface AstReplaceOptions {
   /** Map of pattern string to replacement template. */
   rewrites?: Record<string, string>
-  /** Language override; otherwise inferred from discovered files. */
+  /**
+   * Language override applied to every file; otherwise inferred per file, so
+   * mixed-language paths rewrite each file in its own language.
+   */
   lang?: string
   /** Single file or directory to rewrite. */
   path?: string

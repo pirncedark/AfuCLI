@@ -2401,7 +2401,7 @@ function readCursorBlob(blobStore: Map<string, Uint8Array>, blobId: Uint8Array):
 
 const CURSOR_NATIVE_TOOL_NAMES = new Set(["bash", "read", "write", "delete", "ls", "grep", "lsp", "todo"]);
 
-function buildMcpToolDefinitions(tools: Tool[] | undefined): McpToolDefinition[] {
+export function buildMcpToolDefinitions(tools: Tool[] | undefined): McpToolDefinition[] {
 	if (!tools || tools.length === 0) {
 		return [];
 	}
@@ -2411,7 +2411,16 @@ function buildMcpToolDefinitions(tools: Tool[] | undefined): McpToolDefinition[]
 		return [];
 	}
 
-	return advertisedTools.map(tool => {
+	// The `write` tool doubles as the xd:// transport: forwarded devices such as
+	// `ast_edit` stage previews finalized only by writing a reason to xd://resolve
+	// or xd://reject. Cursor's native catalog may expose no write path, so
+	// re-include the built-in `write` (dropped as native above) whenever pi-agent
+	// devices are advertised — otherwise a staged preview can never be resolved
+	// and the SoftToolRequirement('write') escalation aborts the turn.
+	const writeTool = tools.find(tool => tool.name === "write");
+	const forwarded = writeTool ? [...advertisedTools, writeTool] : advertisedTools;
+
+	return forwarded.map(tool => {
 		const jsonSchema = toolWireSchema(tool);
 		const schemaValue: JsonValue =
 			jsonSchema && typeof jsonSchema === "object"

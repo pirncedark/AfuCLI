@@ -574,6 +574,7 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 		// to Moonshot verbatim, which 400s on non-MFJS constructs.
 		toolSchemaFlavor:
 			isMoonshotNative || isKimiModel ? "moonshot-mfjs" : isLocalOpenAICompatBackend ? "grammar" : undefined,
+		streamFirstEventTimeoutMs: isLocalServingBackend ? 0 : undefined,
 		streamIdleTimeoutMs,
 		stripDeepseekSpecialTokens:
 			isDeepseekModelIdOrName(spec.id) && (provider === "nvidia" || provider === "deepseek"),
@@ -723,6 +724,7 @@ export function buildOpenAIResponsesCompat(spec: OpenAIResponsesSpecLike): Resol
 		emptyLengthFinishIsContextError: spec.provider === "ollama",
 		usesOpenAIToolCallIdLimit: spec.provider === "openai",
 		promptCacheSessionHeader: spec.provider === "xai-oauth" ? "x-grok-conv-id" : undefined,
+		streamFirstEventTimeoutMs: isLocalServingBackend ? 0 : spec.compat?.streamFirstEventTimeoutMs,
 		streamIdleTimeoutMs: isLocalServingBackend
 			? LOCAL_OPENAI_COMPAT_STREAM_IDLE_TIMEOUT_MS
 			: spec.compat?.streamIdleTimeoutMs,
