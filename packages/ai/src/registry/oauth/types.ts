@@ -19,6 +19,14 @@ export type OAuthCredentials = {
 	orgId?: string;
 	/** Human-readable organization name for display (may embed the email). */
 	orgName?: string;
+	/**
+	 * Epoch ms of the interactive login that minted this grant. Set by
+	 * `AuthStorage.login`; token refreshes preserve it. Providers with an
+	 * absolute grant lifetime (Anthropic expires the whole refresh-token
+	 * family ~30 days after authorization regardless of rotation) use it to
+	 * surface re-login deadlines before the grant dies.
+	 */
+	authorizedAt?: number;
 };
 
 export type OAuthProvider = OAuthProviderUnion;
@@ -65,7 +73,8 @@ export interface OAuthProviderInfo {
 export interface OAuthController {
 	onAuth?(info: OAuthAuthInfo): void;
 	onProgress?(message: string): void;
-	onManualCodeInput?(): Promise<string>;
+	/** Request pasted callback input; stop any visible prompt when `signal` aborts. */
+	onManualCodeInput?(signal?: AbortSignal): Promise<string>;
 	onPrompt?(prompt: OAuthPrompt): Promise<string>;
 	signal?: AbortSignal;
 	fetch?: FetchImpl;
@@ -81,7 +90,8 @@ export interface OAuthProviderInterface {
 	readonly name: string;
 	readonly sourceId?: string;
 	login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials | string>;
-	refreshToken?(credentials: OAuthCredentials): Promise<OAuthCredentials>;
+	/** Refresh a stored grant; the signal bounds provider network work to refresh ownership. */
+	refreshToken?(credentials: OAuthCredentials, signal?: AbortSignal): Promise<OAuthCredentials>;
 	getApiKey?(credentials: OAuthCredentials): string;
 	/** Store resulting OAuth credentials under a different provider id. */
 	readonly storeCredentialsAs?: string;

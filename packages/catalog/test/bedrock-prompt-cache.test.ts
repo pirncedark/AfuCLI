@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { classifyModel, compareRevision, parseRevision } from "@oh-my-pi/pi-catalog/identity";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
 
@@ -19,6 +20,22 @@ function bedrockSpec(
 		maxTokens: 128_000,
 		...overrides,
 	};
+}
+
+function expectsAdaptiveDisplay(id: string): boolean {
+	const identity = classifyModel("amazon-bedrock", id, { lenient: true });
+	if (identity.class !== "anthropic" || identity.revision === undefined) return false;
+	const revision = parseRevision(identity.revision);
+	const floor = parseRevision(identity.family === "opus" ? "4.7" : "5");
+	return (
+		revision !== undefined &&
+		floor !== undefined &&
+		(identity.family === "opus" ||
+			identity.family === "sonnet" ||
+			identity.family === "fable" ||
+			identity.family === "mythos") &&
+		compareRevision(revision, floor) >= 0
+	);
 }
 
 describe("Bedrock prompt-cache compat", () => {
@@ -90,6 +107,9 @@ describe("Bedrock prompt-cache compat", () => {
 				supportsLongPromptCacheRetention: supportsLongRetention,
 				promptCacheMinimumTokens: minimumTokens,
 				promptCacheMaximumCheckpoints: minimumTokens === 0 ? 0 : 4,
+				// bedrockSpec is reasoning:true → keepalive-free idle floor applies
+				// (900s for the adaptive-thinking family, 600s otherwise).
+				streamIdleTimeoutMs: expectsAdaptiveDisplay(id) ? 900_000 : 600_000,
 			});
 		}
 	});
@@ -109,7 +129,11 @@ describe("Bedrock prompt-cache compat", () => {
 			"us.amazon.nova-premier-v1:0",
 			"global.amazon.nova-2-lite-v1:0",
 		] as const) {
-			expect(getBundledModel<"bedrock-converse-stream">("amazon-bedrock", id)?.compat).toEqual(expected);
+			const model = getBundledModel<"bedrock-converse-stream">("amazon-bedrock", id);
+			expect(model?.compat).toEqual({
+				...expected,
+				streamIdleTimeoutMs: model?.reasoning ? 600_000 : undefined,
+			});
 		}
 
 		// AWS documents in-region model IDs plus geo/global inference-profile IDs.
@@ -125,7 +149,7 @@ describe("Bedrock prompt-cache compat", () => {
 			"jp.amazon.nova-2-lite-v1:0",
 			"global.amazon.nova-2-lite-v1:0",
 		] as const) {
-			expect(buildModel(bedrockSpec({ id })).compat).toEqual(expected);
+			expect(buildModel(bedrockSpec({ id })).compat).toEqual({ ...expected, streamIdleTimeoutMs: 600_000 });
 		}
 	});
 

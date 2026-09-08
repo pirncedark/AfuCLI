@@ -121,6 +121,54 @@ describe("AuthStorage OAuth account selection", () => {
 		}
 	});
 
+	test("getOAuthAccessByCredentialId refreshes only the durable requested row", async () => {
+		const storage = authStorage;
+		if (!storage) throw new Error("test setup failed");
+		const seen: string[] = [];
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
+			const credential = credentials[provider];
+			if (!credential) return null;
+			seen.push(credential.access);
+			return { newCredentials: credential, apiKey: credential.access };
+		});
+		await storage.set(PROVIDER, [oauthCredential("a"), oauthCredential("b"), oauthCredential("c")]);
+		const target = storage.listOAuthAccounts(PROVIDER)[1];
+		if (!target) throw new Error("expected second OAuth account");
+
+		const result = await storage.getOAuthAccessByCredentialId(PROVIDER, target.credentialId, { forceRefresh: true });
+
+		expect(result?.ok).toBe(true);
+		if (!result?.ok) throw new Error("expected ok resolution");
+		expect(result.credentialId).toBe(target.credentialId);
+		expect(result.accountId).toBe("acc-b");
+		expect(result.accessToken).toBe("access-b");
+		expect(seen).toEqual(["access-b"]);
+	});
+
+	test("getOAuthAccessByCredentialId does not substitute a sibling on failure", async () => {
+		const storage = authStorage;
+		if (!storage) throw new Error("test setup failed");
+		const seen: string[] = [];
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
+			const credential = credentials[provider];
+			if (!credential) return null;
+			seen.push(credential.access);
+			if (credential.accountId === "acc-b") throw new Error("invalid_grant");
+			return { newCredentials: credential, apiKey: credential.access };
+		});
+		await storage.set(PROVIDER, [oauthCredential("a"), oauthCredential("b"), oauthCredential("c")]);
+		const target = storage.listOAuthAccounts(PROVIDER)[1];
+		if (!target) throw new Error("expected second OAuth account");
+
+		const result = await storage.getOAuthAccessByCredentialId(PROVIDER, target.credentialId);
+
+		expect(result?.ok).toBe(false);
+		if (!result || result.ok) throw new Error("expected failed resolution");
+		expect(result.credentialId).toBe(target.credentialId);
+		expect(result.accountId).toBe("acc-b");
+		expect(seen).toEqual(["access-b"]);
+	});
+
 	test("getOAuthAccessAt returns undefined for an out-of-range position", async () => {
 		const storage = authStorage;
 		if (!storage) throw new Error("test setup failed");

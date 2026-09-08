@@ -27,6 +27,15 @@ const QUESTION_PROMPT_RE =
 const USER_DIRECTED_PROMPT_RE = /\b(?:you|your|we|our)\b/i;
 const USER_RESPONSE_CUE_RE =
 	/^(?:please\s+)?(?:confirm|reply|choose|pick|decide|advise)\b|^(?:please\s+)?answer\b|^(?:please\s+)?(?:let\s+me\s+know|tell\s+me)\b/i;
+/**
+ * A trailing question mark is the universal signal that a line is a question, but
+ * the English word/pronoun gates above exist to filter incidental "?" out of prose
+ * (e.g. a TypeScript `foo?: string` tail). Non-English text has no cheap word list,
+ * yet any non-ASCII character in a "?"/"？"-terminated line reliably marks it as
+ * genuine prose — CJK/Japanese/Korean, Spanish `¿…?`, accented Latin — so treat it
+ * as a real user-directed question. Fixes non-Latin prompts going undetected (#7803).
+ */
+const NON_ASCII_TEXT_RE = /[^\x00-\x7F]/;
 
 interface PromptLine {
 	text: string;
@@ -41,12 +50,15 @@ export interface TodoTrackerHost {
 	model(): Model | undefined;
 	agentKind(): "main" | "sub";
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
-	scheduleAgentContinue(options: { generation?: number }): void;
+	scheduleAgentContinue(options: { source: string; generation?: number }): void;
 	promptGeneration(): number;
 	hasPendingAsyncWake(): boolean;
 	getActiveToolNames(): string[];
+	getEnabledToolNames(): string[];
 	toolRegistry(): Map<string, AgentTool>;
 	planModeEnabled(): boolean;
+	/** Whether prewalk will hand off after its plan nudge owns todo creation. */
+	prewalkWillHandoff(): boolean;
 	consumeLastServedToolChoiceLabel(): string | undefined;
 }
 
@@ -124,6 +136,9 @@ export class TodoTracker {
 		const mode = this.#host.settings.get("todo.eager");
 		if (mode === "default" || !this.#host.settings.get("todo.enabled")) return undefined;
 		if (this.#host.planModeEnabled() || this.#phases.length > 0) return undefined;
+		// An actionable prewalk drives todo creation in a plan-first-then-todo order;
+		// the forced eager prelude's "call todo first this turn" contradicts it (#10510).
+		if (this.#host.prewalkWillHandoff()) return undefined;
 		if (promptText !== undefined) {
 			if (this.#host.agent.state.messages.some(message => message.role === "user")) return undefined;
 			const trimmedPromptText = promptText.trimEnd();
@@ -164,7 +179,7 @@ export class TodoTracker {
 			const trimmed = promptText.trimEnd();
 			if (trimmed.endsWith("?") || trimmed.endsWith("!")) return undefined;
 		}
-		if (!this.#host.getActiveToolNames().includes("task")) return undefined;
+		if (!this.#host.getEnabledToolNames().includes("task")) return undefined;
 		return {
 			role: "custom",
 			customType: "eager-task-prelude",
@@ -270,7 +285,10 @@ export class TodoTracker {
 		this.#reminderAwaitingProgress = true;
 		this.#host.agent.appendMessage(reminderMessage);
 		this.#host.sessionManager.appendMessage(reminderMessage);
-		this.#host.scheduleAgentContinue({ generation: this.#host.promptGeneration() });
+		this.#host.scheduleAgentContinue({
+			source: "todo-reminder",
+			generation: this.#host.promptGeneration(),
+		});
 		return true;
 	}
 
@@ -361,7 +379,8 @@ function isQuestionPromptLine(line: string): boolean {
 	return (
 		candidate.hadPromptLabel ||
 		QUESTION_PROMPT_RE.test(candidate.text) ||
-		USER_DIRECTED_PROMPT_RE.test(candidate.text)
+		USER_DIRECTED_PROMPT_RE.test(candidate.text) ||
+		NON_ASCII_TEXT_RE.test(candidate.text)
 	);
 }
 

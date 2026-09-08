@@ -1,5 +1,7 @@
 import * as fs from "node:fs";
-import { workerHostEntry } from "@oh-my-pi/pi-utils";
+import * as path from "node:path";
+import { getStatsDbPath, workerHostEntry } from "@oh-my-pi/pi-utils";
+import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import {
 	getRecentErrors as dbGetRecentErrors,
 	getRecentRequests as dbGetRecentRequests,
@@ -41,12 +43,31 @@ import type { SyncWorkerRequest, SyncWorkerResponse } from "./sync-worker";
 import type {
 	BehaviorDashboardStats,
 	DashboardStats,
+	FolderStats,
 	MessageStats,
 	ProviderDashboardStats,
 	RequestDetails,
 	ToolDashboardStats,
 } from "./types";
-import { computeUsageWindowStats, fetchUsageSnapshots } from "./usage-windows";
+import { computeUsageWindowStats, fetchUsageData } from "./usage-windows";
+
+const STATS_SYNC_LOCK_RETRY_MS = 25;
+const STATS_SYNC_LOCK_WAIT_MS = 60 * 60 * 1000;
+
+/**
+ * Serialize stats ingestion and archive reconciliation across processes.
+ * The lock covers file discovery, parsing, and the final SQLite write so a
+ * parse result for a session moved by GC can never commit after cleanup.
+ * The native lock is owned by an operating-system primitive, so an interrupted
+ * owner is released automatically and a live owner is never displaced.
+ */
+export async function withStatsSyncLock<T>(dbPath: string, fn: () => Promise<T>): Promise<T> {
+	await fs.promises.mkdir(path.dirname(dbPath), { recursive: true });
+	return await withFileLock(`${dbPath}.sync`, fn, {
+		retryDelayMs: STATS_SYNC_LOCK_RETRY_MS,
+		retries: Math.ceil(STATS_SYNC_LOCK_WAIT_MS / STATS_SYNC_LOCK_RETRY_MS),
+	});
+}
 
 /**
  * Apply a freshly parsed result to the database. Runs entirely on the
@@ -218,6 +239,10 @@ export async function smokeTestSyncWorker({ timeoutMs = 5_000 }: { timeoutMs?: n
  * bar walks at a steady rate).
  */
 export async function syncAllSessions(opts?: SyncOptions): Promise<{ processed: number; files: number }> {
+	return withStatsSyncLock(getStatsDbPath(), () => syncAllSessionsLocked(opts));
+}
+
+async function syncAllSessionsLocked(opts?: SyncOptions): Promise<{ processed: number; files: number }> {
 	await initDb();
 
 	const files = await listAllSessionFiles();
@@ -454,6 +479,13 @@ export async function getCostDashboardStats(range?: string | null): Promise<Pick
 		costSeries: getCostTimeSeries(costSeriesDays, cutoff),
 	};
 }
+
+export async function getFolderStats(range?: string | null): Promise<FolderStats[]> {
+	await initDb();
+	const { cutoff } = getTimeRangeConfig(range);
+	return getStatsByFolder(cutoff ?? undefined);
+}
+
 export async function getRecentRequests(limit?: number): Promise<MessageStats[]> {
 	await initDb();
 	return dbGetRecentRequests(limit);
@@ -520,14 +552,18 @@ export async function getToolDashboardStats(range?: string | null): Promise<Tool
  * Get the providers dashboard payload: per-provider totals, peak-burn-hours
  * histogram, provider token time series, and subscription-window analytics
  * (utilization series + insights) derived from recorded usage-limit snapshots.
+ *
+ * Window token estimates use broker-held fleet token burn when a broker is
+ * configured — the window fractions cover every install sharing the broker's
+ * credentials, so dividing them into local-only tokens would undercount.
  */
 export async function getProviderDashboardStats(range?: string | null): Promise<ProviderDashboardStats> {
 	await initDb();
 	const { modelSeriesDays, modelSeriesBucketMs, cutoff } = getTimeRangeConfig(range);
 	const providers = getStatsByProvider(cutoff ?? undefined);
-	const tokensByProvider = new Map(providers.map(p => [p.provider, p.totalTokens]));
-	const snapshots = await fetchUsageSnapshots(cutoff ?? 0);
-	const { usageSeries, windowInsights } = computeUsageWindowStats(snapshots, tokensByProvider);
+	const usage = await fetchUsageData(cutoff ?? 0);
+	const tokensByProvider = usage.fleetTokensByProvider ?? new Map(providers.map(p => [p.provider, p.totalTokens]));
+	const { usageSeries, windowInsights } = computeUsageWindowStats(usage.rows, tokensByProvider);
 	return {
 		providers,
 		hourly: getProviderHourlyBurn(cutoff ?? undefined),

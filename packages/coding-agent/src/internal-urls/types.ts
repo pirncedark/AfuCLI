@@ -1,11 +1,13 @@
 /**
  * Types for the internal URL routing system.
  *
- * Internal URLs (`agent://`, `artifact://`, `history://`, `issue://`, `local://`, `mcp://`, `memory://`, `omp://`, `pr://`, `rule://`, `skill://`, `ssh://`, `vault://`, and `xd://`) are resolved by tools like read,
+ * Internal URLs (`agent://`, `artifact://`, `history://`, `issue://`, `local://`, `mcp://`, `memory://`, `omp://`, `pr://`, `rule://`, `security://`, `skill://`, `ssh://`, `vault://`, and `xd://`) are resolved by tools like read,
  * providing access to agent outputs and server resources without exposing filesystem paths.
  */
 
+import type { Rule } from "../capability/rule";
 import type { Skill } from "../extensibility/skills";
+import type { AgentRegistry } from "../registry/agent-registry";
 import type { LocalProtocolOptions } from "./local-protocol";
 
 /**
@@ -70,6 +72,12 @@ export interface InternalUrl extends URL {
 	 * Raw pathname extracted from input, preserving traversal markers before URL normalization.
 	 */
 	rawPathname?: string;
+	/**
+	 * Exact input string this URL was parsed from, before any normalization.
+	 * Set by `parseInternalUrl`; used where byte-exact URI matching matters
+	 * (e.g. MCP resource URIs compared by string equality).
+	 */
+	rawHref?: string;
 }
 
 /**
@@ -83,6 +91,24 @@ export interface InternalUrl extends URL {
 export interface ResolveContext {
 	/** Working directory of the calling session. */
 	cwd?: string;
+	/**
+	 * Calling session's session file. Handlers that resolve agent ids which may
+	 * be parked (`history://<id>`, `agent://<id>`) refresh the caller's
+	 * persisted roster against this root before registry lookup, so a
+	 * same-named id restored by another root's scan never shadows this
+	 * caller's own transcript or output. Absent when the caller has no session
+	 * file: those handlers keep their existing in-memory behavior.
+	 */
+	sessionFile?: string;
+	/**
+	 * Calling session's stable session-manager id. Sessions that have no
+	 * session file yet (SDK, embedded, `-p`) are only addressable by this id,
+	 * so handlers that must bind a URL to its caller (`memory://`) accept it
+	 * as a second exact identity alongside {@link sessionFile}.
+	 */
+	sessionId?: string;
+	/** Registry that owns the calling session; defaults to the process-wide registry. */
+	agentRegistry?: AgentRegistry;
 	/** Settings of the calling session (used by `issue://`/`pr://` for cache TTLs). */
 	settings?: unknown;
 	/** Caller's abort signal. */
@@ -100,6 +126,15 @@ export interface ResolveContext {
 	localProtocolOptions?: LocalProtocolOptions;
 	/** Calling session's loaded skills. Prefer this over process-global skill state. */
 	skills?: readonly Skill[];
+	/**
+	 * Calling session's agent-scoped applicable rule set (rulebook + always-apply
+	 * + triggered TTSR rules, already bucketed by `agents` frontmatter). Prefer
+	 * this over the process-global snapshot — the global one reflects only the
+	 * top-level session, so a subagent-only rule is unresolvable through it
+	 * even though the subagent's own system prompt tells it to read
+	 * `rule://<name>`.
+	 */
+	rules?: readonly Rule[];
 	/** Session-bound `xd://` documentation resolver. */
 	xd?: {
 		read(name: string | null): Promise<string>;

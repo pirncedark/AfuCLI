@@ -7,9 +7,11 @@ import {
 	generateSessionTitle,
 	setExtensionTerminalTitle,
 	setSessionTerminalTitle,
+	setTerminalTitle,
 	setTerminalTitleState,
 } from "@oh-my-pi/pi-coding-agent/utils/title-generator";
 import { logger, setTerminalHeadless } from "@oh-my-pi/pi-utils";
+import { mockWindowsConsoleTitle, type WindowsConsoleTitleMock } from "./terminal-title-test-utils";
 
 function getModelOrThrow(id: string): Model<Api> {
 	const model = getBundledModel("anthropic", id);
@@ -579,10 +581,10 @@ describe("title generator", () => {
 
 // The terminal title runtime is a module-global. `emitTerminalTitle()` composes
 // the emitted OSC title from three inputs — an extension override, a run-state
-// separator (spinner frame / `>` / `!` between the `π` brand and the session
-// label), and the session label — and writes it to
+// separator (spinner frame, static Windows `:`, `>`, or `!` between the `π`
+// brand and the session label), and the session label — and writes it to
 // `process.stdout` as `ESC]0;<title>BEL`. These tests pin the observable
-// contract at that sink: what STRING actually reaches the terminal after a
+// contract at that sink: what string actually reaches the terminal after a
 // given sequence of the exported state transitions.
 //
 // Two seams must be opened for the real write to happen under `bun test`:
@@ -602,6 +604,7 @@ describe("terminal title runtime", () => {
 	let stdoutSpy: { mockRestore(): void } | undefined;
 	let prevHeadless = false;
 	let ttyDescriptor: PropertyDescriptor | undefined;
+	let windowsTitleMock: WindowsConsoleTitleMock | undefined;
 
 	// Titles emitted (newest last) since the last reset of `writes`; used across
 	// every assertion, so the OSC extraction lives here rather than at each site.
@@ -619,6 +622,7 @@ describe("terminal title runtime", () => {
 		ttyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
 		Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
 
+		windowsTitleMock = mockWindowsConsoleTitle();
 		writes = [];
 		stdoutSpy = spyOn(process.stdout, "write").mockImplementation((chunk: unknown) => {
 			writes.push(typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk as Uint8Array));
@@ -638,6 +642,8 @@ describe("terminal title runtime", () => {
 	afterEach(() => {
 		// Stop any spinner timer started during a test before tearing spies down.
 		disposeTerminalTitleState();
+		windowsTitleMock?.restore();
+		windowsTitleMock = undefined;
 		stdoutSpy?.mockRestore();
 		stdoutSpy = undefined;
 		if (ttyDescriptor) Object.defineProperty(process.stdout, "isTTY", ttyDescriptor);
@@ -698,14 +704,68 @@ describe("terminal title runtime", () => {
 		expect(last).not.toContain("Stale extension title");
 	});
 
-	it("dedupes: emitting the same computed title twice writes to the terminal once", () => {
-		// CONTRACT: emission is deduped via `lastEmitted`; a redundant set is a no-op.
-		setSessionTerminalTitle("dup-session");
-		expect(writes.length).toBe(1);
-		expect(emittedTitles().at(-1)).toContain("dup-session");
+	it("dedupes direct writes after sanitizing the title", () => {
+		setTerminalTitle("direct title\u0000");
+		setTerminalTitle("direct title");
 
-		setSessionTerminalTitle("dup-session");
-		// Second identical set produced no additional write.
-		expect(writes.length).toBe(1);
+		expect(emittedTitles()).toEqual(["direct title"]);
+		expect(writes).toHaveLength(1);
+	});
+
+	it("keeps the working title static with ':' on Windows", () => {
+		const originalPlatform = process.platform;
+		try {
+			Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+			setSessionTerminalTitle("windows-project");
+			writes.length = 0;
+
+			setTerminalTitleState("working");
+			expect(emittedTitles()).toEqual(["π : windows-project"]);
+
+			writes.length = 0;
+			vi.advanceTimersByTime(400);
+			expect(writes).toEqual([]);
+		} finally {
+			Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+		}
+	});
+
+	it("keeps the working title static under WSL", () => {
+		const originalPlatform = process.platform;
+		const originalWslDistro = process.env.WSL_DISTRO_NAME;
+		try {
+			Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+			process.env.WSL_DISTRO_NAME = "Ubuntu";
+			setSessionTerminalTitle("wsl-project");
+			writes.length = 0;
+
+			setTerminalTitleState("working");
+			expect(emittedTitles()).toEqual(["π : wsl-project"]);
+
+			writes.length = 0;
+			vi.advanceTimersByTime(400);
+			expect(writes).toEqual([]);
+		} finally {
+			if (originalWslDistro === undefined) delete process.env.WSL_DISTRO_NAME;
+			else process.env.WSL_DISTRO_NAME = originalWslDistro;
+			Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+		}
+	});
+
+	it("uses SetConsoleTitleW without an OSC write on Windows", () => {
+		const originalPlatform = process.platform;
+		const native = windowsTitleMock;
+		if (!native) throw new Error("Windows console title mock not initialized");
+		native.succeeds = true;
+		try {
+			Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+			setTerminalTitle("native Ω");
+			setTerminalTitle("native Ω");
+
+			expect(native.titles).toEqual(["native Ω"]);
+			expect(writes).toEqual([]);
+		} finally {
+			Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+		}
 	});
 });

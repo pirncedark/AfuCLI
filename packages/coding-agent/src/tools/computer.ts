@@ -1,433 +1,292 @@
-import type {
-	AgentTool,
-	AgentToolContext,
-	AgentToolResult,
-	AgentToolUpdateCallback,
-	ToolApprovalDecision,
-} from "@oh-my-pi/pi-agent-core";
-import type { ComputerAction, ComputerSafetyCheck, ComputerToolCallMetadata } from "@oh-my-pi/pi-ai";
-import type {
-	DesktopAction,
-	DesktopCapabilities,
-	DesktopCapture,
-	DesktopDisplay,
-	DesktopSessionOptions,
-} from "@oh-my-pi/pi-natives";
-import { prompt, sanitizeText } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
+import { type Type, type } from "@oh-my-pi/omptype";
+import type { AgentToolResult, ToolApprovalDecision } from "@oh-my-pi/pi-agent-core";
+import type { Model } from "@oh-my-pi/pi-ai";
+import { classifyModel } from "@oh-my-pi/pi-catalog/identity";
+import type { DesktopCapabilities } from "@oh-my-pi/pi-natives";
+import { once } from "@oh-my-pi/pi-utils";
+import { callSessionTool } from "../eval/js/tool-bridge";
+import type { EvalPreludeContext, EvalPreludeDefinition } from "../eval/preludes";
 import computerDescription from "../prompts/tools/computer.md" with { type: "text" };
-import { truncateForPrompt } from "./approval";
+import { enforceInlineByteCap } from "../session/streaming-output";
+import { type ComputerCallStep, isReadOnlyComputerCall, renderComputerCall } from "./computer/call";
+import type { ComputerScreenshot, ComputerSessionSnapshot } from "./computer/protocol";
+// @ts-expect-error Bun imports this declaration source as text instead of a TypeScript module.
+import computerCodeModeDeclarations from "./computer/declarations.d.ts" with { type: "text" };
+// @ts-expect-error Bun imports this JavaScript source as text instead of evaluating its module shape.
+import computerJavascript from "./computer/prelude.js" with { type: "text" };
+import computerPython from "./computer/prelude.py" with { type: "text" };
 import { type ComputerController, ComputerSupervisor, registerComputerController } from "./computer/supervisor";
 import type { ToolSession } from "./index";
+import { renderFunctionRun } from "./run-code";
 import { ToolError, throwIfAborted } from "./tool-errors";
+import { clampTimeout } from "./tool-timeouts";
 
-// Desktop actions cross the N-API boundary as i32; out-of-range JS numbers
-// must fail closed here instead of truncating in the napi conversion.
-const INT32_MIN = -2_147_483_648;
-const INT32_MAX = 2_147_483_647;
+// Image transports that cannot preserve native screenshot detail resize frames
+// without returning transformed dimensions. Keep their native coordinate frames
+// below the empirically verified threshold so pointer actions match what the
+// model sees. Claude paths predate the resolved transport capability and retain
+// their established model-family fallback.
+const COORDINATE_SAFE_MAX_CAPTURE_WIDTH = 1280;
+const COORDINATE_SAFE_MAX_CAPTURE_HEIGHT = 896;
 
-const coordinateSchema = type("0 <= number.integer <= 2147483647");
-const scrollDeltaSchema = type("-2147483648 <= number.integer <= 2147483647");
-
-const pointSchema = type({
-	x: coordinateSchema.describe("x pixel coordinate"),
-	y: coordinateSchema.describe("y pixel coordinate"),
-	"+": "reject",
-});
-
-const computerActionSchema = type({
-	type: type(
-		"'click' | 'double_click' | 'drag' | 'keypress' | 'move' | 'screenshot' | 'scroll' | 'type' | 'wait'",
-	).describe("action kind"),
-	"x?": coordinateSchema.describe(
-		"x pixel coordinate in the most recent screenshot (click, double_click, move, scroll)",
-	),
-	"y?": coordinateSchema.describe(
-		"y pixel coordinate in the most recent screenshot (click, double_click, move, scroll)",
-	),
-	"button?": type("'left' | 'right' | 'wheel' | 'back' | 'forward'").describe("mouse button; required for click"),
-	"path?": pointSchema.array().atLeastLength(2).describe("waypoints from press to release; required for drag"),
-	"keys?": type("string[] | null").describe(
-		"key names (e.g. CTRL, SHIFT, ENTER, A); required chord for keypress, optional held modifiers for pointer actions",
-	),
-	"scroll_x?": scrollDeltaSchema.describe("horizontal scroll delta in pixels; required for scroll"),
-	"scroll_y?": scrollDeltaSchema.describe(
-		"vertical scroll delta in pixels, positive scrolls content down; required for scroll",
-	),
-	"text?": type("string").describe("literal text to type; required for type"),
-	"+": "reject",
-});
-
-const computerSchema = type({
-	"actions?": computerActionSchema
-		.array()
-		.describe("ordered actions executed as one batch; omit or pass [] to just capture a screenshot"),
-	"+": "reject",
-});
-
-export type ComputerParams = typeof computerSchema.infer;
-
-export interface ComputerToolDetails {
-	width: number;
-	height: number;
-	backend: DesktopCapture["backend"];
-	displayServer?: string;
-	capturePermission: string;
-	inputPermission: string;
-	displays: DesktopDisplay[];
-	capabilities?: DesktopCapabilities;
-	actions: ComputerAction["type"][];
-}
-
-export type ComputerControllerFactory = (options: DesktopSessionOptions) => ComputerController;
-
-function isInt32(value: unknown): value is number {
-	return typeof value === "number" && Number.isInteger(value) && value >= INT32_MIN && value <= INT32_MAX;
-}
-
-function isCoordinate(value: unknown): value is number {
-	return isInt32(value) && value >= 0;
-}
-
-type AllowedFields = Record<string, true>;
-
-const POINT_FIELDS: AllowedFields = { x: true, y: true };
-const MOUSE_BUTTONS: AllowedFields = { left: true, right: true, wheel: true, back: true, forward: true };
-const ACTION_FIELDS: Record<ComputerAction["type"], AllowedFields> = {
-	click: { type: true, button: true, x: true, y: true, keys: true },
-	double_click: { type: true, x: true, y: true, keys: true },
-	drag: { type: true, path: true, keys: true },
-	keypress: { type: true, keys: true },
-	move: { type: true, x: true, y: true, keys: true },
-	screenshot: { type: true },
-	scroll: { type: true, x: true, y: true, scroll_x: true, scroll_y: true, keys: true },
-	type: { type: true, text: true },
-	wait: { type: true },
-};
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function fieldsForAction(actionType: string): AllowedFields | undefined {
-	switch (actionType) {
-		case "click":
-		case "double_click":
-		case "drag":
-		case "keypress":
-		case "move":
-		case "screenshot":
-		case "scroll":
-		case "type":
-		case "wait":
-			return ACTION_FIELDS[actionType];
-		default:
-			return undefined;
-	}
-}
-
-function hasOnlyFields(value: Record<string, unknown>, allowed: AllowedFields): boolean {
-	return Object.keys(value).every(key => allowed[key] === true);
-}
-
-function isPoint(value: unknown): value is { x: number; y: number } {
-	return isRecord(value) && hasOnlyFields(value, POINT_FIELDS) && isCoordinate(value.x) && isCoordinate(value.y);
-}
-
-function isStringArray(value: unknown): value is string[] {
-	return Array.isArray(value) && value.every(item => typeof item === "string");
-}
-
-function modifierBit(value: string): number {
-	switch (value.trim().toUpperCase()) {
-		case "CTRL":
-		case "CONTROL":
-			return 1;
-		case "SHIFT":
-			return 2;
-		case "ALT":
-		case "OPTION":
-			return 4;
-		case "META":
-		case "CMD":
-		case "COMMAND":
-		case "SUPER":
-		case "WINDOWS":
-			return 8;
-		default:
-			return 0;
-	}
-}
-
-function isModifierArray(value: unknown): value is string[] | null | undefined {
-	if (value == null) return true;
-	if (!isStringArray(value)) return false;
-	let seen = 0;
-	for (const entry of value) {
-		for (const component of entry.split("+")) {
-			const bit = modifierBit(component);
-			if (bit === 0 || (seen & bit) !== 0) return false;
-			seen |= bit;
-		}
-	}
-	return true;
-}
-
-function isKeypressArray(value: unknown): value is string[] {
+function usesCoordinateSafeImageSizing(model: Model | undefined): boolean {
+	if (!model) return false;
+	const compat = model.compat;
 	return (
-		isStringArray(value) &&
-		value.length > 0 &&
-		value.every(key => key.split("+").every(component => component.trim().length > 0))
+		(!!compat && "supportsImageDetailOriginal" in compat && compat.supportsImageDetailOriginal === false) ||
+		model.identity.class === "anthropic" ||
+		(model.requestModelId !== undefined &&
+			classifyModel(model.provider, model.requestModelId, { lenient: true }).class === "anthropic")
 	);
 }
 
-function isComputerAction(value: unknown): value is ComputerAction {
-	if (!isRecord(value) || typeof value.type !== "string") return false;
-	const action = value;
-	const actionType = value.type;
-	const allowed = fieldsForAction(actionType);
-	if (!allowed || !hasOnlyFields(action, allowed)) return false;
-	switch (actionType) {
-		case "click":
-			return (
-				isCoordinate(action.x) &&
-				isCoordinate(action.y) &&
-				typeof action.button === "string" &&
-				MOUSE_BUTTONS[action.button] === true &&
-				isModifierArray(action.keys)
-			);
-		case "double_click":
-			return isCoordinate(action.x) && isCoordinate(action.y) && isModifierArray(action.keys);
-		case "drag":
-			return (
-				Array.isArray(action.path) &&
-				action.path.length >= 2 &&
-				action.path.every(isPoint) &&
-				isModifierArray(action.keys)
-			);
-		case "keypress":
-			return isKeypressArray(action.keys);
-		case "move":
-			return isCoordinate(action.x) && isCoordinate(action.y) && isModifierArray(action.keys);
-		case "screenshot":
-		case "wait":
-			return true;
-		case "scroll":
-			return (
-				isCoordinate(action.x) &&
-				isCoordinate(action.y) &&
-				isInt32(action.scroll_x) &&
-				isInt32(action.scroll_y) &&
-				isModifierArray(action.keys)
-			);
-		case "type":
-			return typeof action.text === "string";
-		default:
-			return false;
-	}
+interface ComputerRunParams {
+	action: "run";
+	code?: string;
+	fn?: string;
+	args?: unknown[];
+	read_only?: boolean;
+	timeout?: number;
 }
 
-function parseActions(value: unknown): ComputerAction[] {
-	// Missing or empty action batches degrade to a plain screenshot so a
-	// function-calling model can observe the screen before acting.
-	if (value === undefined) return [{ type: "screenshot" }];
-	if (!Array.isArray(value)) throw new ToolError("Computer call requires an array of actions");
-	if (value.length === 0) return [{ type: "screenshot" }];
-	if (!value.every(isComputerAction)) throw new ToolError("Computer call contains an invalid action");
-	return value;
+interface ComputerCallParams {
+	action: "call";
+	chain: ComputerCallStep[];
+	timeout?: number;
 }
 
-function toDesktopAction(action: ComputerAction): DesktopAction {
-	switch (action.type) {
-		case "click":
-			return {
-				type: "click",
-				x: action.x,
-				y: action.y,
-				button: action.button,
-				...(action.keys ? { keys: action.keys } : {}),
-			};
-		case "double_click":
-			return {
-				type: "double_click",
-				x: action.x,
-				y: action.y,
-				...(action.keys ? { keys: action.keys } : {}),
-			};
-		case "drag":
-			return { type: "drag", path: action.path, ...(action.keys ? { keys: action.keys } : {}) };
-		case "keypress":
-			return { type: "keypress", keys: action.keys };
-		case "move":
-			return { type: "move", x: action.x, y: action.y, ...(action.keys ? { keys: action.keys } : {}) };
-		case "screenshot":
-			return { type: "screenshot" };
-		case "scroll":
-			return {
-				type: "scroll",
-				x: action.x,
-				y: action.y,
-				scroll_x: action.scroll_x,
-				scroll_y: action.scroll_y,
-				...(action.keys ? { keys: action.keys } : {}),
-			};
-		case "type":
-			return { type: "type", text: action.text };
-		case "wait":
-			return { type: "wait" };
-	}
-}
+type ComputerParams = ComputerRunParams | ComputerCallParams | { action: "capabilities" } | { action: "close" };
+type ComputerParamsSchema = Type<ComputerParams>;
 
-function callMetadata(context: AgentToolContext | undefined): ComputerToolCallMetadata | undefined {
-	const metadata = context?.toolCall?.providerMetadata;
-	return metadata?.type === "computer" ? metadata : undefined;
-}
-
-export function computerApproval(args: unknown): ToolApprovalDecision {
-	const actions =
-		args && typeof args === "object" && "actions" in args ? (args as { actions?: unknown }).actions : undefined;
-	if (!Array.isArray(actions)) return "exec";
-	return actions.every(action => {
-		if (!action || typeof action !== "object") return false;
-		const actionType = (action as { type?: unknown }).type;
-		return actionType === "screenshot" || actionType === "wait";
+const getComputerParamsSchema: () => ComputerParamsSchema = once(() =>
+	type({
+		action: "'run'",
+		"code?": type("string").describe(
+			"JavaScript executed in the persistent computer session; top-level await allowed; `desktop`, `wait`, `assert` in scope",
+		),
+		"fn?": type("string").describe("serialized function receiving the computer run scope and positional args"),
+		"args?": type("unknown[]").describe("positional function arguments"),
+		"read_only?": type("boolean").describe(
+			"true = desktop inspection only: screenshots and ax reads allowed, desktop input/mutation blocked",
+		),
+		"timeout?": type("number").describe("run budget in seconds"),
+		"+": "reject",
 	})
-		? "read"
-		: "exec";
+		.or({
+			action: "'call'",
+			chain: type({ method: "string", args: "unknown[]" })
+				.array()
+				.describe("desktop helper invocation with at most one window/element handle hop"),
+			"timeout?": type("number").describe("run budget in seconds"),
+			"+": "reject",
+		})
+		.or({ action: "'capabilities'", "+": "reject" })
+		.or({ action: "'close'", "+": "reject" }),
+);
+
+interface ComputerPreludeDetails {
+	code?: string;
+	readOnly?: boolean;
+	screenshots: ComputerScreenshot[];
+	value?: unknown;
+	backend?: string;
+	capturePermission?: string;
+	inputPermission?: string;
+	axPermission?: string;
 }
 
-function modifierSummary(keys: unknown): string {
-	return isStringArray(keys) && keys.length > 0 ? ` keys=${JSON.stringify(keys)}` : "";
-}
+/** Creates the session-scoped controller used by the computer prelude. */
+export type ComputerControllerFactory = (session: ToolSession) => ComputerController;
 
-function approvalActionSummary(actions: unknown): string[] {
-	if (!Array.isArray(actions)) return ["Actions: unavailable"];
-	const lines = actions.slice(0, 12).map((value, index) => {
-		if (!value || typeof value !== "object") return `${index + 1}. invalid`;
-		const action = value as Record<string, unknown>;
-		const type = typeof action.type === "string" ? action.type : "invalid";
-		let detail: string;
-		switch (type) {
-			case "click":
-				detail = `click button=${String(action.button)} at (${String(action.x)}, ${String(action.y)})${modifierSummary(action.keys)}`;
-				break;
-			case "double_click":
-				detail = `double_click at (${String(action.x)}, ${String(action.y)})${modifierSummary(action.keys)}`;
-				break;
-			case "drag":
-				detail = `drag path=${Array.isArray(action.path) ? action.path.map(point => (isPoint(point) ? `(${point.x}, ${point.y})` : "invalid")).join(" -> ") : "invalid"}${modifierSummary(action.keys)}`;
-				break;
-			case "keypress":
-				detail = `keypress keys=${JSON.stringify(action.keys)}`;
-				break;
-			case "move":
-				detail = `move to (${String(action.x)}, ${String(action.y)})${modifierSummary(action.keys)}`;
-				break;
-			case "scroll":
-				detail = `scroll at (${String(action.x)}, ${String(action.y)}) delta=(${String(action.scroll_x)}, ${String(action.scroll_y)})${modifierSummary(action.keys)}`;
-				break;
-			case "type":
-				detail = `type text=${JSON.stringify(action.text)}`;
-				break;
-			case "screenshot":
-			case "wait":
-				detail = type;
-				break;
-			default:
-				detail = type;
+/** Capability inspection, explicitly read-only runs, and inspection-only direct calls use read approval. */
+export function computerApproval(args: unknown): ToolApprovalDecision {
+	if (args === null || typeof args !== "object" || Array.isArray(args) || !("action" in args)) return "exec";
+	if (args.action === "capabilities") return "read";
+	if (args.action === "call") {
+		// Malformed chains fall to exec here and fail schema validation at invoke time.
+		try {
+			return "chain" in args && Array.isArray(args.chain) && isReadOnlyComputerCall(args.chain) ? "read" : "exec";
+		} catch {
+			return "exec";
 		}
-		return truncateForPrompt(sanitizeText(`${index + 1}. ${detail}`).replace(/[\r\n\t]+/g, " "), 240);
-	});
-	if (actions.length > 12) lines.push(`+${actions.length - 12} more actions`);
-	return truncateForPrompt(lines.join("\n"), 2_000).split("\n");
+	}
+	return args.action === "run" && "read_only" in args && args.read_only === true ? "read" : "exec";
 }
 
-export class ComputerTool implements AgentTool<typeof computerSchema, ComputerToolDetails> {
-	readonly name = "computer";
-	readonly native = { type: "computer" } as const;
-	readonly label = "Computer";
-	readonly loadMode = "essential" as const;
-	readonly concurrency = "exclusive" as const;
-	readonly summary = "Capture and control the host desktop through native OS APIs";
-	readonly parameters = computerSchema;
-	readonly strict = false;
-	readonly approval = computerApproval;
-	readonly formatApprovalDetails = (args: unknown): string[] => {
-		const actions = args && typeof args === "object" ? (args as { actions?: unknown }).actions : undefined;
-		return approvalActionSummary(actions);
+/** Create the enabled-only computer host prelude for one tool session. */
+export function createComputerPrelude(
+	session: ToolSession,
+	createController: ComputerControllerFactory = currentSession =>
+		new ComputerSupervisor(currentSession, undefined, undefined, callSessionTool),
+): EvalPreludeDefinition {
+	const controller = createController(session);
+	const unregisterOwner = registerComputerController(session.getEvalKernelOwnerId?.() ?? undefined, controller);
+	let closed = false;
+	const lifetime: ComputerLifetime = {
+		isClosed: () => closed,
+		close: async () => {
+			if (closed) return;
+			closed = true;
+			unregisterOwner();
+			await controller.close();
+		},
 	};
-	readonly #controller: ComputerController;
-	readonly #unregisterOwner: () => void;
-	#closed = false;
-	#description?: string;
 
-	constructor(
-		readonly session: ToolSession,
-		createController: ComputerControllerFactory = options => new ComputerSupervisor(options),
-	) {
-		this.#controller = createController({
-			backend: session.settings.get("computer.backend"),
-			display: session.settings.get("computer.display"),
-			maxWidth: session.settings.get("computer.maxWidth"),
-			maxHeight: session.settings.get("computer.maxHeight"),
-		});
-		this.#unregisterOwner = registerComputerController(
-			session.getEvalKernelOwnerId?.() ?? undefined,
-			this.#controller,
-		);
-	}
-	get description(): string {
-		this.#description ??= prompt.render(computerDescription);
-		return this.#description;
-	}
+	return {
+		name: "computer",
+		documentation: computerDescription,
+		javascript: computerJavascript,
+		python: computerPython,
+		exports: ["computer"],
+		codeModeDeclarations: computerCodeModeDeclarations,
+		approval: computerApproval,
+		enabled: () => session.settings.get("computer.enabled") === true,
+		invoke: async (parameters, context) => {
+			const parsed = getComputerParamsSchema()(parameters);
+			if (parsed instanceof type.errors) {
+				throw new ToolError(`computer received invalid arguments: ${parsed.summary}`);
+			}
+			return await invokeComputer(session, controller, parsed, context, lifetime);
+		},
+	};
+}
 
-	async execute(
-		_toolCallId: string,
-		params: ComputerParams,
-		signal?: AbortSignal,
-		_onUpdate?: AgentToolUpdateCallback<ComputerToolDetails>,
-		context?: AgentToolContext,
-	): Promise<AgentToolResult<ComputerToolDetails>> {
-		throwIfAborted(signal);
-		if (this.#closed) throw new ToolError("Computer session is closed");
-		const metadata = callMetadata(context);
-		const actions = parseActions(metadata?.actions ?? params.actions);
-		const pendingSafetyChecks: ComputerSafetyCheck[] = metadata?.pendingSafetyChecks ?? [];
-		if (pendingSafetyChecks.length > 0 && context?.providerSafetyApproved !== true) {
-			throw new ToolError("Provider safety checks require interactive approval before computer input");
+interface ComputerLifetime {
+	isClosed(): boolean;
+	close(): Promise<void>;
+}
+
+async function invokeComputer(
+	session: ToolSession,
+	controller: ComputerController,
+	params: ComputerParams,
+	context: EvalPreludeContext,
+	lifetime: ComputerLifetime,
+): Promise<AgentToolResult<unknown>> {
+	throwIfAborted(context.signal);
+
+	switch (params.action) {
+		case "run":
+		case "call":
+			if (lifetime.isClosed()) throw new ToolError("Computer session is closed");
+			return await runComputer(session, controller, params, context.signal);
+		case "capabilities": {
+			const capabilities = lifetime.isClosed() ? undefined : await controller.capabilities();
+			throwIfAborted(context.signal);
+			return {
+				content: [
+					{
+						type: "text",
+						text: capabilities ? stringifyReturnValue(capabilities) : "Computer capabilities unavailable",
+					},
+				],
+				details: capabilities,
+			};
 		}
-		const capture = await this.#controller.execute(actions.map(toDesktopAction), signal);
-		throwIfAborted(signal);
-		const data = Buffer.from(capture.data).toBase64();
-		return {
-			content: [{ type: "image", data, mimeType: "image/png", detail: "original" }],
-			details: {
-				width: capture.width,
-				height: capture.height,
-				backend: capture.backend,
-				displayServer: capture.displayServer,
-				capturePermission: capture.capturePermission,
-				inputPermission: capture.inputPermission,
-				displays: capture.displays,
-				capabilities: this.#controller.capabilities,
-				actions: actions.map(action => action.type),
-			},
-			...(metadata
-				? {
-						providerMetadata: {
-							type: "computer" as const,
-							screenshot: { type: "computer_screenshot" as const, image_url: `data:image/png;base64,${data}` },
-							acknowledgedSafetyChecks: pendingSafetyChecks,
-						},
-					}
-				: {}),
-		};
+		case "close":
+			await lifetime.close();
+			throwIfAborted(context.signal);
+			return { content: [{ type: "text", text: "Closed computer session" }] };
 	}
+}
 
-	async close(): Promise<void> {
-		if (this.#closed) return;
-		this.#closed = true;
-		this.#unregisterOwner();
-		await this.#controller.close();
+const COMPUTER_RUN_SCOPE: readonly string[] = ["desktop", "wait", "assert"];
+
+function resolveComputerRunCode(params: ComputerRunParams | ComputerCallParams): string {
+	if (params.action === "call") return renderComputerCall(params.chain);
+	const code = params.code?.trim();
+	const fn = params.fn?.trim();
+	const hasCode = code !== undefined && code.length > 0;
+	const hasFunction = fn !== undefined && fn.length > 0;
+	if (hasCode === hasFunction) {
+		throw new ToolError("Action 'run' requires exactly one of 'code' or 'fn'.");
+	}
+	if (hasFunction && fn !== undefined) {
+		return renderFunctionRun(fn, COMPUTER_RUN_SCOPE, params.args ?? []);
+	}
+	if (hasCode && code !== undefined) return code;
+	throw new ToolError("Action 'run' requires exactly one of 'code' or 'fn'.");
+}
+
+async function runComputer(
+	session: ToolSession,
+	controller: ComputerController,
+	params: ComputerRunParams | ComputerCallParams,
+	signal?: AbortSignal,
+): Promise<AgentToolResult<unknown>> {
+	const code = resolveComputerRunCode(params);
+	// Direct inspection calls run read-only so the desktop guard backs the read approval tier.
+	const readOnly = params.action === "call" ? isReadOnlyComputerCall(params.chain) : (params.read_only ?? false);
+	const timeoutSeconds = clampTimeout("computer", params.timeout, session.settings.get("tools.maxTimeout"));
+	const coordinateSafe = usesCoordinateSafeImageSizing(session.getActiveModel?.());
+	const configuredMaxWidth = session.settings.get("computer.maxWidth");
+	const configuredMaxHeight = session.settings.get("computer.maxHeight");
+	const snapshot: ComputerSessionSnapshot = {
+		cwd: session.cwd,
+		sessionId: session.getEvalSessionId?.() ?? session.getSessionId?.() ?? "computer",
+		captureMaxWidth: coordinateSafe
+			? Math.min(configuredMaxWidth, COORDINATE_SAFE_MAX_CAPTURE_WIDTH)
+			: configuredMaxWidth,
+		captureMaxHeight: coordinateSafe
+			? Math.min(configuredMaxHeight, COORDINATE_SAFE_MAX_CAPTURE_HEIGHT)
+			: configuredMaxHeight,
+		display: session.settings.get("computer.display") ?? "all",
+		readOnly,
+	};
+	const run = await controller.run(code, timeoutSeconds * 1000, snapshot, signal);
+	throwIfAborted(signal);
+
+	const details: ComputerPreludeDetails = {
+		code,
+		readOnly: snapshot.readOnly,
+		screenshots: run.screenshots,
+	};
+	if (run.returnValue !== undefined) details.value = run.returnValue;
+	populateCapabilityDetails(details, run.capabilities);
+
+	const text = run.displays
+		.filter((content): content is { type: "text"; text: string } => content.type === "text")
+		.map(content => content.text)
+		.join("\n");
+	const cappedText = await enforceInlineByteCap(text, {
+		saveArtifact: full => saveComputerOutputArtifact(session, full),
+	});
+	const content: AgentToolResult<ComputerPreludeDetails>["content"] = [];
+	if (cappedText) content.push({ type: "text", text: cappedText });
+	for (const image of run.displays) {
+		if (image.type === "image") content.push({ ...image, detail: "original" });
+	}
+	return { content, details };
+}
+
+function stringifyReturnValue(value: unknown): string {
+	if (typeof value === "string") return value;
+	try {
+		return JSON.stringify(value, null, 2) ?? String(value);
+	} catch {
+		return String(value);
+	}
+}
+
+function populateCapabilityDetails(
+	details: ComputerPreludeDetails,
+	capabilities: DesktopCapabilities | undefined,
+): void {
+	if (!capabilities) return;
+	details.backend = capabilities.backend;
+	details.capturePermission = capabilities.capturePermission;
+	details.inputPermission = capabilities.inputPermission;
+	details.axPermission = capabilities.axPermission;
+}
+
+/** Persist over-cap computer run output as a session artifact; mirrors the browser run save path. */
+async function saveComputerOutputArtifact(session: ToolSession, fullText: string): Promise<string | undefined> {
+	try {
+		const alloc = await session.allocateOutputArtifact?.("computer-original");
+		if (!alloc?.path || !alloc.id) return undefined;
+		await Bun.write(alloc.path, fullText);
+		return alloc.id;
+	} catch {
+		return undefined;
 	}
 }

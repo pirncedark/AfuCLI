@@ -17,8 +17,8 @@ import {
 } from "./protocol";
 import { CodexLiveTransport } from "./transport";
 import type { LivePhase } from "./visualizer";
+import { DEFAULT_LIVE_VOICE } from "./voices";
 
-const DEFAULT_VOICE = "sol";
 const OUTPUT_ACTIVE_LEVEL = 0.015;
 const MIN_BARGE_IN_LEVEL = 0.04;
 const OUTPUT_ECHO_RATIO = 0.65;
@@ -120,7 +120,7 @@ export class LiveSessionController {
 		this.#session = options.session;
 		this.#callbacks = options.callbacks;
 		this.#extractAssistantText = options.extractAssistantText;
-		this.#voice = options.voice?.trim() || DEFAULT_VOICE;
+		this.#voice = options.voice?.trim() || DEFAULT_LIVE_VOICE;
 	}
 
 	/** Current realtime call phase. */

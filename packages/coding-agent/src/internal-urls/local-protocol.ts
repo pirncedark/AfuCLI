@@ -253,6 +253,48 @@ export function resolveLocalRoot(options: LocalProtocolOptions, platform: NodeJS
 	return path.join(os.tmpdir(), "omp-local", safeSessionId(options));
 }
 
+/**
+ * Recursively copy every local:// artifact from one session-scoped root to
+ * another. Used when a session transition mints a fresh local root (plan
+ * approve-and-execute, handoff) so plans, scratch files, and research notes the
+ * carried-forward context references stay readable in the replacement session.
+ * No-op when the roots match or the source root is absent.
+ */
+export async function copyLocalArtifacts(sourceRoot: string, destinationRoot: string): Promise<void> {
+	if (sourceRoot === destinationRoot) return;
+
+	let sourceRootStat: { isDirectory(): boolean };
+	try {
+		sourceRootStat = await fs.lstat(sourceRoot);
+	} catch (error) {
+		if (isEnoent(error)) return;
+		throw error;
+	}
+	if (!sourceRootStat.isDirectory()) return;
+
+	await fs.mkdir(destinationRoot, { recursive: true });
+	await copyLocalArtifactEntries(sourceRoot, destinationRoot);
+}
+
+async function copyLocalArtifactEntries(sourceDir: string, destinationDir: string): Promise<void> {
+	const entries = await fs.readdir(sourceDir, { withFileTypes: true });
+	for (const entry of entries) {
+		const sourcePath = path.join(sourceDir, entry.name);
+		const destinationPath = path.join(destinationDir, entry.name);
+
+		if (entry.isDirectory()) {
+			await fs.mkdir(destinationPath, { recursive: true });
+			await copyLocalArtifactEntries(sourcePath, destinationPath);
+			continue;
+		}
+
+		if (entry.isFile()) {
+			await fs.mkdir(path.dirname(destinationPath), { recursive: true });
+			await fs.copyFile(sourcePath, destinationPath);
+		}
+	}
+}
+
 /** Resolve a local:// URL to an on-disk path under the active session's local root. */
 export function resolveLocalUrlToPath(
 	input: string | InternalUrl,
@@ -390,8 +432,9 @@ export class LocalProtocolHandler implements ProtocolHandler {
 
 	/**
 	 * Install a process-global override that wins over the AgentRegistry-based
-	 * derivation. Used by SDK consumers that wire `localProtocolOptions` on
-	 * `createAgentSession` and by subagents that share their parent's root.
+	 * derivation. Used by top-level SDK consumers that wire
+	 * `localProtocolOptions` on `createAgentSession`; subagents keep their
+	 * inherited mapping session-bound.
 	 */
 	static setOverride(value: LocalProtocolOptions | undefined): void {
 		LocalProtocolHandler.#override = value;
@@ -445,6 +488,17 @@ export class LocalProtocolHandler implements ProtocolHandler {
 		}
 
 		const resolved = await resolveLocalTarget(url, opts);
+		if (context?.pathOnly) {
+			const sourcePath = resolved.kind === "listing" ? resolved.root : resolved.path;
+			return {
+				url: url.href,
+				content: "",
+				contentType: getContentType(sourcePath),
+				sourcePath,
+				size: resolved.kind === "file" ? resolved.size : undefined,
+				isDirectory: resolved.kind !== "file",
+			};
+		}
 		if (resolved.kind === "listing") {
 			return buildListing(url, resolved.root);
 		}

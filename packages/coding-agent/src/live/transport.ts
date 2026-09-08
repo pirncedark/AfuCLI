@@ -1,5 +1,5 @@
 import { type AuthStorage, isAuthRetryableError, type OAuthAccess, withOAuthAccess } from "@oh-my-pi/pi-ai";
-import { getProxyForProvider, wrapFetchForProxy } from "@oh-my-pi/pi-ai/utils/proxy";
+import { getProxyForUrl, wrapFetchForProxy } from "@oh-my-pi/pi-ai/utils/proxy";
 import {
 	CODEX_BASE_URL,
 	CODEX_CLIENT_VERSION,
@@ -252,7 +252,7 @@ export class CodexLiveTransport {
 		const url = buildLiveSidebandUrl(callId);
 		const options = {
 			headers: liveSessionHeaders(access, this.#options.sessionId, this.#realtimeSessionId, attestation),
-			proxy: getProxyForProvider(LIVE_PROVIDER),
+			proxy: getProxyForUrl(LIVE_PROVIDER, new URL(url)),
 		} satisfies Bun.WebSocketOptions;
 		const socket: Bun.WebSocket = Reflect.construct(WebSocket, [url, options]);
 		socket.binaryType = "nodebuffer";

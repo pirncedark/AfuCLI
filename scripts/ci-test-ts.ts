@@ -21,7 +21,10 @@ type CodingAgentBucket = "singleton" | "ui" | "runtime" | "native";
 interface TestCommand {
 	label: string;
 	cwd: string;
+	/** argv without `--parallel`; the runner appends it from `parallel` and the pool's CPU budget. */
 	command: string[];
+	/** `bun test --parallel` width this chunk wants when it has the machine to itself. */
+	parallel?: number;
 }
 
 type CodingAgentTestPartition = Record<CodingAgentBucket, string[]>;
@@ -82,17 +85,15 @@ const codingAgentBucketPlans: Record<CodingAgentBucket, { label: string; paralle
 // Smaller workspace packages stay separate from native/TUI/integration suites so
 // their short TS suites can run together. CI still downloads the Linux x64 native
 // addon before this bucket: shared utility barrels may load native-backed modules.
-// mnemopi is intentionally excluded — its embedding suites depend on a ~270MB
-// fastembed model absent from CI runners, so they flake/time out under the parallel
-// bucket; run `bun --cwd=packages/mnemopi test` locally instead.
 const fastWorkspacePackages = [
-	"packages/hashline",
 	"packages/wire",
+	"packages/omptype",
 	"packages/utils",
 	"packages/catalog",
 	"packages/ai",
 	"packages/snapcompact",
 	"packages/agent",
+	"packages/mnemopi",
 ];
 
 // These suites cover the native package, TUI/browser-ish behavior, local servers,
@@ -106,25 +107,8 @@ const nativeAndIntegrationPackages = [
 ];
 
 // Packages the CI buckets deliberately skip but a local full run should still
-// cover. mnemopi's embedding suites need a ~270MB fastembed model absent from CI
-// runners (so it flakes/times out there); robomp-web lives under python/robomp
-// and is outside every CI TS bucket.
-const localOnlyWorkspacePackages = ["packages/mnemopi", "python/robomp/web"];
-
-// Repo-level script tests. CI's `workspace` bucket only runs the merge gates:
-// the concurrency regression (the GHA-config guard) and the .d.ts extension
-// rewrite (guards published-type resolution; hermetic temp-dir suite). A local
-// full run also exercises the release-notes and link-omp tests. (A
-// `ci-test-ts.test.ts` entry used to sit here but the file never existed — bun
-// silently ignores unmatched filters when at least one other filter matches.)
-const repoScriptTests = [
-	"scripts/ci-concurrency.test.ts",
-	"scripts/ci-build-native.test.ts",
-	"scripts/ci-release-notes.test.ts",
-	"scripts/ci-release-publish.test.ts",
-	"scripts/fix-dts-extensions.test.ts",
-	"scripts/link-omp.test.ts",
-];
+// cover. robomp-web lives under python/robomp and is outside every CI TS bucket.
+const localOnlyWorkspacePackages = ["python/robomp/web"];
 
 const codingAgentNativePathPatterns = [
 	/(^|\/)[^/]*(bash|native|browser|cmux|mnemopi|hindsight|memory)[^/]*\.test\.ts$/i,
@@ -146,7 +130,6 @@ const codingAgentSingletonPathPatterns = [
 const codingAgentUiPathPatterns = [
 	/^test\/modes\//,
 	/^test\/(interactive-mode|main-interactive|input-controller|streaming|status-line|keybindings|editor|hook|theme|setup-wizard|job-renderer|tool-args-reveal|tool-execution)[^/]*\.test\.ts$/,
-	/^src\/modes\/components\//,
 ];
 
 const codingAgentRuntimePathPatterns = [
@@ -223,7 +206,8 @@ function workspaceTestCommand(pkg: string, parallel: number, options: { extraArg
 	return {
 		label: pkg,
 		cwd: pkg,
-		command: ["bun", "test", `--parallel=${parallel}`, ...extraArgs],
+		command: ["bun", "test", ...extraArgs],
+		parallel,
 	};
 }
 
@@ -298,10 +282,7 @@ function classifyCodingAgentTest(testFile: string, content: string): CodingAgent
 async function getCodingAgentTestPartition(): Promise<CodingAgentTestPartition> {
 	codingAgentTestPartitionPromise ??= (async () => {
 		const codingAgentDir = path.join(repoRoot, "packages/coding-agent");
-		const testFiles = [
-			...(await collectTestsUnder(path.join(codingAgentDir, "test"), codingAgentDir)),
-			...(await collectTestsUnder(path.join(codingAgentDir, "src"), codingAgentDir)),
-		].sort();
+		const testFiles = (await collectTestsUnder(path.join(codingAgentDir, "test"), codingAgentDir)).sort();
 		const partition: CodingAgentTestPartition = {
 			singleton: [],
 			ui: [],
@@ -335,7 +316,8 @@ async function codingAgentTestCommands(bucket: CodingAgentBucket): Promise<TestC
 		commands.push({
 			label: `packages/coding-agent (${plan.label}; ${testFiles.length} files; parallel=${plan.parallel}${chunkLabel}; ${chunk.length} files)`,
 			cwd: "packages/coding-agent",
-			command: ["bun", "test", `--parallel=${plan.parallel}`, ...onlyFailuresArgs, ...chunk],
+			command: ["bun", "test", ...onlyFailuresArgs, ...chunk],
+			parallel: plan.parallel,
 		});
 	}
 	return commands;
@@ -344,25 +326,9 @@ async function codingAgentTestCommands(bucket: CodingAgentBucket): Promise<TestC
 async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 	switch (mode) {
 		case "workspace":
-			return [
-				...fastWorkspacePackages.map(pkg => workspaceTestCommand(pkg, 8)),
-				{
-					label: "scripts",
-					cwd: ".",
-					command: [
-						"bun",
-						"test",
-						"--parallel=4",
-						...onlyFailuresArgs,
-						"scripts/ci-concurrency.test.ts",
-						"scripts/ci-build-native.test.ts",
-						"scripts/ci-release-publish.test.ts",
-						"scripts/fix-dts-extensions.test.ts",
-					],
-				},
-			];
+			return fastWorkspacePackages.map(pkg => workspaceTestCommand(pkg, 8));
 		case "native":
-			return nativeAndIntegrationPackages.map(pkg => workspaceTestCommand(pkg, 4, { smol: true }));
+			return nativeAndIntegrationPackages.map(pkg => workspaceTestCommand(pkg, 4));
 		case "coding-agent-singleton":
 			return await codingAgentTestCommands("singleton");
 		case "coding-agent-ui":
@@ -386,20 +352,15 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 			];
 		// `local-ts` is the full local TypeScript run that root `bun run test:ts`
 		// drives: every package the old `--workspaces` fan-out covered (the CI
-		// `all` set PLUS mnemopi and robomp-web, which CI omits) and every repo
-		// script test, routed through this one quiet runner so the whole suite
-		// shares one progress stream and one failure report.
+		// `all` set plus robomp-web, which CI omits), routed through
+		// this one quiet runner so the whole suite shares one progress stream and
+		// one failure report. Repo script tests remain available via `test:scripts`.
 		case "local-ts":
 			return [
 				...fastWorkspacePackages.map(pkg => workspaceTestCommand(pkg, 8, { extraArgs: onlyFailuresArgs })),
 				...nativeAndIntegrationPackages.map(pkg => workspaceTestCommand(pkg, 4, { extraArgs: onlyFailuresArgs })),
 				...localOnlyWorkspacePackages.map(pkg => workspaceTestCommand(pkg, 4, { extraArgs: onlyFailuresArgs })),
 				...(await commandsForMode("coding-agent-heavy")),
-				{
-					label: "scripts",
-					cwd: ".",
-					command: ["bun", "test", "--parallel=4", ...onlyFailuresArgs, ...repoScriptTests],
-				},
 			];
 		// `local` is what root `bun run test` drives: the full TS suite plus the
 		// Rust task, so a single invocation reports TS and Rust together. The Rust
@@ -409,16 +370,15 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 	}
 }
 
-// The omp-kata runner pods inject sccache S3 credentials (`AWS_*`) and config
-// (`SCCACHE_*`) pod-wide via `envFrom`, GitHub Actions injects `GITHUB_TOKEN`,
+// The omp-kata runner pods may inject cloud credentials (`AWS_*`) pod-wide via
+// `envFrom`, GitHub Actions injects `GITHUB_TOKEN`,
 // and a host may carry provider API keys. Any of these make env-sensitive code
 // non-deterministic in tests — e.g. leaked AWS creds make `amazon-bedrock` look
 // authenticated and win the provider startup fallback over `anthropic`. Run the
 // suites in a hermetic environment with all credential / cloud-config variables
 // stripped so resolution depends only on the test's own fixtures.
-const SCRUBBED_ENV_PREFIXES = ["AWS_", "SCCACHE_", "GOOGLE_CLOUD_"];
+const SCRUBBED_ENV_PREFIXES = ["AWS_", "GOOGLE_CLOUD_"];
 const SCRUBBED_ENV_NAMES = new Set([
-	"RUSTC_WRAPPER",
 	"GITHUB_TOKEN",
 	"GH_TOKEN",
 	"COPILOT_GITHUB_TOKEN",
@@ -456,25 +416,31 @@ async function runTestCommand(testCommand: TestCommand): Promise<void> {
 			stdout: "inherit",
 			stderr: "inherit",
 		});
-		const killTimer = setTimeout(() => proc.kill("SIGKILL"), chunkTimeoutMs());
+		// Watchdog, mirroring the parallel path: record that *we* killed the child,
+		// otherwise the resulting 137 is indistinguishable from an OOM kill.
+		let timedOut = false;
+		const killTimer = setTimeout(() => {
+			timedOut = true;
+			proc.kill("SIGKILL");
+		}, chunkTimeoutMs());
 		const exitCode = await proc.exited;
 		clearTimeout(killTimer);
 		if (exitCode === 0) {
 			return;
 		}
-		if (BUN_CRASH_EXITS[exitCode] && attempt < MAX_CHUNK_ATTEMPTS) {
+		if (!timedOut && BUN_CRASH_EXITS[exitCode] && attempt < MAX_CHUNK_ATTEMPTS) {
 			console.log(
 				`==> ${testCommand.label}: bun crashed (exit ${exitCode}); retrying (attempt ${attempt + 1}/${MAX_CHUNK_ATTEMPTS})`,
 			);
 			continue;
 		}
-		throw new Error(`${testCommand.label} failed with exit code ${exitCode}: ${renderedCommand}`);
+		throw new Error(`${testCommand.label} ${describeChunkFailure(exitCode, timedOut)}: ${renderedCommand}`);
 	}
 }
 
-// Child env shared by every spawned test process: the parent env with all CI
-// credential / cloud-config variables scrubbed (see SCRUBBED_ENV_* above) and
-// GITHUB_ACTIONS cleared so suites resolve only against their own fixtures.
+// Child env shared by every spawned test process: the parent env with the
+// private test-runtime marker set, all CI credential / cloud-config variables
+// scrubbed (see SCRUBBED_ENV_* above), and GITHUB_ACTIONS cleared.
 //
 // GC knobs (both needed — they gate different JSC mechanisms):
 // - `BUN_JSC_useConcurrentGC=0` stops the collector from marking concurrently
@@ -498,6 +464,7 @@ function buildChildEnv(): Record<string, string | undefined> {
 	const env: Record<string, string | undefined> = {
 		...Bun.env,
 		GITHUB_ACTIONS: "",
+		PI_TEST_RUNTIME: "1",
 		BUN_JSC_useConcurrentGC: "0",
 		BUN_JSC_numberOfGCMarkers: "1",
 	};
@@ -543,6 +510,21 @@ const BUN_CRASH_EXITS: Record<number, true> = {
 // deterministic crash still fails every attempt and is reported normally.
 const MAX_CHUNK_ATTEMPTS = 3;
 
+// Why a chunk failed, in words. Exit 137 is SIGKILL, which this runner reaches
+// two very different ways -- the per-chunk watchdog firing, or the kernel OOM
+// killer reaping a chunk that outgrew the runner -- and the bare exit code
+// cannot tell them apart. Which one it was is the difference between "raise
+// OMP_TEST_CHUNK_TIMEOUT" and "lower this bucket's chunkSize", so say it.
+export function describeChunkFailure(exitCode: number, timedOut: boolean): string {
+	if (timedOut) {
+		return `exceeded the ${Math.round(chunkTimeoutMs() / 1000)}s chunk watchdog and was killed (exit ${exitCode}; OMP_TEST_CHUNK_TIMEOUT to change)`;
+	}
+	if (exitCode === 137) {
+		return "was SIGKILLed (exit 137) without reaching the chunk watchdog, which on a CI runner means the OOM killer; lower this bucket's chunkSize";
+	}
+	return `failed with exit code ${exitCode}`;
+}
+
 // The standard `CI` signal is authoritative. In CI each bucket is its own
 // memory-capped runner job (a single fat invocation gets OOM-killed at 137), so
 // chunks run sequentially within a job and parallelism happens across jobs.
@@ -560,6 +542,7 @@ function isCI(): boolean {
 // memory-constrained laptop), or `all`/`max` to launch every chunk at once.
 function testConcurrency(total: number): number {
 	const raw = Bun.env.OMP_TEST_CONCURRENCY?.trim().toLowerCase();
+	if (!raw) return Math.min(Math.max(1, os.availableParallelism()), total);
 	if (raw === "all" || raw === "max") {
 		return total;
 	}
@@ -567,7 +550,59 @@ function testConcurrency(total: number): number {
 	if (Number.isFinite(override) && override >= 1) {
 		return Math.min(Math.floor(override), total);
 	}
-	return Math.min(Math.max(1, os.availableParallelism()), total);
+	throw new Error(`Invalid OMP_TEST_CONCURRENCY=${JSON.stringify(raw)}; expected a positive integer, all, or max`);
+}
+
+// Test files interleave real IO — sqlite writes, temp dirs, spawned CLIs — with
+// CPU, so keeping every core busy needs more in-flight files than cores. This is
+// the factor by which the shared budget exceeds `availableParallelism()`.
+const FILE_OVERSUBSCRIBE = 2;
+
+// Two independent parallelism knobs stack multiplicatively: the chunk pool runs
+// `poolWidth` `bun test` processes at once, and each of those runs its own
+// `--parallel=N` test files concurrently, so up to `poolWidth * N` files are in
+// flight. Left unbudgeted that oversubscribes the runner by design — the
+// workspace bucket asked for 4 x 8 = 32 files on a 4-core box — and because
+// bun's per-test timeout is wall-clock, CPU-starved suites blow it and fail at
+// random (mnemopi's sqlite/CLI files did, a different set each run). Spend one
+// budget instead: each live chunk gets an equal share, never below 1 and never
+// above the width it asked for. A chunk that runs alone still gets everything,
+// so the sequential CI path is unchanged.
+function budgetedParallel(requested: number, poolWidth: number): number {
+	const budget = Math.max(1, os.availableParallelism()) * FILE_OVERSUBSCRIBE;
+	return Math.max(1, Math.min(requested, Math.floor(budget / poolWidth)));
+}
+
+// Bun's 5s default per-test timeout is a unit-test default, and this repo's
+// suites are not unit tests: mnemopi builds real SQLite schemas per case, the
+// coding-agent suites drive sessions and subprocesses. Those cases already run
+// 1-4s on a quiet CI runner, so any scheduling hiccup crosses 5s and reports a
+// timeout that says nothing about the code. Timing out is still worth catching,
+// so keep a ceiling — just one loose enough to only fire on a real hang. The
+// per-chunk watchdog (chunkTimeoutMs) remains the backstop for a wedged process.
+// Override with OMP_TEST_TIMEOUT (seconds); per-test `it(name, fn, ms)` still wins.
+function testTimeoutMs(): number {
+	const raw = Number(Bun.env.OMP_TEST_TIMEOUT?.trim());
+	if (Number.isFinite(raw) && raw >= 1) return raw * 1000;
+	return 30_000;
+}
+
+// Materialize each chunk's argv against the pool width it will actually run at,
+// rewriting `parallel` from the requested width to the granted one so later
+// reporting reads the truth. A `parallel` request marks the command as a `bun
+// test` invocation, so that is also where the shared per-test timeout is
+// applied; the Rust task, which has neither, passes through untouched.
+function applyChunkBudget(commands: TestCommand[], poolWidth: number): TestCommand[] {
+	const timeout = testTimeoutMs();
+	return commands.map(testCommand => {
+		if (testCommand.parallel === undefined) return testCommand;
+		const parallel = budgetedParallel(testCommand.parallel, poolWidth);
+		return {
+			...testCommand,
+			command: [...testCommand.command, `--parallel=${parallel}`, `--timeout=${timeout}`],
+			parallel,
+		};
+	});
 }
 
 // ANSI styling for interactive runs only; disabled when stdout is not a TTY or
@@ -736,9 +771,11 @@ export async function runTestCommandsInParallel(commands: TestCommand[], concurr
 	const queue = [...commands];
 	const failures: ChunkOutcome[] = [];
 	let completed = 0;
+	const fileWidths = [...new Set(commands.map(c => c.parallel).filter(p => p !== undefined))].sort((a, b) => a - b);
 	console.log(
 		`Running ${commands.length} test command(s), up to ${concurrency} in parallel ` +
-			`(OMP_TEST_CONCURRENCY=<n>|all to change).`,
+			`(OMP_TEST_CONCURRENCY=<n>|all to change); ${os.availableParallelism()} cores, ` +
+			`--parallel=${fileWidths.join("/") || "n/a"} per chunk.`,
 	);
 
 	// Incremental, cancellable drain into a mutable sink, so a watchdog-killed
@@ -889,11 +926,18 @@ if (import.meta.main) {
 		);
 	}
 
-	const testCommands = await commandsForMode(requestedMode as Mode);
-	// Outside CI, fan the independent chunk processes out across cores; CI keeps the
-	// sequential, fail-fast path so each memory-capped runner job stays bounded.
-	if (!isDryRun && !isCI() && testCommands.length > 1) {
-		await runTestCommandsInParallel(testCommands, testConcurrency(testCommands.length));
+	const requestedCommands = await commandsForMode(requestedMode as Mode);
+	const explicitConcurrency = Boolean(Bun.env.OMP_TEST_CONCURRENCY?.trim());
+	// CI defaults to one process at a time, but memory-sized workflow buckets
+	// explicitly opt into bounded process concurrency. Local runs fan out by
+	// default and may use the same override. Resolved before the dry-run check so
+	// `--dry-run` prints the argv the real run would use, budget included.
+	const pooled = requestedCommands.length > 1 && (!isCI() || explicitConcurrency);
+	// The sequential path is a pool of one, so a lone chunk keeps the whole budget.
+	const poolWidth = pooled ? testConcurrency(requestedCommands.length) : 1;
+	const testCommands = applyChunkBudget(requestedCommands, poolWidth);
+	if (pooled && !isDryRun) {
+		await runTestCommandsInParallel(testCommands, poolWidth);
 	} else {
 		for (const testCommand of testCommands) {
 			await runTestCommand(testCommand);

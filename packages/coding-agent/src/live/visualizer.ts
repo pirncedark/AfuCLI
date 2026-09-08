@@ -1,5 +1,6 @@
 import {
 	type Component,
+	type KeyId,
 	matchesKey,
 	replaceTabs,
 	sliceWithWidth,
@@ -15,6 +16,8 @@ export type LivePhase = "connecting" | "listening" | "working" | "speaking" | "m
 export interface LiveVisualizerOptions {
 	onStop(): void;
 	onToggleMute(): void;
+	/** Configured `app.live.toggle` chords that also end the call (Ctrl+L by default). */
+	stopKeys?: readonly KeyId[];
 }
 
 function normalizeTranscript(text: string): string {
@@ -100,7 +103,11 @@ export class LiveVisualizer implements Component {
 
 	/** Processes user keypresses. */
 	handleInput(data: string): void {
-		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
+		if (
+			matchesKey(data, "escape") ||
+			matchesKey(data, "ctrl+c") ||
+			this.#options.stopKeys?.some(key => matchesKey(data, key))
+		) {
 			this.#options.onStop();
 		} else if (matchesKey(data, "space")) {
 			this.#options.onToggleMute();

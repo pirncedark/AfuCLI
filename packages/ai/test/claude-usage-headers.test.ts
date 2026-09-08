@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { claudeCodeVersion } from "@oh-my-pi/pi-ai/providers/anthropic";
+import { claudeCodeVersion } from "@oh-my-pi/pi-ai/providers/claude-code-fingerprint";
 import type { UsageFetchContext, UsageLimit, UsageReport } from "@oh-my-pi/pi-ai/usage";
 import { claudeRankingStrategy, claudeUsageProvider } from "@oh-my-pi/pi-ai/usage/claude";
 
@@ -96,7 +96,7 @@ describe("claude usage request headers", () => {
 			fetch: fetchMock,
 		};
 
-		const report = await claudeUsageProvider.fetchUsage(
+		await claudeUsageProvider.fetchUsage(
 			{
 				provider: "anthropic",
 				credential: {
@@ -110,7 +110,6 @@ describe("claude usage request headers", () => {
 			ctx,
 		);
 
-		expect(report).not.toBeNull();
 		expect(calls).toHaveLength(1);
 		expect(calls[0]?.input).toBe("https://api.anthropic.com/api/oauth/usage");
 
@@ -119,7 +118,6 @@ describe("claude usage request headers", () => {
 		expect(getHeaderCaseInsensitive(headers, "user-agent")).toBe(`claude-cli/${claudeCodeVersion} (external, cli)`);
 
 		const beta = getHeaderCaseInsensitive(headers, "anthropic-beta");
-		expect(beta).toBeDefined();
 		const betaTokens = beta?.split(",").map(tokenValue => tokenValue.trim()) ?? [];
 		expect(betaTokens).toContain("claude-code-20250219");
 		expect(betaTokens).toContain("oauth-2025-04-20");
@@ -239,7 +237,7 @@ describe("claude usage request headers", () => {
 		expect(weekly?.scope.shared).toBe(true);
 	});
 
-	it("skips inactive and unnamed scoped limits", async () => {
+	it("surfaces inactive scoped limits and skips unnamed ones", async () => {
 		const now = Date.now();
 		const futureReset = new Date(now + 4 * 24 * 60 * 60 * 1000).toISOString();
 		const fetchMock = (async () => {
@@ -248,11 +246,14 @@ describe("claude usage request headers", () => {
 					five_hour: { utilization: 16, resets_at: new Date(now + 5 * 60 * 60 * 1000).toISOString() },
 					limits: [
 						{
+							// Anthropic marks only the currently binding limit
+							// `is_active`; an idle scoped bucket still carries real
+							// utilization and must render instead of "not reported".
 							kind: "weekly_scoped",
 							group: "weekly",
-							percent: 0,
+							percent: 5,
 							severity: "normal",
-							resets_at: null,
+							resets_at: futureReset,
 							scope: { model: { display_name: "Fable", id: null }, surface: null },
 							is_active: false,
 						},
@@ -283,8 +284,11 @@ describe("claude usage request headers", () => {
 			ctx,
 		);
 
-		expect(report?.limits.some(limit => limit.id.includes(":fable"))).toBe(false);
-		expect(report?.limits.map(limit => limit.id)).toEqual(["anthropic:5h"]);
+		expect(report?.limits.map(limit => limit.id)).toEqual(["anthropic:5h", "anthropic:7d:fable"]);
+		const fable = report?.limits.find(limit => limit.id === "anthropic:7d:fable");
+		expect(fable?.amount.used).toBe(5);
+		expect(fable?.window?.resetsAt).toBe(Date.parse(futureReset));
+		expect(fable?.status).toBe("ok");
 	});
 
 	it("falls back to session and weekly_all entries when legacy buckets are absent", async () => {
@@ -338,7 +342,6 @@ describe("claude usage request headers", () => {
 		// instead of burning retries. The trailing /profile call is the expected
 		// identity backfill for a payload/credential carrying no account identity.
 		expect(calls.filter(url => url.endsWith("/usage"))).toEqual(["https://api.anthropic.com/api/oauth/usage"]);
-		expect(report).not.toBeNull();
 		expect(report?.limits.map(limit => limit.id)).toEqual(["anthropic:5h", "anthropic:7d"]);
 		const session = report?.limits.find(limit => limit.id === "anthropic:5h");
 		const weekly = report?.limits.find(limit => limit.id === "anthropic:7d");
@@ -915,7 +918,6 @@ describe("claude ranking strategy", () => {
 			limits,
 		};
 
-		expect(claudeRankingStrategy.scopeLimits).toBeDefined();
 		const scopeLimits = claudeRankingStrategy.scopeLimits;
 		if (!scopeLimits) throw new Error("expected claude scopeLimits");
 		expect(scopeLimits(report).map(limit => limit.id)).toEqual(["anthropic:5h", "anthropic:7d"]);

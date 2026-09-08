@@ -30,20 +30,14 @@ export interface TavilySearchParams {
 	/** `before:` upper bound, ISO `YYYY-MM-DD`, mapped to `end_date`. */
 	end_date?: string;
 	signal?: AbortSignal;
+	timeoutMs?: number;
 	fetch?: FetchImpl;
 }
 
-interface TavilySearchResult {
-	title?: string | null;
-	url?: string | null;
-	content?: string | null;
-	published_date?: string | null;
-}
-
 interface TavilySearchResponse {
-	answer?: string | null;
-	results?: TavilySearchResult[];
-	request_id?: string | null;
+	answer?: unknown;
+	results?: unknown;
+	request_id?: unknown;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -120,7 +114,7 @@ async function callTavilySearch(apiKey: string, params: TavilySearchParams): Pro
 			Authorization: `Bearer ${apiKey}`,
 		},
 		body: JSON.stringify(buildRequestBody(params)),
-		signal: withHardTimeout(params.signal),
+		signal: withHardTimeout(params.signal, params.timeoutMs),
 	});
 
 	if (!response.ok) {
@@ -140,28 +134,36 @@ async function callTavilySearch(apiKey: string, params: TavilySearchParams): Pro
 		throw new SearchProviderError("tavily", `Tavily API error (${response.status}): ${message}`, response.status);
 	}
 
-	return (await response.json()) as TavilySearchResponse;
+	const payload: unknown = await response.json();
+	return asRecord(payload) ?? {};
 }
 
 function toSearchResponse(response: TavilySearchResponse, numResults: number): SearchResponse {
 	const sources: SearchSource[] = [];
 
-	for (const result of response.results ?? []) {
-		if (!result.url) continue;
-		sources.push({
-			title: result.title ?? result.url,
-			url: result.url,
-			snippet: result.content ?? undefined,
-			publishedDate: result.published_date ?? undefined,
-			ageSeconds: dateToAgeSeconds(result.published_date ?? undefined),
-		});
+	if (Array.isArray(response.results)) {
+		for (const value of response.results) {
+			const result = asRecord(value);
+			if (!result || typeof result.url !== "string" || !result.url) continue;
+			const title = typeof result.title === "string" && result.title ? result.title : result.url;
+			const snippet = typeof result.content === "string" ? result.content : undefined;
+			const publishedDate = typeof result.published_date === "string" ? result.published_date : undefined;
+			sources.push({
+				title,
+				url: result.url,
+				snippet,
+				publishedDate,
+				ageSeconds: dateToAgeSeconds(publishedDate),
+			});
+		}
 	}
 
+	const answer = typeof response.answer === "string" ? response.answer.trim() || undefined : undefined;
 	return {
 		provider: "tavily",
-		answer: response.answer?.trim() || undefined,
+		answer,
 		sources: sources.slice(0, numResults),
-		requestId: response.request_id ?? undefined,
+		requestId: typeof response.request_id === "string" ? response.request_id : undefined,
 		authMode: "api_key",
 	};
 }
@@ -189,6 +191,7 @@ export async function searchTavily(params: SearchParams): Promise<SearchResponse
 		num_results: params.numSearchResults ?? params.limit,
 		recency: params.recency,
 		signal: params.signal,
+		timeoutMs: params.timeoutMs,
 		fetch: params.fetch,
 	};
 	if (parsed.hasDirectives) {

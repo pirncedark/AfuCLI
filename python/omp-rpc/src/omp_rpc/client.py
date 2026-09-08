@@ -25,6 +25,7 @@ from .protocol import (
     AutoRetryEndEvent,
     AutoRetryStartEvent,
     BashResult,
+    FastModeResult,
     BranchMessage,
     BranchResult,
     CancellationResult,
@@ -67,6 +68,7 @@ from .protocol import (
     assistant_text,
     parse_agent_messages,
     parse_bash_result,
+    parse_fast_mode_result,
     parse_branch_messages,
     parse_branch_result,
     parse_cancellation_result,
@@ -508,6 +510,7 @@ class RpcClient:
         self._event_condition = threading.Condition()
         self._pending: dict[str, _PendingRequest] = {}
         self._pending_host_tool_calls: dict[str, _PendingHostToolCall] = {}
+        self._host_tool_dispatch_names: dict[str, str] = {}
         self._pending_host_uri_requests: dict[str, _PendingHostUriRequest] = {}
         self._request_id = 0
         self._events = _BoundedHistory[JsonObject](self._max_event_history)
@@ -706,6 +709,7 @@ class RpcClient:
             # reader's exception path) returns early.
             self._mark_closed(RpcProcessExitError("RPC process stopped"))
             self._pending_host_tool_calls.clear()
+            self._host_tool_dispatch_names.clear()
             self._pending_host_uri_requests.clear()
             self._process = None
             self._pgid = None
@@ -913,6 +917,9 @@ class RpcClient:
     def get_state(self) -> SessionState:
         payload = self._request("get_state")
         return parse_session_state(payload)
+
+    def set_fast_mode(self, enabled: bool) -> FastModeResult:
+        return parse_fast_mode_result(self._request("set_fast_mode", enabled=enabled))
 
     def set_model(self, provider: str, model_id: str) -> ModelInfo:
         payload = self._request("set_model", provider=provider, modelId=model_id)
@@ -1346,7 +1353,9 @@ class RpcClient:
 
                 event_payloads = self._events.snapshot_from(start_index)
                 if any(
-                    payload.get("type") == "agent_end" for payload in event_payloads
+                    payload.get("type") == "agent_end"
+                    and payload.get("isTerminal") is not False
+                    for payload in event_payloads
                 ):
                     events = tuple(
                         cast(RpcAgentEvent, parse_notification(payload))
@@ -1418,6 +1427,30 @@ class RpcClient:
             return cast(JsonObject, dict(result))
         raise RpcError("Host tool handlers must return a string or a result mapping")
 
+    def _normalize_host_tool_event(self, payload: JsonObject) -> None:
+        """Rename transport tool events for in-flight host-tool dispatches.
+
+        With `tools.xdev` enabled, omp mounts custom tools as `xd://` devices
+        and the agent invokes them through the `write` tool, so
+        `tool_execution_update`/`tool_execution_end` events report the
+        transport tool (`write`) rather than the host tool that actually ran.
+        The `host_tool_call` frame carries the outer call's `toolCallId` (the
+        device dispatch forwards it verbatim), which lets events for that call
+        be renamed to the executed host tool — consumers observe the same tool
+        names regardless of transport. A top-level call (xdev off) maps the
+        name onto itself. `tool_execution_start` precedes the `host_tool_call`
+        frame on the wire, so start events keep the transport name.
+        """
+        tool_call_id = payload.get("toolCallId")
+        if not isinstance(tool_call_id, str):
+            return
+        if payload.get("type") == "tool_execution_end":
+            tool_name = self._host_tool_dispatch_names.pop(tool_call_id, None)
+        else:
+            tool_name = self._host_tool_dispatch_names.get(tool_call_id)
+        if tool_name is not None:
+            payload["toolName"] = tool_name
+
     def _handle_host_tool_call(self, payload: JsonObject) -> None:
         request_id = payload.get("id")
         tool_name = payload.get("toolName")
@@ -1429,6 +1462,10 @@ class RpcClient:
             or not isinstance(tool_call_id, str)
         ):
             return
+        # Remember the dispatch so tool_execution_* events for this call id can
+        # be renamed from the transport tool to the host tool that ran; see
+        # _normalize_host_tool_event.
+        self._host_tool_dispatch_names[tool_call_id] = tool_name
         if not isinstance(raw_arguments, Mapping):
             self._send_notification(
                 {
@@ -1673,6 +1710,7 @@ class RpcClient:
                     "status": cast(JsonValue, seed.status),
                     "notes": seed.notes,
                     "details": seed.details,
+                    "blocker": seed.blocker,
                 }
 
             content = seed.get("content")
@@ -1683,6 +1721,7 @@ class RpcClient:
             raw_status = seed.get("status")
             raw_notes = seed.get("notes")
             raw_details = seed.get("details")
+            raw_blocker = seed.get("blocker")
             if isinstance(raw_status, str):
                 if raw_status not in _TODO_STATUS_VALUES:
                     raise RpcError(f"Unsupported todo status: {raw_status}")
@@ -1697,6 +1736,7 @@ class RpcClient:
                 "status": cast(JsonValue, status),
                 "notes": raw_notes if isinstance(raw_notes, str) else None,
                 "details": raw_details if isinstance(raw_details, str) else None,
+                "blocker": raw_blocker if isinstance(raw_blocker, str) else None,
             }
 
         def is_phase_seed(seed: TodoSeed | TodoPhaseSeed) -> bool:
@@ -1857,13 +1897,31 @@ class RpcClient:
                     self._handle_host_uri_cancel(payload)
                     continue
 
-                notification = parse_notification(payload)
-                listener_notification = parse_notification(payload)
+                payload_type = payload.get("type")
+                if payload_type in ("tool_execution_update", "tool_execution_end"):
+                    self._normalize_host_tool_event(payload)
+                try:
+                    notification = parse_notification(payload)
+                except (TypeError, ValueError) as exc:
+                    # Protocol drift must not terminate the reader. This also
+                    # demotes parser defects to UnknownNotification; consumers
+                    # that need visibility should register an unknown listener.
+                    notification = UnknownNotification(
+                        _clone_json_object(payload), parse_error=str(exc)
+                    )
+                    if (
+                        payload_type == "agent_end"
+                        and payload.get("isTerminal") is not False
+                    ):
+                        self._append_async_error(
+                            RpcError(f"Failed to parse terminal agent_end: {exc}")
+                        )
+                        self._mark_agent_run_completed()
                 self._dispatch_listeners(
                     "notification",
-                    listener_notification.type,
+                    notification.type,
                     self._notification_listeners,
-                    listener_notification,
+                    notification,
                 )
 
                 if isinstance(notification, ReadyEvent):
@@ -1872,9 +1930,9 @@ class RpcClient:
                     self._ready.set()
                     self._dispatch_listeners(
                         "ready",
-                        listener_notification.type,
+                        notification.type,
                         self._ready_listeners,
-                        listener_notification,
+                        notification,
                     )
                     continue
 
@@ -1882,42 +1940,45 @@ class RpcClient:
                     self._ui_requests.put(notification)
                     self._dispatch_listeners(
                         "ui_request",
-                        listener_notification.type,
+                        notification.type,
                         self._ui_request_listeners,
-                        cast(ExtensionUiRequest, listener_notification),
+                        notification,
                     )
                     continue
 
                 if isinstance(notification, ExtensionError):
                     self._dispatch_listeners(
                         "extension_error",
-                        listener_notification.type,
+                        notification.type,
                         self._extension_error_listeners,
-                        cast(ExtensionError, listener_notification),
+                        notification,
                     )
                     continue
 
                 if isinstance(notification, UnknownNotification):
                     self._dispatch_listeners(
                         "unknown_notification",
-                        listener_notification.type,
+                        notification.type,
                         self._unknown_notification_listeners,
-                        cast(UnknownNotification, listener_notification),
+                        notification,
                     )
                     continue
 
-                listener_event = cast(RpcAgentEvent, listener_notification)
+                event = cast(RpcAgentEvent, notification)
                 self._append_event(payload)
-                if listener_event.type == "agent_end":
+                if (
+                    isinstance(event, AgentEndEvent)
+                    and event.is_terminal is not False
+                ):
                     self._mark_agent_run_completed()
                 self._dispatch_listeners(
-                    "event", listener_event.type, self._event_listeners, listener_event
+                    "event", event.type, self._event_listeners, event
                 )
                 self._dispatch_listeners(
                     "typed_event",
-                    listener_event.type,
-                    self._typed_event_listeners.get(listener_event.type, []),
-                    listener_event,
+                    event.type,
+                    self._typed_event_listeners.get(event.type, []),
+                    event,
                 )
         except Exception as exc:
             self._mark_closed(exc)

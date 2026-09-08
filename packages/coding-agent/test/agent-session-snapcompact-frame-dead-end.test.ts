@@ -1,7 +1,7 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { Agent } from "@oh-my-pi/pi-agent-core";
+import { Agent, RESCUE_SHAKE_CONFIG } from "@oh-my-pi/pi-agent-core";
 import * as compactionModule from "@oh-my-pi/pi-agent-core/compaction";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -38,8 +38,15 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
 
+	beforeAll(async () => {
+		authStorage = await AuthStorage.create(":memory:");
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		modelRegistry = new ModelRegistry(authStorage);
+	});
+
 	const NOTICE_SOURCE = "compaction";
 	const NO_PROGRESS_FRAGMENT = "Compaction freed too little context to make progress";
+	const IMAGE_REMEDY_FRAGMENT = "reduce archived image frames (";
 	const SEEDED_FRAME_COUNT = 16;
 
 	function makeFrames(count: number): Record<string, unknown>[] {
@@ -75,10 +82,7 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 		preArchiveKeptText?: string;
 	}): Promise<void> {
 		tempDir = TempDir.createSync("@pi-snapcompact-frame-dead-end-");
-		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		modelRegistry = new ModelRegistry(authStorage);
-		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		sessionManager = SessionManager.inMemory(tempDir.path());
 
 		let extensionRunner: ExtensionRunner | undefined;
 		if (options.hookArchiveFrames !== undefined) {
@@ -157,9 +161,10 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 				"stale snapcompact archive",
 				userEntryId,
 				150_000,
-				{ readFiles: ["src/a.ts"], modifiedFiles: ["src/b.ts"] },
-				false,
-				makeArchivePreserveData(options.frameCount),
+				{
+					details: { readFiles: ["src/a.ts"], modifiedFiles: ["src/b.ts"] },
+					preserveData: makeArchivePreserveData(options.frameCount),
+				},
 			);
 		}
 
@@ -177,7 +182,7 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 			sessionManager,
 			settings: Settings.isolated({
 				"compaction.autoContinue": true,
-				"compaction.strategy": "snapcompact",
+				"compaction.methodOrder": ["snapcompact", "soft"],
 				// Fixed trigger so the rescue's threshold-derived frame budget is
 				// deterministic: band 0.8 × 60k = 48k minus base/edge reserves
 				// yields well under 16 frames — the rebuild must shrink.
@@ -192,10 +197,13 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 		try {
 			await session?.dispose();
 		} finally {
-			authStorage?.close();
 			await tempDir?.remove();
 			vi.restoreAllMocks();
 		}
+	});
+
+	afterAll(() => {
+		authStorage.close();
 	});
 
 	function collectNotices() {
@@ -269,7 +277,7 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 		});
 
 		const notices = collectNotices();
-		const compactionEnds: { result?: unknown; skipped?: boolean }[] = [];
+		const compactionEnds: { result?: compactionModule.CompactionResult; skipped?: boolean }[] = [];
 		session.subscribe(event => {
 			if (event.type === "auto_compaction_end") {
 				compactionEnds.push({ result: event.result, skipped: event.skipped });
@@ -283,6 +291,7 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 		expect(compactionEnds.length).toBe(1);
 		expect(compactionEnds[0].result).toBeTruthy();
 		expect(compactionEnds[0].skipped).toBeFalsy();
+		expect(compactionEnds[0].result?.preserveData).toBeUndefined();
 		const [, compactOptions] = compactSpy.mock.calls[0] as [unknown, { maxFrames?: number }];
 		expect(compactOptions.maxFrames).toBeDefined();
 		expect(compactOptions.maxFrames as number).toBeLessThan(SEEDED_FRAME_COUNT);
@@ -388,11 +397,12 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 
 		const notices = collectNotices();
 		await triggerMaintenance();
+		expect(shakeSpy).toHaveBeenCalledWith("elide", expect.objectContaining({ config: RESCUE_SHAKE_CONFIG }));
 
-		expect(shakeSpy).toHaveBeenCalledWith("elide", expect.anything());
 		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
 		expect(noProgress.length).toBe(1);
 		expect(noProgress[0].level).toBe("warning");
+		expect(noProgress[0].message).toContain(IMAGE_REMEDY_FRAGMENT);
 		// The dead-end badge must live on the ACTIVE (rebuilt) entry — the
 		// collapsed transcript only shows the latest compaction divider.
 		const compactions = sessionManager
@@ -401,6 +411,7 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 		const active = compactions.at(-1);
 		expect(snapcompact.getPreservedArchive(active?.preserveData)?.frames.length).toBe(4);
 		expect(active?.warning).toContain(NO_PROGRESS_FRAGMENT);
+		expect(active?.warning).toContain(IMAGE_REMEDY_FRAGMENT);
 	});
 
 	it("bails when the kept tail plus fixed context leaves no frame budget", async () => {
@@ -431,7 +442,7 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 		await triggerMaintenance();
 
 		expect(compactSpy).not.toHaveBeenCalled();
-		expect(shakeSpy).toHaveBeenCalledWith("elide", expect.anything());
+		expect(shakeSpy).toHaveBeenCalledWith("elide", expect.objectContaining({ config: RESCUE_SHAKE_CONFIG }));
 		expect(sessionManager.getBranch().at(-1)?.type).not.toBe("compaction");
 	});
 
@@ -455,7 +466,7 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 		await triggerMaintenance();
 
 		expect(compactSpy).not.toHaveBeenCalled();
-		expect(shakeSpy).toHaveBeenCalledWith("elide", expect.anything());
+		expect(shakeSpy).toHaveBeenCalledWith("elide", expect.objectContaining({ config: RESCUE_SHAKE_CONFIG }));
 	});
 
 	it("leaves an oversized non-archive tail to the elide tiers instead of rescuing the archive", async () => {
@@ -492,7 +503,7 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 
 		// The archive was NOT rebuilt; the elide tier got its shot at the tail.
 		expect(compactSpy).not.toHaveBeenCalled();
-		expect(shakeSpy).toHaveBeenCalledWith("elide", expect.anything());
+		expect(shakeSpy).toHaveBeenCalledWith("elide", expect.objectContaining({ config: RESCUE_SHAKE_CONFIG }));
 		const lastEntry = sessionManager.getBranch().at(-1);
 		expect(lastEntry?.type).not.toBe("compaction");
 		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
@@ -539,7 +550,7 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 		// Text-only model: no frame re-render; existing tiers still run and the
 		// existing dead-end warning is preserved.
 		expect(compactSpy).not.toHaveBeenCalled();
-		expect(shakeSpy).toHaveBeenCalledWith("elide", expect.anything());
+		expect(shakeSpy).toHaveBeenCalledWith("elide", expect.objectContaining({ config: RESCUE_SHAKE_CONFIG }));
 		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
 		expect(noProgress.length).toBe(1);
 	});

@@ -1,13 +1,12 @@
 import * as fs from "node:fs";
-import * as path from "node:path";
 
-import { getProjectDir, logger } from "@oh-my-pi/pi-utils";
+import { getProjectDir, logger, Snowflake } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "../../tools";
 import {
-	attachSessionOwner,
 	buildManagedKernelEnv,
 	buildManagedKernelEnvPatch,
 	createCancelledKernelResult,
+	EvalKernelNotRunningError,
 	executeWithKernelBase,
 	getExecutionDeadlineMs,
 	getRemainingTimeoutMs,
@@ -16,6 +15,17 @@ import {
 	waitForPromiseWithCancellation,
 } from "../executor-base";
 import type { JsStatusEvent } from "../js/shared/types";
+import { getEnabledEvalPreludes } from "../preludes";
+import type { EvalToolDescriptor, EvalToolInvokeResult } from "../types";
+import {
+	createKernelSessionRegistry,
+	formatSessionKernelTimeoutAnnotation,
+	formatSessionTimeoutAnnotation,
+	type KernelSession,
+	type KernelSessionRegistryContext,
+	normalizeKernelSessionCwd,
+	requireRemainingKernelTimeoutMs,
+} from "../kernel-session-registry";
 import {
 	checkPythonKernelAvailability,
 	type KernelDisplayOutput,
@@ -23,11 +33,27 @@ import {
 	type KernelExecuteResult,
 	type KernelShutdownResult,
 	PythonKernel,
+	type PythonPreludeSource,
 } from "./kernel";
 import { resolveExplicitPythonRuntime } from "./runtime";
-import { ensurePyToolBridge } from "./tool-bridge";
+import { ensurePyToolBridge, registerPyToolBridge } from "./tool-bridge";
 
 export type PythonKernelMode = "session" | "per-call";
+
+/** Raw request sent to a retained Python kernel's tool registry. */
+export type PythonToolRequest =
+	| { op: "describe"; names: string[] }
+	| { op: "call"; name: string; args: Record<string, unknown> };
+
+/** Session identity and bridge context for invoking a retained Python tool. */
+export interface PythonToolInvokeOptions {
+	cwd: string;
+	sessionId: string;
+	interpreter?: string;
+	kernelOwnerId?: string;
+	toolSession: ToolSession;
+	signal?: AbortSignal;
+}
 
 export interface PythonExecutorOptions {
 	/** Working directory for command execution */
@@ -101,6 +127,11 @@ export interface PythonExecutorOptions {
 
 export interface PythonKernelExecutor {
 	execute: (code: string, options?: KernelExecuteOptions) => Promise<KernelExecuteResult>;
+	syncPreludes?: (
+		preludes: readonly PythonPreludeSource[],
+		signal: AbortSignal | undefined,
+		timeoutMs: number,
+	) => Promise<void>;
 }
 
 export interface PythonResult {
@@ -143,23 +174,9 @@ interface SessionKernelReplacement {
 	promise: Promise<PythonKernel>;
 }
 
-interface PythonSession {
-	sessionKey: string;
-	sessionId: string;
-	cwd: string;
-	kernel: PythonKernel;
+interface PythonSession extends KernelSession<PythonKernel> {
 	generation: number;
 	replacement?: SessionKernelReplacement;
-	ownerIds: Set<string>;
-	hasFallbackOwner: boolean;
-}
-
-const sessions = new Map<string, PythonSession>();
-const startingSessions = new Map<string, Promise<PythonSession>>();
-const resettingSessions = new Map<string, Promise<void>>();
-
-function normalizeSessionCwd(cwd: string): string {
-	return path.resolve(cwd);
 }
 
 function normalizeExplicitInterpreter(cwd: string, interpreter: string | undefined): string {
@@ -170,11 +187,6 @@ function normalizeExplicitInterpreter(cwd: string, interpreter: string | undefin
 	} catch {
 		return resolved;
 	}
-}
-
-function buildSessionKey(sessionId: string, cwd: string, interpreter: string | undefined): string {
-	const normalizedCwd = normalizeSessionCwd(cwd);
-	return `${sessionId}\0${normalizedCwd}\0${normalizeExplicitInterpreter(normalizedCwd, interpreter)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -192,32 +204,16 @@ class PythonExecutionCancelledError extends Error {
 }
 
 function requireRemainingTimeoutMs(deadlineMs?: number): number | undefined {
-	const remainingMs = getRemainingTimeoutMs(deadlineMs);
-	if (remainingMs === undefined) return undefined;
-	if (remainingMs <= 0) {
-		throw new PythonExecutionCancelledError(true);
-	}
-	return remainingMs;
+	return requireRemainingKernelTimeoutMs(deadlineMs, PythonExecutionCancelledError);
 }
 
 // ---------------------------------------------------------------------------
 // Result formatting
 // ---------------------------------------------------------------------------
 
-function formatTimeoutAnnotation(timeoutMs?: number): string | undefined {
-	if (timeoutMs === undefined) return "Command timed out";
-	const secs = Math.max(1, Math.round(timeoutMs / 1000));
-	return `Command timed out after ${secs} seconds`;
-}
+const formatTimeoutAnnotation = formatSessionTimeoutAnnotation;
 
-function formatKernelTimeoutAnnotation(timeoutMs: number | undefined, kernelKilled: boolean): string {
-	const secs = timeoutMs === undefined ? undefined : Math.max(1, Math.round(timeoutMs / 1000));
-	if (kernelKilled) {
-		return "eval cell timed out and the kernel was unresponsive to interrupt; the kernel has been killed and will be recreated on the next call.";
-	}
-	const duration = secs === undefined ? "the configured timeout" : `${secs}s`;
-	return `eval cell timed out after ${duration}; kernel interrupted but remains running. Reset the kernel via { reset: true } if state appears corrupted.`;
-}
+const formatKernelTimeoutAnnotation = formatSessionKernelTimeoutAnnotation;
 
 function createCancelledPythonResult(timedOut: boolean, timeoutMs?: number): PythonResult {
 	const output = timedOut ? (formatTimeoutAnnotation(timeoutMs) ?? "Command timed out") : "";
@@ -239,54 +235,14 @@ async function startKernel(cwd: string, options: PythonExecutorOptions): Promise
 	});
 }
 
-async function acquireSession(
-	sessionKey: string,
-	sessionId: string,
-	cwd: string,
-	options: PythonExecutorOptions,
-): Promise<PythonSession> {
-	const existing = sessions.get(sessionKey);
-	if (existing) {
-		attachSessionOwner(existing, sessionId, options.kernelOwnerId);
-		return existing;
-	}
-	const starting = startingSessions.get(sessionKey);
-	if (starting) {
-		const session = await starting;
-		attachSessionOwner(session, sessionId, options.kernelOwnerId);
-		return session;
-	}
-	const startup = (async () => {
-		const kernel = await startKernel(cwd, options);
-		const session: PythonSession = {
-			sessionKey,
-			sessionId,
-			cwd,
-			kernel,
-			generation: 0,
-			ownerIds: new Set(),
-			hasFallbackOwner: false,
-		};
-		sessions.set(sessionKey, session);
-		return session;
-	})();
-	startingSessions.set(sessionKey, startup);
-	try {
-		const session = await startup;
-		attachSessionOwner(session, sessionId, options.kernelOwnerId);
-		return session;
-	} finally {
-		if (startingSessions.get(sessionKey) === startup) startingSessions.delete(sessionKey);
-	}
-}
-
 async function replaceSessionKernel(
 	session: PythonSession,
-	kernel: PythonKernel,
-	generation: number,
 	cwd: string,
 	options: PythonExecutorOptions,
+	context: KernelSessionRegistryContext<PythonKernel, PythonExecutorOptions, PythonSession>,
 ): Promise<PythonKernel> {
+	const kernel = session.kernel;
+	const generation = session.generation;
 	const inFlight = session.replacement;
 	if (inFlight?.generation === generation) {
 		if (
@@ -297,7 +253,11 @@ async function replaceSessionKernel(
 		}
 		return await waitForPromiseWithCancellation(inFlight.promise, options, PythonExecutionCancelledError);
 	}
-	if (sessions.get(session.sessionKey) !== session || session.generation !== generation || session.kernel !== kernel) {
+	if (
+		context.sessions.get(session.sessionKey) !== session ||
+		session.generation !== generation ||
+		session.kernel !== kernel
+	) {
 		throw new PythonExecutionCancelledError(false);
 	}
 
@@ -318,7 +278,7 @@ async function replaceSessionKernel(
 				throw new PythonExecutionCancelledError(true);
 			}
 			if (
-				sessions.get(session.sessionKey) !== session ||
+				context.sessions.get(session.sessionKey) !== session ||
 				session.generation !== generation ||
 				session.kernel !== kernel
 			) {
@@ -330,7 +290,7 @@ async function replaceSessionKernel(
 				deadlineMs: undefined,
 			});
 			if (
-				sessions.get(session.sessionKey) !== session ||
+				context.sessions.get(session.sessionKey) !== session ||
 				session.generation !== generation ||
 				session.kernel !== kernel
 			) {
@@ -359,101 +319,40 @@ async function acquireLiveSessionKernel(
 	session: PythonSession,
 	cwd: string,
 	options: PythonExecutorOptions,
+	context: KernelSessionRegistryContext<PythonKernel, PythonExecutorOptions, PythonSession>,
 ): Promise<PythonKernel> {
-	while (sessions.get(session.sessionKey) === session) {
+	while (context.sessions.get(session.sessionKey) === session) {
 		const kernel = session.kernel;
-		const generation = session.generation;
 		if (kernel.isAlive()) return kernel;
-		await replaceSessionKernel(session, kernel, generation, cwd, options);
+		await context.replaceSessionKernel(session, cwd, options);
 	}
 	throw new PythonExecutionCancelledError(false);
-}
-
-async function resetSession(sessionKey: string): Promise<void> {
-	const existing = sessions.get(sessionKey) ?? (await startingSessions.get(sessionKey)?.catch(() => undefined));
-	if (!existing) return;
-	existing.generation += 1;
-	sessions.delete(sessionKey);
-	await shutdownInvalidatedSession(existing).catch(() => undefined);
-}
-
-// ---------------------------------------------------------------------------
-// Public dispose entry points
-// ---------------------------------------------------------------------------
-
-export async function disposeAllKernelSessions(): Promise<void> {
-	const pending = [...startingSessions.values()];
-	startingSessions.clear();
-	const started = await Promise.allSettled(pending);
-	const all = [...sessions.entries()];
-	for (const result of started) {
-		if (result.status !== "fulfilled") continue;
-		if (!all.some(([, session]) => session === result.value)) {
-			all.push([result.value.sessionKey, result.value]);
-		}
-	}
-	for (const [id, session] of all) {
-		session.generation += 1;
-		if (sessions.get(id) === session) sessions.delete(id);
-	}
-	const results = await Promise.allSettled(all.map(([, session]) => shutdownInvalidatedSession(session)));
-	for (let i = 0; i < all.length; i += 1) {
-		const [id, session] = all[i];
-		const result = results[i];
-		if (result.status === "fulfilled" && result.value?.confirmed !== false) continue;
-		const reason = result.status === "rejected" ? result.reason : "not confirmed";
-		logger.warn("Python kernel shutdown not confirmed", {
-			sessionId: session.sessionId,
-			sessionKey: id,
-			cwd: session.cwd,
-			reason,
-		});
-		if (!sessions.has(id)) sessions.set(id, session);
-	}
-}
-
-export async function disposeKernelSessionsByOwner(ownerId: string): Promise<void> {
-	const toShutdown: PythonSession[] = [];
-	for (const session of [...sessions.values()]) {
-		if (!session.ownerIds.has(ownerId)) continue;
-		if (session.ownerIds.size === 1) {
-			toShutdown.push(session);
-			continue;
-		}
-		session.ownerIds.delete(ownerId);
-	}
-	for (const session of toShutdown) {
-		session.generation += 1;
-		if (sessions.get(session.sessionKey) === session) sessions.delete(session.sessionKey);
-	}
-	const results = await Promise.allSettled(toShutdown.map(session => shutdownInvalidatedSession(session)));
-	for (let i = 0; i < toShutdown.length; i += 1) {
-		const session = toShutdown[i];
-		const result = results[i];
-		if (result.status === "fulfilled" && result.value?.confirmed !== false) {
-			session.ownerIds.delete(ownerId);
-			continue;
-		}
-		const reason = result.status === "rejected" ? result.reason : "not confirmed";
-		logger.warn("Python kernel shutdown not confirmed", {
-			sessionId: session.sessionId,
-			sessionKey: session.sessionKey,
-			cwd: session.cwd,
-			reason,
-		});
-		if (!sessions.has(session.sessionKey)) sessions.set(session.sessionKey, session);
-	}
 }
 
 // ---------------------------------------------------------------------------
 // Execution
 // ---------------------------------------------------------------------------
 
+function pythonPreludeSources(session: ToolSession | undefined): PythonPreludeSource[] {
+	const definitions = getEnabledEvalPreludes(session?.getEvalPreludes?.() ?? []);
+	return definitions.flatMap(definition =>
+		definition.python.trim().length === 0
+			? []
+			: [{ name: definition.name, exports: [...definition.exports], source: definition.python }],
+	);
+}
+
 async function executeWithKernel(
 	kernel: PythonKernelExecutor,
 	code: string,
 	options: PythonExecutorOptions | undefined,
 ): Promise<PythonResult> {
+	const remainingMs = getRemainingTimeoutMs(options?.deadlineMs);
+	await kernel.syncPreludes?.(
+		pythonPreludeSources(options?.toolSession),
+		options?.signal,
+		Math.max(1, remainingMs ?? 10_000),
+	);
 	return executeWithKernelBase<PythonExecutorOptions>({
 		kernel,
 		code,
@@ -501,59 +400,129 @@ async function executePerCall(code: string, cwd: string, options: PythonExecutor
 	}
 }
 
-async function executeOnSession(code: string, cwd: string, options: PythonExecutorOptions): Promise<PythonResult> {
-	const sessionId = options.sessionId ?? `session:${cwd}`;
-	const sessionKey = buildSessionKey(sessionId, cwd, options.interpreter);
-	if (options.bridge && !options.bridgeSessionId) {
-		options.bridgeSessionId = sessionId;
-	}
-	if (options.reset) {
-		// Coalesce concurrent resets: if another reset is in flight for this
-		// session, await it instead of throwing — the caller's intent ("start
-		// from a clean kernel") is satisfied once that reset settles.
-		const inFlight = resettingSessions.get(sessionKey);
-		if (inFlight) await inFlight.catch(() => undefined);
-		else {
-			const resetPromise = resetSession(sessionKey);
-			resettingSessions.set(
-				sessionKey,
-				resetPromise.then(() => undefined),
-			);
-			try {
-				await resetPromise;
-			} finally {
-				resettingSessions.delete(sessionKey);
-			}
-		}
-	} else {
-		// A reset already in progress is an internal coordination state, not a
-		// user-visible failure. Wait for it to clear, then proceed with the
-		// requested execution on the freshly-restarted kernel.
-		const inFlight = resettingSessions.get(sessionKey);
-		if (inFlight) await inFlight.catch(() => undefined);
-	}
-	const session = await acquireSession(sessionKey, sessionId, cwd, options);
-	if (options.signal?.aborted) {
-		throw new PythonExecutionCancelledError(
-			isTimedOutCancellation(options.signal.reason, PythonExecutionCancelledError, options.signal),
-		);
-	}
-	const kernel = await acquireLiveSessionKernel(session, cwd, options);
-	if (sessions.get(session.sessionKey) !== session || session.kernel !== kernel) {
-		throw new PythonExecutionCancelledError(false);
-	}
-	const runOptions = { ...options, cwd };
+const sessionRegistry = createKernelSessionRegistry<PythonKernel, PythonExecutorOptions, PythonResult, PythonSession>({
+	languageLabel: "Python",
+	cancelledErrorClass: PythonExecutionCancelledError,
+	buildSessionKey: (sessionId, cwd, interpreter) => {
+		const normalizedCwd = normalizeKernelSessionCwd(cwd);
+		return `${sessionId}\0${normalizedCwd}\0${normalizeExplicitInterpreter(normalizedCwd, interpreter)}`;
+	},
+	createSession: session => ({ ...session, generation: 0 }),
+	startKernel,
+	executeWithKernel,
+	replaceSessionKernel,
+	acquireLiveSessionKernel,
+	invalidateSession: session => {
+		session.generation += 1;
+	},
+	shutdownSession: session => shutdownInvalidatedSession(session),
+	validateKernel: (session, kernel) => session.kernel === kernel,
+});
+
+interface PythonToolRequestOutcome {
+	execution: KernelExecuteResult;
+	envelope: unknown;
+}
+
+function isUnknownRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function pythonToolError(execution: KernelExecuteResult): string {
+	const error = execution.error;
+	if (!error) return "Python tool request failed";
+	return error.value || error.name || "Python tool request failed";
+}
+
+async function invokePythonToolRequest(
+	request: PythonToolRequest,
+	options: PythonToolInvokeOptions,
+): Promise<PythonToolRequestOutcome> {
+	const cwd = normalizeKernelSessionCwd(options.cwd);
+	const kernel = sessionRegistry.peekLiveKernel(cwd, {
+		cwd,
+		sessionId: options.sessionId,
+		interpreter: options.interpreter,
+		kernelOwnerId: options.kernelOwnerId,
+	});
+	if (!kernel) throw new EvalKernelNotRunningError("Python");
+
+	const bridgeOptions: PythonExecutorOptions = {
+		cwd,
+		sessionId: options.sessionId,
+		interpreter: options.interpreter,
+		kernelOwnerId: options.kernelOwnerId,
+		toolSession: options.toolSession,
+		signal: options.signal,
+	};
+	await ensureToolBridge(bridgeOptions);
+
+	const runId = Snowflake.next();
+	const unregister = registerPyToolBridge(options.sessionId, runId, {
+		toolSession: options.toolSession,
+		signal: options.signal,
+		emitStatus: undefined,
+	});
+	let envelope: unknown;
 	try {
-		return await executeWithKernel(kernel, code, runOptions);
-	} catch (err) {
-		if (isCancellationError(err, PythonExecutionCancelledError) || options.signal?.aborted) throw err;
-		if (kernel.isAlive()) throw err;
-		const retryKernel = await acquireLiveSessionKernel(session, cwd, options);
-		if (sessions.get(session.sessionKey) !== session || session.kernel !== retryKernel) {
-			throw new PythonExecutionCancelledError(false);
-		}
-		return await executeWithKernel(retryKernel, code, runOptions);
+		const execution = await kernel.invokeTool(request, {
+			id: runId,
+			signal: options.signal,
+			onDisplay: output => {
+				if (output.type === "json") envelope = output.data;
+			},
+		});
+		return { execution, envelope };
+	} finally {
+		unregister();
 	}
+}
+
+/** Describe named tools defined in a retained Python kernel. */
+export async function describePythonTools(
+	names: string[],
+	options: PythonToolInvokeOptions,
+): Promise<{ tools: EvalToolDescriptor[]; missing: string[] }> {
+	const { execution, envelope } = await invokePythonToolRequest({ op: "describe", names }, options);
+	if (execution.status === "error") throw new Error(pythonToolError(execution));
+	if (!isUnknownRecord(envelope) || envelope.ok !== true) {
+		throw new Error("Python tool describe request returned an invalid response");
+	}
+
+	const rawTools = Array.isArray(envelope.tools) ? envelope.tools : [];
+	const tools: EvalToolDescriptor[] = [];
+	for (const rawTool of rawTools) {
+		if (!isUnknownRecord(rawTool)) continue;
+		const { name, description, parameters } = rawTool;
+		if (typeof name !== "string" || typeof description !== "string" || !isUnknownRecord(parameters)) continue;
+		tools.push({ name, description, parameters, language: "python" });
+	}
+	const missing = Array.isArray(envelope.missing)
+		? envelope.missing.filter((name): name is string => typeof name === "string")
+		: [];
+	return { tools, missing };
+}
+
+/** Invoke a named tool defined in a retained Python kernel. */
+export async function callPythonTool(
+	name: string,
+	args: Record<string, unknown>,
+	options: PythonToolInvokeOptions,
+): Promise<EvalToolInvokeResult> {
+	const { execution, envelope } = await invokePythonToolRequest({ op: "call", name, args }, options);
+	if (execution.status === "error") return { ok: false, error: pythonToolError(execution) };
+	if (!isUnknownRecord(envelope) || envelope.ok !== true || !("value" in envelope)) {
+		return { ok: false, error: "Python tool call returned an invalid response" };
+	}
+	return { ok: true, value: envelope.value };
+}
+
+export async function disposeAllKernelSessions(): Promise<void> {
+	await sessionRegistry.disposeAll();
+}
+
+export async function disposeKernelSessionsByOwner(ownerId: string): Promise<void> {
+	await sessionRegistry.disposeByOwner(ownerId);
 }
 
 export async function executePythonWithKernel(
@@ -565,10 +534,10 @@ export async function executePythonWithKernel(
 }
 
 export async function executePython(code: string, options?: PythonExecutorOptions): Promise<PythonResult> {
-	const cwd = normalizeSessionCwd(options?.cwd ?? getProjectDir());
+	const cwd = normalizeKernelSessionCwd(options?.cwd ?? getProjectDir());
 	const deadlineMs = getExecutionDeadlineMs(options);
 	const executionOptions: PythonExecutorOptions = {
-		...(options ?? {}),
+		...options,
 		cwd,
 		deadlineMs,
 	};
@@ -591,7 +560,7 @@ export async function executePython(code: string, options?: PythonExecutorOption
 		if (kernelMode === "per-call") {
 			return await executePerCall(code, cwd, executionOptions);
 		}
-		return await executeOnSession(code, cwd, executionOptions);
+		return await sessionRegistry.executeOnSession(code, cwd, executionOptions);
 	} catch (err) {
 		if (isCancellationError(err, PythonExecutionCancelledError) || executionOptions.signal?.aborted) {
 			return createCancelledPythonResult(

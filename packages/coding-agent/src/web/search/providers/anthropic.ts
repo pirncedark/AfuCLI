@@ -19,6 +19,7 @@ import {
 	withAuth,
 	wrapFetchForCch,
 } from "@oh-my-pi/pi-ai";
+import { classifyModel, compareRevision, parseRevision } from "@oh-my-pi/pi-catalog/identity";
 import { $env } from "@oh-my-pi/pi-utils";
 import type {
 	AnthropicApiResponse,
@@ -32,6 +33,22 @@ import { formatQuery, parseSearchQuery, type QuerySyntax, type StructuredQuery }
 import type { SearchParams } from "./base";
 import { SearchProvider } from "./base";
 import { classifyProviderHttpError, withHardTimeout } from "./utils";
+
+function hasSamplingRestrictions(modelId: string): boolean {
+	const identity = classifyModel("anthropic", modelId, { lenient: true });
+	if (identity.class !== "anthropic" || identity.revision === undefined) return false;
+	const revision = parseRevision(identity.revision);
+	const floor = parseRevision(identity.family === "opus" ? "4.7" : "5");
+	return (
+		revision !== undefined &&
+		floor !== undefined &&
+		(identity.family === "opus" ||
+			identity.family === "sonnet" ||
+			identity.family === "fable" ||
+			identity.family === "mythos") &&
+		compareRevision(revision, floor) >= 0
+	);
+}
 
 const DEFAULT_MODEL = "claude-haiku-4-5";
 const DEFAULT_MAX_TOKENS = 4096;
@@ -97,6 +114,7 @@ export interface AnthropicSearchParams {
 	max_tokens?: number;
 	temperature?: number;
 	signal?: AbortSignal;
+	timeoutMs?: number;
 	fetch?: FetchImpl;
 }
 
@@ -128,7 +146,6 @@ function buildSystemBlocks(
 	return buildAnthropicSystemBlocks(systemPrompt ? [systemPrompt] : undefined, {
 		includeClaudeCodeInstruction: includeClaudeCode,
 		extraInstructions,
-		cacheControl: { type: "ephemeral" },
 	});
 }
 
@@ -152,6 +169,7 @@ async function callSearch(
 	temperature?: number,
 	signal?: AbortSignal,
 	fetchImpl: FetchImpl = fetch,
+	timeoutMs?: number,
 ): Promise<AnthropicApiResponse> {
 	const url = buildAnthropicUrl(auth);
 	const headers = buildAnthropicSearchHeaders(auth);
@@ -176,7 +194,8 @@ async function callSearch(
 		body.metadata = { user_id: metadataUserId };
 	}
 
-	if (temperature !== undefined) {
+	// Opus 4.7+, Sonnet 5+, and Fable/Mythos 5 reject sampling parameters with a 400.
+	if (temperature !== undefined && !hasSamplingRestrictions(model)) {
 		body.temperature = temperature;
 	}
 
@@ -191,7 +210,7 @@ async function callSearch(
 		method: "POST",
 		headers,
 		body: JSON.stringify(body),
-		signal: withHardTimeout(signal),
+		signal: withHardTimeout(signal, timeoutMs),
 	});
 
 	if (!response.ok) {
@@ -367,6 +386,7 @@ export async function searchAnthropic(
 				params.temperature,
 				params.signal,
 				params.fetch,
+				params.timeoutMs,
 			);
 		},
 		{

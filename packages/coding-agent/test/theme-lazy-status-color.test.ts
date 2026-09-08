@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as themeModule from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
+import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
 
 /**
@@ -12,9 +15,13 @@ import { Text } from "@oh-my-pi/pi-tui";
  */
 
 /** Opening SGR sequence `theme.fg(color, ...)` emits, independent of color mode. */
-function fgPrefix(color: "warning"): string {
+function fgPrefix(color: "accent" | "muted" | "warning"): string {
 	const styled = themeModule.theme.fg(color, "\u0001");
 	return styled.slice(0, styled.indexOf("\u0001"));
+}
+
+function isSingleComponent(component: Component | readonly Component[]): component is Component {
+	return !Array.isArray(component);
 }
 
 describe("lazy status color re-resolves on theme switch", () => {
@@ -62,5 +69,59 @@ describe("lazy status color re-resolves on theme switch", () => {
 		const out = warning.render(80).join("");
 		expect(out).toContain(lightPrefix);
 		expect(out).not.toContain(darkPrefix);
+	});
+	it("recolors the presented update notification when auto-theme resolves light", async () => {
+		themeModule.onTerminalAppearanceChange("dark");
+		await themeModule.initTheme(false, undefined, undefined, "dark-catppuccin", "light-catppuccin");
+
+		let presented: Component | undefined;
+		const context: Pick<InteractiveModeContext, "present"> = {
+			present(component) {
+				if (!isSingleComponent(component)) throw new Error("Expected one update notification block");
+				presented = component;
+			},
+		};
+		new UiHelpers(context as InteractiveModeContext).showNewVersionNotification("1.2.3");
+		const notification = presented;
+		if (!notification) throw new Error("Update notification was not presented");
+
+		const darkPrefixes = {
+			warning: fgPrefix("warning"),
+			muted: fgPrefix("muted"),
+			accent: fgPrefix("accent"),
+		};
+		const darkOutput = notification.render(100).join("\n");
+		expect(darkOutput).toContain(darkPrefixes.warning);
+		expect(darkOutput).toContain(darkPrefixes.muted);
+		expect(darkOutput).toContain(darkPrefixes.accent);
+
+		const switched = Promise.withResolvers<void>();
+		const off = themeModule.onThemeChange(() => switched.resolve());
+		try {
+			themeModule.onTerminalAppearanceChange("light");
+			await switched.promise;
+		} finally {
+			off();
+		}
+
+		const lightPrefixes = {
+			warning: fgPrefix("warning"),
+			muted: fgPrefix("muted"),
+			accent: fgPrefix("accent"),
+		};
+		expect(lightPrefixes.warning).not.toBe(darkPrefixes.warning);
+		expect(lightPrefixes.muted).not.toBe(darkPrefixes.muted);
+		expect(lightPrefixes.accent).not.toBe(darkPrefixes.accent);
+
+		notification.invalidate?.();
+		const lightOutput = notification.render(100).join("\n");
+		for (const prefix of Object.values(lightPrefixes)) expect(lightOutput).toContain(prefix);
+		for (const prefix of Object.values(darkPrefixes)) expect(lightOutput).not.toContain(prefix);
+
+		const semanticLines = Bun.stripANSI(lightOutput)
+			.split("\n")
+			.map(line => line.trim())
+			.filter(line => line === "Update Available" || line.startsWith("New version "));
+		expect(semanticLines).toEqual(["Update Available", "New version 1.2.3 is available. Run: omp update"]);
 	});
 });

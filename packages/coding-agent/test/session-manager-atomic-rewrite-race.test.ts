@@ -27,7 +27,10 @@ class DetachingRewriteStorage extends MemorySessionStorage {
 	guardRejections = 0;
 	readonly #writers = new Set<DetachableWriter>();
 
-	openWriter(path: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }): SessionStorageWriter {
+	override openWriter(
+		path: string,
+		options?: { flags?: "a" | "w"; onError?: (err: Error) => void },
+	): SessionStorageWriter {
 		const inner = super.openWriter(path, options);
 		const writers = this.#writers;
 		const detachedLines = this.detachedLines;
@@ -300,7 +303,7 @@ describe("SessionManager atomic rewrite race", () => {
 		// Simulate a Ctrl+C teardown: append a session_exit custom entry (fenced
 		// because the atomic rewrite is active) and flushSync it.
 		sessionManager.appendCustomEntry("session_exit", { reason: "sigterm", kind: "signal" });
-		expect(() => sessionManager.flushSync()).not.toThrow();
+		sessionManager.flushSync();
 
 		const sessionFile = sessionManager.getSessionFile();
 		if (!sessionFile) throw new Error("Expected session file");
@@ -364,10 +367,16 @@ describe("SessionManager atomic rewrite fence spans writer.close()", () => {
 
 		sessionManager.appendMessage({ role: "user", content: "during close", timestamp: Date.now() });
 		sessionManager.appendCustomEntry("during_close_custom", { reason: "guard" });
-		// Pre-fix, #appendToSessionFile would take the hot path and call
-		// storage.openWriter here; the writer would then be caught by the pending
-		// writeTextAtomic detachment. Fence keeps writerOpens flat.
-		expect(storage.writerOpens).toBe(opensBeforeRewrite);
+		// First fenced append supersedes the in-flight atomic with a synchronous
+		// full-body rewrite (software-crash durable before return). That bumps
+		// `#diskEpoch`, so a second append may open a hot-path writer against the
+		// already-published body; the abandoned atomic's commitGuard must still
+		// refuse to clobber it, and nothing may land on a detached handle.
+		const sessionFileMid = sessionManager.getSessionFile();
+		if (!sessionFileMid) throw new Error("Expected session file");
+		const midContent = await storage.readText(sessionFileMid);
+		expect(midContent).toContain("during close");
+		expect(midContent).toContain('"customType":"during_close_custom"');
 
 		storage.allowClose.resolve();
 		storage.allowWrite.resolve();
@@ -379,6 +388,9 @@ describe("SessionManager atomic rewrite fence spans writer.close()", () => {
 		const content = await storage.readText(sessionFile);
 		expect(content).toContain("during close");
 		expect(content).toContain('"customType":"during_close_custom"');
+		// Superseding rewrite may finish before the paused atomic reaches its
+		// commitGuard; either way the fenced entries must remain and no append
+		// may land on a detached handle.
 		expect(storage.detachedLines).toEqual([]);
 	});
 });
@@ -443,15 +455,22 @@ describe("SessionManager title-change fallback fenced-append durability", () => 
 		const rename = sessionManager.setSessionName("second title", "user", "test");
 		await storage.writeStarted.promise;
 
-		// Fenced appends during the paused fallback rewrite: pre-fix these
-		// would be marked dirty and dropped from the serialized body because
-		// the fallback never looped on that flag.
+		// Fenced appends during the paused fallback rewrite supersede the atomic
+		// with a synchronous full-body rewrite, so they are on disk before the
+		// paused publish resumes. The abandoned atomic's body must not clobber
+		// them when released.
 		sessionManager.appendMessage({
 			role: "user",
 			content: "during title fallback",
 			timestamp: Date.now(),
 		});
 		sessionManager.appendCustomEntry("during_title_fallback_custom", { reason: "test" });
+
+		const sessionFileMid = sessionManager.getSessionFile();
+		if (!sessionFileMid) throw new Error("Expected session file");
+		const midContent = await storage.readText(sessionFileMid);
+		expect(midContent).toContain("during title fallback");
+		expect(midContent).toContain('"customType":"during_title_fallback_custom"');
 
 		storage.allowWrite.resolve();
 		await rename;
@@ -463,9 +482,10 @@ describe("SessionManager title-change fallback fenced-append durability", () => 
 		expect(content).toContain('"title":"second title"');
 		expect(content).toContain("during title fallback");
 		expect(content).toContain('"customType":"during_title_fallback_custom"');
-		// Loop must have executed at least twice: first pass paused, dirty from
-		// the fenced appends triggers a second pass that includes them.
-		expect(storage.writeTextAtomicCalls).toBeGreaterThanOrEqual(2);
+		// At least the failed title path's atomic fallback ran once; fenced
+		// appends may have superseded it via writeTextSync without a second
+		// atomic pass.
+		expect(storage.writeTextAtomicCalls).toBeGreaterThanOrEqual(1);
 	});
 });
 
@@ -508,7 +528,7 @@ describe("SessionManager fence relaxes when flushSync supersedes the atomic rewr
 
 		// (2) flushSync supersedes the pending atomic (bumps #diskEpoch) and
 		// publishes a synchronous body containing X1.
-		expect(() => sessionManager.flushSync()).not.toThrow();
+		sessionManager.flushSync();
 
 		// (3) Post-flushSync append MUST take the hot path: pre-fix, the fence
 		// stayed active and this entry was only marked dirty, then dropped when
@@ -652,7 +672,7 @@ describe("SessionManager fence handoff across superseded rewrites", () => {
 		// A fenced append flips fileIsCurrent so flushSync actually publishes,
 		// bumping the epoch to 1 with the fenced entry captured in the body.
 		sessionManager.appendCustomEntry("during_stale", { data: "X1" });
-		expect(() => sessionManager.flushSync()).not.toThrow();
+		sessionManager.flushSync();
 
 		// Newer rewrite scheduled at epoch=1. Parks at pauses[1]. Fence epoch = 1.
 		const newer = sessionManager.rewriteEntries();

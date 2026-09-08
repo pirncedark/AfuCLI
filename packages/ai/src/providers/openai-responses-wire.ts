@@ -2515,6 +2515,14 @@ export interface ResponseFunctionToolCall {
 	 */
 	namespace?: string;
 	/**
+	 * Plaintext-argument marker for collaboration tool calls (codex-rs
+	 * `encrypted_function_args`, #35845): an empty array marks the arguments as
+	 * plaintext agent-message payloads rather than encrypted blobs. Preserved
+	 * verbatim across history replay so the backend keeps treating them as
+	 * plaintext; omitted entirely for ordinary function calls.
+	 */
+	encrypted_function_args?: string[];
+	/**
 	 * The status of the item. One of `in_progress`, `completed`, or `incomplete`.
 	 * Populated when items are returned via API.
 	 */
@@ -3005,6 +3013,7 @@ export type ResponseInputItem =
 	| ResponseCustomToolCallOutput
 	| ResponseCustomToolCall
 	| ResponseInputItem.CompactionTrigger
+	| ResponseInputItem.ConfigurationUpdate
 	| ResponseInputItem.ItemReference;
 export declare namespace ResponseInputItem {
 	/**
@@ -3590,6 +3599,20 @@ export declare namespace ResponseInputItem {
 		 * The type of the item. Always `compaction_trigger`.
 		 */
 		type: "compaction_trigger";
+	}
+	/**
+	 * Changes reasoning effort for subsequent responses without touching the
+	 * request-level `reasoning.effort` (GPT-6 Astra). Must not be adjacent to
+	 * another `configuration_update`.
+	 */
+	interface ConfigurationUpdate {
+		/**
+		 * The type of the item. Always `configuration_update`.
+		 */
+		type: "configuration_update";
+		reasoning: {
+			effort: string;
+		};
 	}
 	/**
 	 * An internal identifier for an item to reference.

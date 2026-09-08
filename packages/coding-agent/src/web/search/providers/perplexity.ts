@@ -150,6 +150,7 @@ interface PerplexityOAuthStreamEvent {
 	error_code?: string;
 	error_message?: string;
 	display_model?: string;
+	user_selected_model?: string;
 	uuid?: string;
 }
 
@@ -322,11 +323,16 @@ function sourcesFromTextPayload(text: string | undefined): SearchSource[] {
 }
 export interface PerplexitySearchParams {
 	signal?: AbortSignal;
+	timeoutMs?: number;
 	query: string;
 	system_prompt?: string;
 	/** Pre-parsed view of `query` from the search pipeline; parsed locally when absent. */
 	parsedQuery?: StructuredQuery;
+	/** Direct API model. Defaults to `PI_PERPLEXITY_API_MODEL`, then `sonar-pro`. */
+	api_model?: string;
 	search_recency_filter?: "hour" | "day" | "week" | "month" | "year";
+	/** Consumer subscription model preference. Defaults to `PI_PERPLEXITY_MODEL`, then Sonar (`experimental`). */
+	subscription_model?: string;
 	num_results?: number;
 	/** Maximum output tokens. Defaults to 8192. */
 	max_tokens?: number;
@@ -498,10 +504,11 @@ async function callPerplexityApi(
 	request: PerplexityRequest,
 	fetchImpl: FetchImpl | undefined,
 	signal?: AbortSignal,
+	timeoutMs?: number,
 ): Promise<SearchResponse> {
 	const metadata: PerplexityApiStreamMetadata = {};
 	const context = buildPerplexityContext(request);
-	const requestSignal = withHardTimeout(signal);
+	const requestSignal = withHardTimeout(signal, timeoutMs);
 	const onSseEvent = (event: { data: string }): void => {
 		collectPerplexityMetadata(metadata, event.data);
 	};
@@ -535,6 +542,15 @@ async function callPerplexityApi(
 	}
 
 	return parseStreamedApiResponse(message, metadata);
+}
+
+function oauthSourceKey(url: string): string {
+	const trimmed = url.trim().replace(/\/$/, "");
+	try {
+		return new URL(trimmed).href.replace(/\/$/, "");
+	} catch {
+		return trimmed.toLowerCase();
+	}
 }
 
 function buildOAuthSources(event: PerplexityOAuthStreamEvent): SearchSource[] {
@@ -605,6 +621,7 @@ async function callPerplexityAsk(
 	params: PerplexitySearchParams,
 	filters: PerplexityNativeFilters,
 ): Promise<{ answer: string; sources: SearchSource[]; model?: string; requestId?: string }> {
+	const subscriptionModel = params.subscription_model?.trim() || $env.PI_PERPLEXITY_MODEL?.trim() || "experimental";
 	const requestId = crypto.randomUUID();
 	// The consumer `perplexity_ask` endpoint is itself a research assistant and
 	// has no system-message slot. Prepending the API-style system prompt to the
@@ -643,14 +660,14 @@ async function callPerplexityAsk(
 		query_str: effectiveQuery,
 		search_focus: "internet",
 		mode: "copilot",
-		model_preference: "experimental",
+		model_preference: subscriptionModel,
 		sources: ["web"],
 		attachments: [],
 		frontend_uuid: crypto.randomUUID(),
 		frontend_context_uuid: crypto.randomUUID(),
 		version: OAUTH_API_VERSION,
 		language: "en-US",
-		timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+		timezone: Intl.DateTimeFormat().resolvedOptions().timeZone ?? "UTC",
 		// Recency cannot be combined with absolute date filters; explicit
 		// before:/after: bounds take precedence.
 		search_recency_filter: filters.afterDate || filters.beforeDate ? null : (params.search_recency_filter ?? null),
@@ -690,7 +707,7 @@ async function callPerplexityAsk(
 			query_str: effectiveQuery,
 			params: requestParams,
 		}),
-		signal: withHardTimeout(params.signal),
+		signal: withHardTimeout(params.signal, params.timeoutMs),
 	};
 
 	// The consumer ask endpoint intermittently drops the socket before sending an
@@ -738,12 +755,14 @@ async function callPerplexityAsk(
 		if (eventAnswer.length > 0) {
 			answer = eventAnswer;
 		}
-
 		for (const source of buildOAuthSources(mergedEvent)) {
-			sourcesByUrl.set(source.url, source);
+			sourcesByUrl.set(oauthSourceKey(source.url), source);
 		}
 
-		if (mergedEvent.display_model) model = mergedEvent.display_model;
+		const reportedModel = [mergedEvent.user_selected_model, mergedEvent.display_model].find(
+			candidate => candidate && candidate !== "turbo",
+		);
+		if (reportedModel) model = reportedModel;
 		if (mergedEvent.uuid) finalRequestId = mergedEvent.uuid;
 		if (mergedEvent.final || mergedEvent.status === "COMPLETED") {
 			break;
@@ -753,7 +772,7 @@ async function callPerplexityAsk(
 	return {
 		answer,
 		sources: [...sourcesByUrl.values()],
-		model,
+		model: model ?? (auth.type === "anonymous" ? mergedEvent.display_model : subscriptionModel),
 		requestId: finalRequestId ?? requestId,
 	};
 }
@@ -870,7 +889,7 @@ export async function searchPerplexity(params: PerplexitySearchParams): Promise<
 	messages.push({ role: "user", content: filters.query });
 
 	const request: PerplexityRequest = {
-		model: "sonar-pro",
+		model: params.api_model?.trim() || $env.PI_PERPLEXITY_API_MODEL?.trim() || "sonar-pro",
 		messages,
 		max_tokens: params.max_tokens ?? DEFAULT_MAX_TOKENS,
 		temperature: params.temperature ?? DEFAULT_TEMPERATURE,
@@ -902,7 +921,7 @@ export async function searchPerplexity(params: PerplexitySearchParams): Promise<
 	for (const auth of authMethods) {
 		if (auth.type === "api_key") {
 			try {
-				const result = await callPerplexityApi(auth, request, params.fetch, params.signal);
+				const result = await callPerplexityApi(auth, request, params.fetch, params.signal, params.timeoutMs);
 				result.authMode = "api_key";
 				return applySourceLimit(result, params.num_results);
 			} catch (error) {
@@ -971,13 +990,14 @@ export class PerplexityProvider extends SearchProvider {
 	 * configured provider keeps priority over the anonymous/OpenRouter
 	 * fallbacks.
 	 */
-	isExplicitlyAvailable(_authStorage: AuthStorage): boolean {
+	override isExplicitlyAvailable(_authStorage: AuthStorage): boolean {
 		return true;
 	}
 
 	search(params: SearchParams): Promise<SearchResponse> {
 		return searchPerplexity({
 			signal: params.signal,
+			timeoutMs: params.timeoutMs,
 			query: params.query,
 			parsedQuery: params.parsedQuery,
 			temperature: params.temperature,

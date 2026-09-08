@@ -1,4 +1,4 @@
-import * as fs from "node:fs/promises";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentState } from "@oh-my-pi/pi-agent-core";
 import { APP_NAME, isEnoent } from "@oh-my-pi/pi-utils";
@@ -7,31 +7,38 @@ import type { SessionEntry, SessionHeader } from "../../session/session-entries"
 import { loadEntriesFromFile } from "../../session/session-loader";
 import { SessionManager } from "../../session/session-manager";
 import type { ExportThemeNames } from "./args";
-import templateCss from "./template.css" with { type: "text" };
-import templateHtml from "./template.html" with { type: "text" };
-import templateJs from "./template.js" with { type: "text" };
+import templateCssPath from "./template.css" with { type: "file" };
+import templateHtmlPath from "./template.html" with { type: "file" };
+import templateJsPath from "./template.js" with { type: "file" };
 // Pre-built React tool renderers: built by `gen:tool-views` (`bun run gen:tool-views`),
 // run automatically by root `prepare` on install and by `prepack` at publish.
-import toolViewsJs from "./tool-views.generated.js" with { type: "text" };
+import toolViewsJsPath from "./tool-views.generated.js" with { type: "file" };
 import { webExportThemeVars } from "./web-palette";
 
 export { type ExportThemeNames, parseExportArgs } from "./args";
 
 let cachedTemplate: string | undefined;
+/** Resolve a Bun file-loader value without parsing Windows drive letters as URL schemes. */
+export function resolveBundledHtmlAssetPath(assetPath: string, moduleDir: string = import.meta.dir): string {
+	if (path.isAbsolute(assetPath) || path.win32.isAbsolute(assetPath)) return assetPath;
+	return path.resolve(moduleDir, assetPath);
+}
 
 /** Compose the standalone export template: minified CSS, tool renderers, and viewer JS inlined. */
 export function getTemplate(): string {
 	if (cachedTemplate) return cachedTemplate;
+	const templateCss = fs.readFileSync(resolveBundledHtmlAssetPath(templateCssPath), "utf8");
+	const templateHtml = fs.readFileSync(resolveBundledHtmlAssetPath(templateHtmlPath as unknown as string), "utf8");
+	const templateJs = fs.readFileSync(resolveBundledHtmlAssetPath(templateJsPath), "utf8");
+	const toolViewsJs = fs.readFileSync(resolveBundledHtmlAssetPath(toolViewsJsPath), "utf8");
 	const minifiedCss = templateCss
 		.replace(/\/\*[\s\S]*?\*\//g, "")
 		.replace(/\s+/g, " ")
 		.replace(/\s*([{}:;,])\s*/g, "$1")
 		.trim();
 	// Function replacements so `$'`, `$&`, `$$`, etc. inside the embedded
-	// CSS/JS are not interpreted as substitution patterns. The cast is safe:
-	// `with { type: "text" }` yields a string at runtime; bun-types just types
-	// every *.html import as HTMLBundle (TS can't vary types by import attribute).
-	cachedTemplate = (templateHtml as unknown as string)
+	// CSS/JS are not interpreted as substitution patterns.
+	cachedTemplate = templateHtml
 		.replace("<template-css/>", () => `<style>${minifiedCss}</style>`)
 		.replace("<template-tool-views/>", () => `<script>${toolViewsJs}</script>`)
 		.replace("<template-js/>", () => `<script>${templateJs}</script>`);
@@ -174,10 +181,17 @@ export interface SessionData {
 	subSessions?: Record<string, SubSession>;
 }
 
+function sessionHeaderForExport(header: SessionHeader | null): SessionHeader | null {
+	if (!header) return null;
+	const exported = { ...header };
+	delete exported.previousSessionFiles;
+	return exported;
+}
+
 /** Snapshot the session (plus optional agent state) into the JSON shape the viewer renders. */
 export function buildSessionData(sm: SessionManager, state?: AgentState): SessionData {
 	return {
-		header: sm.getHeader(),
+		header: sessionHeaderForExport(sm.getHeader()),
 		entries: sm.getEntries(),
 		leafId: sm.getLeafId(),
 		systemPrompt: state?.systemPrompt.join("\n\n"),
@@ -207,7 +221,7 @@ async function collectSubSessionsFromDir(
 ): Promise<void> {
 	let names: string[];
 	try {
-		names = await fs.readdir(dir);
+		names = await fs.promises.readdir(dir);
 	} catch (err) {
 		if (isEnoent(err)) return;
 		throw err;
@@ -224,7 +238,7 @@ async function collectSubSessionsFromDir(
 			out[key] = {
 				agentId,
 				parent: parentKey,
-				header,
+				header: sessionHeaderForExport(header),
 				entries,
 				leafId: entries.length > 0 ? entries[entries.length - 1].id : null,
 			};
@@ -288,7 +302,7 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 	}
 
 	const sessionData: SessionData = {
-		header: sm.getHeader(),
+		header: sessionHeaderForExport(sm.getHeader()),
 		entries: sm.getEntries(),
 		leafId: sm.getLeafId(),
 	};

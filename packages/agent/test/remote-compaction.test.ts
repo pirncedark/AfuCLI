@@ -1,24 +1,32 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
+import { ThinkingLevel, Tokenizer } from "@oh-my-pi/pi-agent-core";
 import {
 	type CompactionPreparation,
 	compact,
 	createFileOps,
 	DEFAULT_COMPACTION_SETTINGS,
+	NativeCompactionError,
 	prepareCompaction,
 	type SessionEntry,
 } from "@oh-my-pi/pi-agent-core/compaction";
 import {
 	buildCompactionV2Request,
 	buildOpenAiNativeHistory,
+	CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE,
 	getCompactionV2PreserveData,
 	requestCompactionV2Streaming,
 	requestOpenAiRemoteCompaction,
 	requestRemoteCompaction,
 	shouldUseCompactionV2Streaming,
 	shouldUseOpenAiRemoteCompaction,
+	trimRemoteCompactionInputToContextWindow,
 } from "@oh-my-pi/pi-agent-core/compaction/openai";
 import * as ai from "@oh-my-pi/pi-ai";
-import { getOpenAICodexTransportDetails } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import * as AIError from "@oh-my-pi/pi-ai/error";
+import {
+	buildTransformedCodexRequestBody,
+	getOpenAICodexTransportDetails,
+} from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import type {
 	AssistantMessage,
 	CodexCompactionContext,
@@ -26,6 +34,7 @@ import type {
 	Model,
 	ProviderSessionState,
 	ToolResultMessage,
+	UserMessage,
 } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
@@ -40,6 +49,14 @@ const TEST_CODEX_COMPACTION: CodexCompactionContext = {
 	phase: "pre_turn",
 	strategy: "memento",
 };
+const CODEX_RESIDENCY_TOKEN = `header.${Buffer.from(
+	JSON.stringify({
+		"https://api.openai.com/auth": {
+			chatgpt_account_id: "acct-test",
+			chatgpt_data_residency: "us",
+		},
+	}),
+).toString("base64url")}.signature`;
 
 beforeEach(() => {
 	vi.spyOn(piUtils, "getInstallId").mockReturnValue(TEST_INSTALLATION_ID);
@@ -92,6 +109,87 @@ function sseResponse(events: Array<Record<string, unknown>>): Response {
 		},
 	});
 	return new Response(body, { headers: { "content-type": "text/event-stream" } });
+}
+
+interface CodexCompactionTestSocket {
+	readyState: number;
+	readonly sent: Array<Record<string, unknown>>;
+	emit(event: Record<string, unknown>): void;
+	fail(): void;
+}
+
+function installCodexCompactionWebSocket(options?: {
+	respond?: (socket: CodexCompactionTestSocket, request: Record<string, unknown>) => void;
+}): {
+	sockets: CodexCompactionTestSocket[];
+	restore(): void;
+} {
+	const originalWebSocket = globalThis.WebSocket;
+	const sockets: CodexCompactionTestSocket[] = [];
+
+	class CodexCompactionWebSocket implements CodexCompactionTestSocket {
+		static readonly CONNECTING = 0;
+		static readonly OPEN = 1;
+		static readonly CLOSING = 2;
+		static readonly CLOSED = 3;
+
+		readyState = CodexCompactionWebSocket.CONNECTING;
+		binaryType: "blob" | "arraybuffer" | "nodebuffer" = "blob";
+		onopen: ((event: Event) => void) | null = null;
+		onmessage: ((event: MessageEvent) => void) | null = null;
+		onerror: ((event: Event) => void) | null = null;
+		onclose: ((event: Event) => void) | null = null;
+		readonly sent: Array<Record<string, unknown>> = [];
+		readonly handshakeHeaders = { "x-codex-turn-state": `compaction-state-${sockets.length}` };
+
+		constructor(
+			readonly url: string,
+			readonly socketOptions?: { headers?: Record<string, string> },
+		) {
+			sockets.push(this);
+			queueMicrotask(() => {
+				this.readyState = CodexCompactionWebSocket.OPEN;
+				this.onopen?.(new Event("open"));
+			});
+		}
+
+		send(data: string): void {
+			const parsed: unknown = JSON.parse(data);
+			if (!isRecord(parsed)) throw new Error("Expected Codex WebSocket request object");
+			this.sent.push(parsed);
+			options?.respond?.(this, parsed);
+		}
+
+		emit(event: Record<string, unknown>): void {
+			this.onmessage?.(new MessageEvent("message", { data: JSON.stringify(event) }));
+		}
+
+		fail(): void {
+			this.readyState = CodexCompactionWebSocket.CLOSED;
+			this.onerror?.(new Event("error"));
+			this.onclose?.(new Event("close"));
+		}
+
+		close(): void {
+			this.readyState = CodexCompactionWebSocket.CLOSED;
+		}
+	}
+
+	Object.defineProperty(globalThis, "WebSocket", {
+		configurable: true,
+		writable: true,
+		value: CodexCompactionWebSocket,
+	});
+	return {
+		sockets,
+		restore: () => {
+			Object.defineProperty(globalThis, "WebSocket", {
+				configurable: true,
+				writable: true,
+				value: originalWebSocket,
+			});
+		},
+	};
 }
 
 describe("buildOpenAiNativeHistory custom tool calls", () => {
@@ -239,8 +337,22 @@ function codexAssistant(calls: Array<{ callId: string; custom?: boolean }>, dt: 
 	}));
 	const items = calls.map(c =>
 		c.custom
-			? { type: "custom_tool_call", id: `ctc_${c.callId}`, call_id: c.callId, name: "apply_patch", input: "p" }
-			: { type: "function_call", id: `fc_${c.callId}`, call_id: c.callId, name: "read", arguments: "{}" },
+			? {
+					type: "custom_tool_call",
+					id: `ctc_${c.callId}`,
+					call_id: c.callId,
+					name: "apply_patch",
+					input: "p",
+					status: "completed",
+				}
+			: {
+					type: "function_call",
+					id: `fc_${c.callId}`,
+					call_id: c.callId,
+					name: "read",
+					arguments: "{}",
+					status: "completed",
+				},
 	);
 	return {
 		role: "assistant",
@@ -266,6 +378,81 @@ function toolResultFor(callId: string, custom = false): ToolResultMessage {
 	};
 }
 
+describe("buildOpenAiNativeHistory multimodal tool results", () => {
+	test("encodes ReadTool images inside the native function output", () => {
+		const imageData = Buffer.from("read image").toString("base64");
+		const result: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "call_image|fc_call_image",
+			toolName: "read",
+			content: [
+				{ type: "text", text: "Read image file [image/png]" },
+				{ type: "image", data: imageData, mimeType: "image/png", detail: "original" },
+			],
+			isError: false,
+			timestamp: Date.now(),
+		};
+		const model = makeOpenAiModel({ provider: "openai-codex", input: ["text", "image"] });
+
+		const items = buildOpenAiNativeHistory(
+			[codexAssistant([{ callId: "call_image" }], true), result],
+			model,
+			undefined,
+			true,
+		);
+
+		const output = items.find(item => item.type === "function_call_output");
+		expect(output?.output).toEqual([
+			{ type: "input_text", text: "Read image file [image/png]" },
+			{
+				type: "input_image",
+				detail: "original",
+				image_url: `data:image/png;base64,${imageData}`,
+			},
+		]);
+		expect(items.some(item => item.type === "message" && item.role === "user")).toBe(false);
+	});
+});
+
+describe("buildOpenAiNativeHistory interleaved assistant message (#8789)", () => {
+	test("hoists a trailing text block before its tool-call batch", () => {
+		// deepseek-v4-flash on opencode-go streamed [thinking, 2 tool calls,
+		// trailing "</thinking" text]; the compaction history builder must not
+		// wedge the demoted text between the calls and their outputs.
+		const model = makeOpenAiModel({
+			id: "deepseek-v4-flash",
+			provider: "opencode-go",
+			baseUrl: "https://opencode.ai/zen/go/v1",
+		});
+		const assistant: AssistantMessage = {
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "planning" },
+				{ type: "toolCall", id: "call_a|fc_call_a", name: "read", arguments: { path: "a" } },
+				{ type: "toolCall", id: "call_b|fc_call_b", name: "read", arguments: { path: "b" } },
+				{ type: "text", text: "<think>\n</thinking\n</think>" },
+			],
+			timestamp: Date.now(),
+			provider: "opencode-go",
+			model: "deepseek-v4-flash",
+			api: "openai-responses",
+			usage: ZERO_USAGE,
+			stopReason: "toolUse",
+		};
+
+		const items = buildOpenAiNativeHistory([assistant, toolResultFor("call_a"), toolResultFor("call_b")], model);
+
+		expect(items.map(item => item.type)).toEqual([
+			"message",
+			"function_call",
+			"function_call",
+			"function_call_output",
+			"function_call_output",
+		]);
+		expect(JSON.stringify(items[0]?.content)).toContain("</thinking");
+	});
+});
+
 describe("buildOpenAiNativeHistory call-id tracking", () => {
 	test("registers function_call ids carried in providerPayload so later tool results are emitted", () => {
 		const items = buildOpenAiNativeHistory(
@@ -273,6 +460,9 @@ describe("buildOpenAiNativeHistory call-id tracking", () => {
 			CODEX_MODEL,
 		);
 		const output = items.find(item => item.type === "function_call_output");
+		const call = items.find(item => item.type === "function_call");
+		expect(call).toBeDefined();
+		expect(call).not.toHaveProperty("status");
 		expect(output?.call_id).toBe("call_1");
 		expect(items.find(item => item.type === "custom_tool_call_output")).toBeUndefined();
 	});
@@ -421,8 +611,8 @@ describe("buildOpenAiNativeHistory computer calls", () => {
 		expect(recovery).toMatchObject({
 			type: "message",
 			role: "assistant",
-			status: "completed",
 		});
+		expect(recovery).not.toHaveProperty("status");
 		expect(String(recovery?.id)).toMatch(/^msg_[a-z0-9-]+$/);
 		expect(recovery?.content).toEqual([expect.objectContaining({ type: "output_text", annotations: [] })]);
 		expect(JSON.stringify(items)).toContain("failed before a screenshot was recorded");
@@ -448,7 +638,8 @@ describe("buildOpenAiNativeHistory computer calls", () => {
 		const second = buildOpenAiNativeHistory([computerAssistant(), result], unsupportedModel);
 		expect(first).toHaveLength(2);
 		for (const note of first) {
-			expect(note).toMatchObject({ type: "message", role: "assistant", status: "completed" });
+			expect(note).toMatchObject({ type: "message", role: "assistant" });
+			expect(note).not.toHaveProperty("status");
 			expect(String(note.id)).toMatch(/^msg_[a-z0-9-]+$/);
 			expect(note.content).toEqual([expect.objectContaining({ type: "output_text", annotations: [] })]);
 		}
@@ -460,13 +651,19 @@ describe("buildOpenAiNativeHistory computer calls", () => {
 });
 
 describe("remote compaction input forwarding", () => {
-	test("sends the full native history without local trimming", async () => {
-		// Contract: the compact endpoint owns compression. Trimming locally dropped
-		// assistant turns + encrypted reasoning before the provider ever saw them,
-		// so the client now forwards the full input untouched even on a tiny window.
+	test("rewrites an oversized trailing tool output without dropping native history", async () => {
+		// The compact endpoint still receives every call/result item. Only the
+		// trailing output body is replaced when the request cannot fit.
+		const nativeInput = [
+			{ type: "custom_tool_call", call_id: "call_apply_1", name: "apply_patch", input: "{}" },
+			{ type: "custom_tool_call_output", call_id: "call_apply_1", output: "patch applied".repeat(1_000) },
+		];
 		let requestInput: Array<Record<string, unknown>> | undefined;
 		const fetchMock: FetchImpl = async (_input, init) => {
-			const body = JSON.parse(String(init?.body)) as { input: Array<Record<string, unknown>> };
+			const body: unknown = JSON.parse(String(init?.body));
+			if (!isRecord(body) || !Array.isArray(body.input) || !body.input.every(isRecord)) {
+				throw new Error("expected remote compaction input");
+			}
 			requestInput = body.input;
 			return Response.json({
 				output: [{ type: "compaction_summary", summary: "compact" }],
@@ -474,19 +671,157 @@ describe("remote compaction input forwarding", () => {
 		};
 
 		await requestOpenAiRemoteCompaction(
-			makeOpenAiModel({ contextWindow: 1 }),
+			makeOpenAiModel({ contextWindow: 1_000 }),
 			"test-key",
-			[
-				{ type: "custom_tool_call", call_id: "call_apply_1", name: "apply_patch", input: "x".repeat(10_000) },
-				{ type: "custom_tool_call_output", call_id: "call_apply_1", output: "patch applied".repeat(1_000) },
-			],
+			nativeInput,
 			"compact",
 			undefined,
 			{ fetch: fetchMock },
 		);
 
+		const trimmed = trimRemoteCompactionInputToContextWindow(nativeInput, new Tokenizer(), 1_000, "compact");
+		expect(trimmed.estimatedTokensAfter).toBeLessThanOrEqual(1_000);
 		expect(requestInput?.some(item => item.type === "custom_tool_call")).toBe(true);
-		expect(requestInput?.some(item => item.type === "custom_tool_call_output")).toBe(true);
+		expect(requestInput?.find(item => item.type === "custom_tool_call_output")?.output).toBe(
+			CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE,
+		);
+	});
+
+	test("rewrites contiguous trailing outputs until the request fits", () => {
+		const input = [
+			{ type: "function_call", call_id: "call_1", name: "read", arguments: "{}" },
+			{ type: "function_call", call_id: "call_2", name: "read", arguments: "{}" },
+			{ type: "function_call_output", call_id: "call_1", output: "a".repeat(8_000) },
+			{ type: "function_call_output", call_id: "call_2", output: "b".repeat(8_000) },
+		];
+
+		const result = trimRemoteCompactionInputToContextWindow(input, new Tokenizer(), 1_000, "compact");
+
+		expect(result.rewrittenOutputs).toBe(2);
+		expect(result.input.slice(0, 2)).toEqual(input.slice(0, 2));
+		expect(result.input.slice(2).map(item => item.output)).toEqual([
+			CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE,
+			CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE,
+		]);
+		expect(result.estimatedTokensAfter).toBeLessThanOrEqual(1_000);
+		expect(input[2].output).toHaveLength(8_000);
+	});
+
+	test("keeps the original input when trailing rewrites cannot make the request fit", () => {
+		const input = [
+			{ type: "function_call", call_id: "call_1", name: "read", arguments: "{}" },
+			{ type: "function_call_output", call_id: "call_1", output: "a".repeat(20_000) },
+			{ type: "function_call", call_id: "call_2", name: "read", arguments: "{}" },
+			{ type: "function_call_output", call_id: "call_2", output: "useful latest result" },
+		];
+
+		const result = trimRemoteCompactionInputToContextWindow(input, new Tokenizer(), 1_000, "compact");
+
+		expect(result.rewrittenOutputs).toBe(0);
+		expect(result.input).toEqual(input);
+		expect(result.input[3].output).toBe("useful latest result");
+		expect(result.estimatedTokensAfter).toBe(result.estimatedTokensBefore);
+	});
+
+	test("charges inline images by the maximum vision budget instead of serialized base64 size", () => {
+		const input = [
+			{
+				type: "message",
+				role: "user",
+				content: [
+					{ type: "input_image", detail: "auto", image_url: `data:image/png;base64,${"a".repeat(80_000)}` },
+				],
+			},
+			{ type: "function_call_output", call_id: "call_1", output: "useful result" },
+		];
+
+		const result = trimRemoteCompactionInputToContextWindow(input, new Tokenizer(), 15_000, "compact");
+
+		expect(result.rewrittenOutputs).toBe(0);
+		expect(result.input).toEqual(input);
+		expect(result.estimatedTokensAfter).toBeGreaterThan(12_000);
+		expect(result.estimatedTokensAfter).toBeLessThanOrEqual(15_000);
+	});
+
+	test("uses conservative token accounting for token-dense trailing output", () => {
+		const output = Array.from({ length: 1_000 }, (_, index) => index.toString(16).padStart(8, "0")).join("");
+		const input = [{ type: "function_call_output", call_id: "call_1", output }];
+
+		const result = trimRemoteCompactionInputToContextWindow(input, new Tokenizer(), 3_000, "compact");
+
+		expect(result.estimatedTokensBefore).toBeGreaterThan(3_000);
+		expect(result.rewrittenOutputs).toBe(1);
+		expect(result.input[0].output).toBe(CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE);
+		expect(result.estimatedTokensAfter).toBeLessThanOrEqual(3_000);
+	});
+
+	test("scans past a synthetic tool-image attachment to rewrite its output", () => {
+		const attachment = {
+			type: "message",
+			role: "user",
+			content: [
+				{ type: "input_text", text: "Attached image(s) from tool result:" },
+				{ type: "input_image", detail: "auto", image_url: "data:image/png;base64,AAAA" },
+			],
+		};
+		const input = [
+			{ type: "function_call_output", call_id: "call_1", output: "large tool output".repeat(1_000) },
+			attachment,
+		];
+
+		const result = trimRemoteCompactionInputToContextWindow(input, new Tokenizer(), 15_000, "compact");
+
+		expect(result.rewrittenOutputs).toBe(1);
+		expect(result.input[0].output).toBe(CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE);
+		expect(result.input[1]).toEqual(attachment);
+		expect(result.estimatedTokensAfter).toBeLessThanOrEqual(15_000);
+	});
+
+	test("rewrites a native multimodal tool output atomically", () => {
+		const input = [
+			{
+				type: "function_call_output",
+				call_id: "call_1",
+				output: [
+					{ type: "input_text", text: "large tool output".repeat(1_000) },
+					{ type: "input_image", detail: "auto", image_url: "data:image/png;base64,AAAA" },
+				],
+			},
+		];
+
+		const result = trimRemoteCompactionInputToContextWindow(input, new Tokenizer(), 15_000, "compact");
+
+		expect(result.rewrittenOutputs).toBe(1);
+		expect(result.input[0].output).toBe(CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE);
+		expect(result.estimatedTokensAfter).toBeLessThanOrEqual(15_000);
+	});
+
+	test("reserves the maximum patch budget for original-detail images", () => {
+		const input = [
+			{
+				type: "message",
+				role: "user",
+				content: [
+					{ type: "input_image", detail: "original", image_url: `data:image/png;base64,${"a".repeat(80_000)}` },
+				],
+			},
+			{ type: "function_call_output", call_id: "call_1", output: "useful result".repeat(2_000) },
+		];
+
+		const result = trimRemoteCompactionInputToContextWindow(input, new Tokenizer(), 15_000, "compact");
+
+		expect(result.estimatedTokensBefore).toBeGreaterThan(15_000);
+		expect(result.rewrittenOutputs).toBe(1);
+		expect(result.estimatedTokensAfter).toBeLessThanOrEqual(15_000);
+	});
+
+	test("returns semantically unchanged input when it already fits", () => {
+		const input = [{ type: "function_call_output", call_id: "call_1", output: "small" }];
+
+		const result = trimRemoteCompactionInputToContextWindow(input, new Tokenizer(), 1_000, "compact");
+
+		expect(result.rewrittenOutputs).toBe(0);
+		expect(result.input).toEqual(input);
 	});
 });
 
@@ -517,6 +852,7 @@ describe("requestCompactionV2Streaming", () => {
 		let sessionHeader: string | undefined;
 		let clientRequestHeader: string | undefined;
 		let legacySessionHeader: string | undefined;
+		let betaFeaturesHeader: string | undefined;
 		const fetchMock: FetchImpl = async (input, init) => {
 			expect(String(input)).toBe("https://compact.example/v1/responses");
 			if (!init?.headers || init.headers instanceof Headers || Array.isArray(init.headers)) {
@@ -525,9 +861,11 @@ describe("requestCompactionV2Streaming", () => {
 			const rawSessionHeader = init.headers.session_id;
 			const rawClientRequestHeader = init.headers["x-client-request-id"];
 			const rawLegacySessionHeader = init.headers["session-id"];
+			const rawBetaFeaturesHeader = init.headers["x-codex-beta-features"];
 			sessionHeader = typeof rawSessionHeader === "string" ? rawSessionHeader : undefined;
 			clientRequestHeader = typeof rawClientRequestHeader === "string" ? rawClientRequestHeader : undefined;
 			legacySessionHeader = typeof rawLegacySessionHeader === "string" ? rawLegacySessionHeader : undefined;
+			betaFeaturesHeader = typeof rawBetaFeaturesHeader === "string" ? rawBetaFeaturesHeader : undefined;
 			requestBody = JSON.parse(String(init.body)) as {
 				model: string;
 				input: Array<Record<string, unknown>>;
@@ -561,6 +899,7 @@ describe("requestCompactionV2Streaming", () => {
 		expect(sessionHeader).toBe("session-1");
 		expect(clientRequestHeader).toBe("session-1");
 		expect(legacySessionHeader).toBeUndefined();
+		expect(betaFeaturesHeader).toBeUndefined();
 		expect(requestBody?.model).toBe("gpt-5-compact");
 		expect(requestBody?.prompt_cache_key).toBe("cache-1");
 		expect(requestBody?.input[requestBody.input.length - 1]).toEqual({ type: "compaction_trigger" });
@@ -568,6 +907,62 @@ describe("requestCompactionV2Streaming", () => {
 		expect(result.usedTokens).toBe(123);
 		expect(result.usage?.cachedInputTokens).toBe(7);
 		expect(result.usage?.reasoningOutputTokens).toBe(1);
+	});
+
+	test("negotiates Codex V2 compaction for an explicit Responses endpoint", async () => {
+		const model = buildModel({
+			id: "gpt-5",
+			name: "GPT-5",
+			api: "openai-responses",
+			provider: "openai",
+			baseUrl: "https://api.openai.com/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+			remoteCompaction: {
+				enabled: true,
+				api: "openai-codex-responses",
+				v2StreamingEnabled: true,
+				v2Endpoint: "https://compact.example/v1/responses",
+			},
+		});
+		const request = buildCompactionV2Request(
+			model,
+			[{ type: "message", role: "user", content: [{ type: "input_text", text: "real user" }] }],
+			"instructions",
+		);
+		let betaFeaturesHeader: string | undefined;
+		let residencyHeader: string | undefined;
+		let clientMetadata: Record<string, unknown> | undefined;
+		const fetchMock: FetchImpl = async (_input, init) => {
+			if (!init?.headers || init.headers instanceof Headers || Array.isArray(init.headers)) {
+				throw new Error("Expected V2 compaction to send headers as a plain object");
+			}
+			const rawBetaFeaturesHeader = init.headers["x-codex-beta-features"];
+			const rawResidencyHeader = init.headers["x-openai-internal-codex-residency"];
+			betaFeaturesHeader = typeof rawBetaFeaturesHeader === "string" ? rawBetaFeaturesHeader : undefined;
+			residencyHeader = typeof rawResidencyHeader === "string" ? rawResidencyHeader : undefined;
+			const parsedBody: unknown = JSON.parse(String(init.body));
+			if (isRecord(parsedBody) && isRecord(parsedBody.client_metadata)) {
+				clientMetadata = parsedBody.client_metadata;
+			}
+			return sseResponse([
+				{
+					type: "response.output_item.done",
+					output_index: 0,
+					item: { type: "compaction", encrypted_content: "enc" },
+				},
+				{ type: "response.completed", response: { usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } },
+			]);
+		};
+
+		await requestCompactionV2Streaming(model, CODEX_RESIDENCY_TOKEN, request, undefined, { fetch: fetchMock });
+
+		expect(betaFeaturesHeader).toBe("remote_compaction_v2");
+		expect(residencyHeader).toBe("us");
+		expect(clientMetadata?.["x-codex-installation-id"]).toBe(TEST_INSTALLATION_ID);
 	});
 
 	test("retries transient V2 stream failures with a fresh request attempt", async () => {
@@ -605,6 +1000,36 @@ describe("requestCompactionV2Streaming", () => {
 		});
 
 		expect(attempts).toBe(2);
+	});
+
+	test("does not retry and preserves auth_unavailable from V2 HTTP failures", async () => {
+		const model = makeOpenAiModel({
+			remoteCompaction: {
+				enabled: true,
+				v2StreamingEnabled: true,
+				v2Endpoint: "https://compact.example/v1/responses",
+			},
+		});
+		const request = buildCompactionV2Request(
+			model,
+			[{ type: "message", role: "user", content: [{ type: "input_text", text: "real user" }] }],
+			"instructions",
+		);
+		const fetchMock = vi.fn(async () =>
+			Response.json(
+				{ error: { type: "auth_unavailable", message: "no auth available for codex" } },
+				{ status: 503, statusText: "Service Unavailable" },
+			),
+		);
+
+		const error = await requestCompactionV2Streaming(model, "test-key", request, undefined, {
+			fetch: fetchMock,
+			retryWait: async () => {},
+		}).catch(cause => cause);
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(error).toBeInstanceOf(AIError.ProviderHttpError);
+		expect(AIError.is(AIError.classify(error), AIError.Flag.AuthFailed)).toBe(true);
 	});
 });
 
@@ -669,6 +1094,23 @@ describe("Responses Lite remote compaction", () => {
 		};
 	}
 
+	function compactionV2Events(encryptedContent: string): Array<Record<string, unknown>> {
+		return [
+			{
+				type: "response.output_item.done",
+				output_index: 0,
+				item: { type: "compaction", encrypted_content: encryptedContent },
+			},
+			{
+				type: "response.done",
+				response: {
+					id: `response-${encryptedContent}`,
+					usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+				},
+			},
+		];
+	}
+
 	test("V1 compaction sends the lite header and input-item instructions", async () => {
 		const model = makeCodexLiteModel();
 		let captured: CapturedLiteExchange | undefined;
@@ -679,7 +1121,7 @@ describe("Responses Lite remote compaction", () => {
 
 		await requestOpenAiRemoteCompaction(
 			model,
-			"test-key",
+			CODEX_RESIDENCY_TOKEN,
 			[{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
 			"compact instructions",
 			undefined,
@@ -692,6 +1134,7 @@ describe("Responses Lite remote compaction", () => {
 		);
 
 		expect(captured?.headers.get("x-openai-internal-codex-responses-lite")).toBe("true");
+		expect(captured?.headers.get("x-openai-internal-codex-residency")).toBe("us");
 		expect(captured?.body.reasoning).toEqual({ context: "all_turns" });
 		expect(captured?.body.include).toEqual(["reasoning.encrypted_content"]);
 		expect(captured?.body.instructions).toBeUndefined();
@@ -725,25 +1168,19 @@ describe("Responses Lite remote compaction", () => {
 		);
 		let captured: CapturedLiteExchange | undefined;
 		const fetchMock: FetchImpl = async (_input, init) => {
-			captured = captureLite(init);
-			return sseResponse([
-				{
-					type: "response.output_item.done",
-					output_index: 0,
-					item: { type: "compaction", encrypted_content: "enc" },
-				},
-				{ type: "response.completed", response: { usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } },
-			]);
+			captured = captureStreamLite(init);
+			return sseResponse(compactionV2Events("enc"));
 		};
 
 		expect(shouldUseCompactionV2Streaming(model)).toBe(true);
-		await requestCompactionV2Streaming(model, "test-key", request, undefined, {
+		await requestCompactionV2Streaming(model, CODEX_RESIDENCY_TOKEN, request, undefined, {
 			fetch: fetchMock,
 			providerSessionState: new Map<string, ProviderSessionState>(),
 			codexCompaction: TEST_CODEX_COMPACTION,
 		});
 
 		expect(captured?.headers.get("x-openai-internal-codex-responses-lite")).toBe("true");
+		expect(captured?.headers.get("x-openai-internal-codex-residency")).toBe("us");
 		expect(captured?.body.reasoning).toEqual({ context: "all_turns" });
 		expect(captured?.body.include).toEqual(["reasoning.encrypted_content"]);
 		expect(captured?.body.instructions).toBeUndefined();
@@ -769,6 +1206,297 @@ describe("Responses Lite remote compaction", () => {
 			content: [{ type: "input_text", text: "compact instructions" }],
 		});
 		expect(captured?.body.input?.at(-1)).toEqual({ type: "compaction_trigger" });
+	});
+
+	test.each([false, true])(
+		"V2 compaction preserves Codex input and disabled reasoning (Lite: %s)",
+		async responsesLite => {
+			const model = makeCodexLiteModel({ useResponsesLite: responsesLite });
+			const systemPrompt = ["base instructions", "workspace instructions"];
+			const messages: UserMessage[] = [
+				{ role: "user", content: "first user request", timestamp: 1 },
+				{ role: "user", content: "second user request", timestamp: 2 },
+			];
+			const normalBody = await buildTransformedCodexRequestBody(
+				model,
+				{ systemPrompt, messages },
+				{ sessionId: "codex-cache-session", responsesLite, forceReasoningOff: true },
+			);
+			const preparation: CompactionPreparation = {
+				firstKeptEntryId: "kept-1",
+				messagesToSummarize: [messages[0]],
+				turnPrefixMessages: [],
+				recentMessages: [messages[1]],
+				isSplitTurn: false,
+				tokensBefore: 100_000,
+				fileOps: createFileOps(),
+				settings: {
+					...DEFAULT_COMPACTION_SETTINGS,
+					remoteStreamingV2Enabled: true,
+				},
+			};
+			let captured: CapturedLiteExchange | undefined;
+			const fetchMock: FetchImpl = async (_input, init) => {
+				captured = captureStreamLite(init);
+				return sseResponse(compactionV2Events("enc-cache"));
+			};
+
+			await compact(preparation, model, CODEX_RESIDENCY_TOKEN, undefined, undefined, {
+				fetch: fetchMock,
+				remoteSystemPrompt: systemPrompt,
+				sessionId: "codex-cache-session",
+				thinkingLevel: ThinkingLevel.Off,
+			});
+
+			expect(JSON.stringify(captured?.body.input?.slice(0, -1))).toBe(JSON.stringify(normalBody.input));
+			expect(captured?.body.instructions).toEqual(normalBody.instructions);
+			expect(captured?.body.reasoning).toEqual(normalBody.reasoning);
+			expect(captured?.body.reasoning?.effort).toBe("none");
+		},
+	);
+
+	test("V2 compaction isolates its Lite WebSocket from the full Responses session", async () => {
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const webSocket = installCodexCompactionWebSocket({
+			respond: (socket, outbound) => {
+				const input = outbound.input;
+				const isCompaction =
+					Array.isArray(input) && input.some(item => isRecord(item) && item.type === "compaction_trigger");
+				const events = isCompaction
+					? compactionV2Events("enc-websocket")
+					: [
+							{
+								type: "response.output_item.done",
+								item: {
+									type: "message",
+									id: "message-live-turn",
+									role: "assistant",
+									status: "completed",
+									content: [{ type: "output_text", text: "live response" }],
+								},
+							},
+							{
+								type: "response.done",
+								response: {
+									id: "response-live-turn",
+									status: "completed",
+									usage: { input_tokens: 8, output_tokens: 2, total_tokens: 10 },
+								},
+							},
+						];
+				for (const event of events) socket.emit(event);
+			},
+		});
+		try {
+			const model = makeCodexLiteModel({ preferWebsockets: true });
+			const sessionId = "codex-websocket-compaction";
+			const fetchMock = vi.fn(async () => {
+				throw new Error("WebSocket-first V2 compaction unexpectedly used SSE");
+			});
+			const liveTurn = await ai
+				.streamSimple(
+					model,
+					{
+						systemPrompt: ["You are a helpful assistant."],
+						messages: [{ role: "user", content: "Start the turn", timestamp: Date.now() }],
+					},
+					{
+						apiKey: "test-key",
+						fetch: fetchMock,
+						sessionId,
+						preferWebsockets: true,
+						providerSessionState,
+					},
+				)
+				.result();
+			expect(liveTurn.stopReason).toBe("stop");
+
+			const request = buildCompactionV2Request(
+				model,
+				[{ type: "message", role: "user", content: [{ type: "input_text", text: "real user" }] }],
+				"compact instructions",
+				{ sessionId },
+			);
+			const result = await requestCompactionV2Streaming(model, "test-key", request, undefined, {
+				fetch: fetchMock,
+				preferWebsockets: true,
+				providerSessionState,
+				codexCompaction: TEST_CODEX_COMPACTION,
+			});
+
+			const liveRequest = webSocket.sockets[0]?.sent[0];
+			const compactionRequest = webSocket.sockets[1]?.sent[0];
+			const compactionInput = compactionRequest?.input;
+			expect(fetchMock).not.toHaveBeenCalled();
+			expect(webSocket.sockets).toHaveLength(2);
+			expect(webSocket.sockets[0]?.sent).toHaveLength(1);
+			expect(webSocket.sockets[1]?.sent).toHaveLength(1);
+			expect(liveRequest?.instructions).toBe("You are a helpful assistant.");
+			expect(liveRequest?.parallel_tool_calls).toBeUndefined();
+			expect(compactionRequest?.type).toBe("response.create");
+			expect(compactionRequest?.instructions).toBeUndefined();
+			expect(compactionRequest?.parallel_tool_calls).toBe(false);
+			expect(Array.isArray(compactionInput) ? compactionInput.at(-1) : undefined).toEqual({
+				type: "compaction_trigger",
+			});
+			expect(result.compactionItem).toEqual({ type: "compaction", encrypted_content: "enc-websocket" });
+			expect(
+				getOpenAICodexTransportDetails(model, {
+					sessionId,
+					providerSessionState,
+				}),
+			).toMatchObject({
+				lastTransport: "websocket",
+				websocketConnected: true,
+				canAppend: false,
+			});
+		} finally {
+			for (const state of providerSessionState.values()) state.close();
+			providerSessionState.clear();
+			webSocket.restore();
+		}
+	});
+
+	test("V2 compaction discards partial WebSocket output before SSE replay", async () => {
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const webSocket = installCodexCompactionWebSocket({
+			respond: socket => {
+				socket.emit({
+					type: "response.output_item.done",
+					output_index: 0,
+					item: { type: "compaction", encrypted_content: "enc-partial-websocket" },
+				});
+				queueMicrotask(() => socket.fail());
+			},
+		});
+		try {
+			const model = makeCodexLiteModel({ preferWebsockets: true });
+			const request = buildCompactionV2Request(
+				model,
+				[{ type: "message", role: "user", content: [{ type: "input_text", text: "real user" }] }],
+				"compact instructions",
+				{ sessionId: "codex-websocket-fallback" },
+			);
+			const fetchMock = vi.fn(async () => sseResponse(compactionV2Events("enc-sse")));
+
+			const result = await requestCompactionV2Streaming(model, "test-key", request, undefined, {
+				fetch: fetchMock,
+				preferWebsockets: true,
+				providerSessionState,
+				codexCompaction: TEST_CODEX_COMPACTION,
+			});
+
+			expect(webSocket.sockets).toHaveLength(1);
+			expect(fetchMock).toHaveBeenCalledTimes(1);
+			expect(result.compactionItem).toEqual({ type: "compaction", encrypted_content: "enc-sse" });
+			expect(
+				getOpenAICodexTransportDetails(model, {
+					sessionId: "codex-websocket-fallback",
+					providerSessionState,
+				}),
+			).toMatchObject({
+				lastTransport: "sse",
+				websocketDisabled: true,
+			});
+		} finally {
+			for (const state of providerSessionState.values()) state.close();
+			providerSessionState.clear();
+			webSocket.restore();
+		}
+	});
+
+	test("V2 compaction over WebSocket keeps the first mid-turn x-codex-turn-state", async () => {
+		const midTurnCompaction = { ...TEST_CODEX_COMPACTION, phase: "mid_turn" as const };
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		let responseCount = 0;
+		const webSocket = installCodexCompactionWebSocket({
+			respond: socket => {
+				responseCount += 1;
+				// The handshake already seeded `compaction-state-0`; a later
+				// response value must not replace the turn's first sticky token.
+				socket.emit({ type: "response.metadata", headers: { "x-codex-turn-state": "later-turn-state" } });
+				for (const event of compactionV2Events(`enc-metadata-${responseCount}`)) socket.emit(event);
+			},
+		});
+		try {
+			const model = makeCodexLiteModel({ preferWebsockets: true });
+			const sessionId = "codex-websocket-turn-state";
+			const buildRequest = () =>
+				buildCompactionV2Request(
+					model,
+					[{ type: "message", role: "user", content: [{ type: "input_text", text: "real user" }] }],
+					"compact instructions",
+					{ sessionId },
+				);
+			const streamOptions = {
+				preferWebsockets: true,
+				providerSessionState,
+				codexCompaction: midTurnCompaction,
+			} as const;
+
+			await requestCompactionV2Streaming(model, "test-key", buildRequest(), undefined, streamOptions);
+			await requestCompactionV2Streaming(model, "test-key", buildRequest(), undefined, streamOptions);
+
+			const secondRequest = webSocket.sockets[0]?.sent[1];
+			const clientMetadata = isRecord(secondRequest?.client_metadata) ? secondRequest.client_metadata : undefined;
+			expect(webSocket.sockets).toHaveLength(1);
+			expect(webSocket.sockets[0]?.sent).toHaveLength(2);
+			expect(clientMetadata?.["x-codex-turn-state"]).toBe("compaction-state-0");
+			expect(getOpenAICodexTransportDetails(model, { sessionId, providerSessionState })).toMatchObject({
+				hasTurnState: true,
+			});
+		} finally {
+			for (const state of providerSessionState.values()) state.close();
+			providerSessionState.clear();
+			webSocket.restore();
+		}
+	});
+
+	test("V2 compaction rolls back SSE metadata when the attempt fails", async () => {
+		const model = makeCodexLiteModel();
+		const sessionId = "codex-sse-failed-turn-state";
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const request = buildCompactionV2Request(
+			model,
+			[{ type: "message", role: "user", content: [{ type: "input_text", text: "real user" }] }],
+			"compact instructions",
+			{ sessionId },
+		);
+		let requestCount = 0;
+		let replay: CapturedLiteExchange | undefined;
+		const fetchMock: FetchImpl = async (_input, init) => {
+			requestCount += 1;
+			if (requestCount === 1) {
+				return sseResponse([
+					{ type: "response.metadata", headers: { "x-codex-turn-state": "discarded-turn-state" } },
+					{
+						type: "response.failed",
+						response: { error: { code: "data_residency_mismatch", message: "wrong transport route" } },
+					},
+				]);
+			}
+			replay = captureStreamLite(init);
+			return sseResponse(compactionV2Events("enc-replay"));
+		};
+		const options = {
+			fetch: fetchMock,
+			preferWebsockets: false,
+			providerSessionState,
+			codexCompaction: { ...TEST_CODEX_COMPACTION, phase: "mid_turn" as const },
+		};
+		try {
+			await expect(requestCompactionV2Streaming(model, "test-key", request, undefined, options)).rejects.toThrow(
+				"data_residency_mismatch",
+			);
+			await requestCompactionV2Streaming(model, "test-key", request, undefined, options);
+
+			const clientMetadata = isRecord(replay?.body.client_metadata) ? replay.body.client_metadata : undefined;
+			expect(requestCount).toBe(2);
+			expect(clientMetadata?.["x-codex-turn-state"]).toBeUndefined();
+		} finally {
+			for (const state of providerSessionState.values()) state.close();
+			providerSessionState.clear();
+		}
 	});
 
 	test("compact fan-out keeps local Codex summaries on one classified turn", async () => {
@@ -860,42 +1588,13 @@ describe("Responses Lite remote compaction", () => {
 	});
 
 	test("local Codex compaction isolates and closes transient websocket sessions", async () => {
-		const originalWebSocket = global.WebSocket;
-		const sockets: AgentCompactionWebSocket[] = [];
 		let responseCount = 0;
-
-		class AgentCompactionWebSocket {
-			static readonly CONNECTING = 0;
-			static readonly OPEN = 1;
-			static readonly CLOSING = 2;
-			static readonly CLOSED = 3;
-
-			readyState = AgentCompactionWebSocket.CONNECTING;
-			binaryType: "blob" | "arraybuffer" | "nodebuffer" = "blob";
-			onopen: ((event: Event) => void) | null = null;
-			onmessage: ((event: MessageEvent) => void) | null = null;
-			onerror: ((event: Event) => void) | null = null;
-			onclose: ((event: Event) => void) | null = null;
-			readonly handshakeHeaders = {
-				"x-codex-turn-state": `agent-compaction-state-${sockets.length}`,
-			};
-
-			constructor(
-				readonly url: string,
-				readonly options?: { headers?: Record<string, string> },
-			) {
-				sockets.push(this);
-				queueMicrotask(() => {
-					this.readyState = AgentCompactionWebSocket.OPEN;
-					this.onopen?.(new Event("open"));
-				});
-			}
-
-			send(_data: string): void {
+		const webSocket = installCodexCompactionWebSocket({
+			respond: socket => {
 				responseCount += 1;
 				const responseId = `response-${responseCount}`;
 				const messageId = `message-${responseCount}`;
-				const text = sockets[0] === this ? "main response" : "local summary";
+				const text = responseCount === 1 ? "main response" : "local summary";
 				const events: Record<string, unknown>[] = [
 					{
 						type: "response.output_item.added",
@@ -927,19 +1626,12 @@ describe("Responses Lite remote compaction", () => {
 						},
 					},
 				];
-				for (const event of events) {
-					this.onmessage?.({ data: JSON.stringify(event) } as MessageEvent);
-				}
-			}
-
-			close(): void {
-				this.readyState = AgentCompactionWebSocket.CLOSED;
-			}
-		}
+				for (const event of events) socket.emit(event);
+			},
+		});
 
 		const providerSessionState = new Map<string, ProviderSessionState>();
 		try {
-			global.WebSocket = AgentCompactionWebSocket as unknown as typeof WebSocket;
 			const model = makeCodexLiteModel({ preferWebsockets: true });
 			const sessionId = "agent-compaction-isolation";
 			const fetchMock: FetchImpl = async () => {
@@ -956,8 +1648,8 @@ describe("Responses Lite remote compaction", () => {
 				)
 				.result();
 			expect(main.stopReason).toBe("stop");
-			expect(sockets).toHaveLength(1);
-			expect(sockets[0]?.readyState).toBe(AgentCompactionWebSocket.OPEN);
+			expect(webSocket.sockets).toHaveLength(1);
+			expect(webSocket.sockets[0]?.readyState).toBe(globalThis.WebSocket.OPEN);
 
 			const preparation: CompactionPreparation = {
 				firstKeptEntryId: "kept-1",
@@ -981,10 +1673,10 @@ describe("Responses Lite remote compaction", () => {
 			});
 
 			expect(result.summary).toContain("local summary");
-			expect(sockets).toHaveLength(3);
-			expect(sockets[0]?.readyState).toBe(AgentCompactionWebSocket.OPEN);
-			expect(sockets[1]?.readyState).toBe(AgentCompactionWebSocket.CLOSED);
-			expect(sockets[2]?.readyState).toBe(AgentCompactionWebSocket.CLOSED);
+			expect(webSocket.sockets).toHaveLength(3);
+			expect(webSocket.sockets[0]?.readyState).toBe(globalThis.WebSocket.OPEN);
+			expect(webSocket.sockets[1]?.readyState).toBe(globalThis.WebSocket.CLOSED);
+			expect(webSocket.sockets[2]?.readyState).toBe(globalThis.WebSocket.CLOSED);
 			expect(
 				getOpenAICodexTransportDetails(model, {
 					sessionId,
@@ -997,7 +1689,7 @@ describe("Responses Lite remote compaction", () => {
 		} finally {
 			for (const state of providerSessionState.values()) state.close();
 			providerSessionState.clear();
-			global.WebSocket = originalWebSocket;
+			webSocket.restore();
 		}
 	});
 });
@@ -1181,7 +1873,7 @@ describe("requestRemoteCompaction wire formats", () => {
 
 		const result = await requestRemoteCompaction(
 			"http://127.0.0.1:8001/v1/chat/completions",
-			{ systemPrompt: "summarize", prompt: "<conversation>hello</conversation>" },
+			{ systemPrompt: "summarize", prompt: "<conversation>hello</conversation>", maxTokens: 16_384 },
 			undefined,
 			{ fetch: fetchMock, model, apiKey: "local-key" },
 		);
@@ -1194,6 +1886,7 @@ describe("requestRemoteCompaction wire formats", () => {
 				{ role: "user", content: "<conversation>hello</conversation>" },
 			],
 			stream: false,
+			max_tokens: 16_384,
 		});
 	});
 
@@ -1210,13 +1903,17 @@ describe("requestRemoteCompaction wire formats", () => {
 
 		const result = await requestRemoteCompaction(
 			"https://compaction.example.test/summarize",
-			{ systemPrompt: "summarize", prompt: "<conversation>hello</conversation>" },
+			{ systemPrompt: "summarize", prompt: "<conversation>hello</conversation>", maxTokens: 16_384 },
 			undefined,
 			{ fetch: fetchMock, apiKey: "unused-for-generic" },
 		);
 
 		expect(result).toEqual({ summary: "generic summary", shortSummary: "generic" });
-		expect(sentBody).toEqual({ systemPrompt: "summarize", prompt: "<conversation>hello</conversation>" });
+		expect(sentBody).toEqual({
+			systemPrompt: "summarize",
+			prompt: "<conversation>hello</conversation>",
+			maxTokens: 16_384,
+		});
 	});
 });
 
@@ -1338,13 +2035,86 @@ describe("compact() remote compaction failure handling", () => {
 		expect(input.some(item => item.type === "reasoning")).toBe(true);
 		expect(input.some(item => item.type === "function_call" && item.name === "read")).toBe(true);
 		expect(input.some(item => item.type === "function_call_output")).toBe(true);
+		expect(
+			input.some(
+				item =>
+					(item.type === "message" || item.type === "function_call" || item.type === "custom_tool_call") &&
+					Object.hasOwn(item, "status"),
+			),
+		).toBe(false);
 		// Reasoning effort is sent like a normal turn (gpt-5 is a reasoning model).
 		expect(requestBody?.reasoning).toMatchObject({ effort: "high", summary: "auto" });
 		const remote = getCompactionV2PreserveData(result.preserveData);
 		expect(remote?.usedTokens).toBe(55);
 		expect(remote?.replacementHistory.at(-1)).toEqual(compactionItem);
-		expect(result.summary).toContain("Remote compaction preserved provider-native history");
+		expect(result.summary).toBe(
+			"Remote compaction preserved provider-native history for this session. Compaction processed 55 input tokens.",
+		);
 		expect(completeSpy).not.toHaveBeenCalled();
+	});
+
+	test("rewrites an oversized trailing tool output before V2 streaming compaction", async () => {
+		const preparation = makePreparation();
+		preparation.settings = { ...preparation.settings, remoteStreamingV2Enabled: true };
+		preparation.messagesToSummarize = [
+			{ role: "user", content: "inspect the large file", timestamp: 1 },
+			{
+				role: "assistant",
+				content: [
+					{ type: "toolCall", id: "call_read_large|fc_read_large", name: "read", arguments: { path: "/tmp/x" } },
+				],
+				timestamp: 2,
+				provider: "openai",
+				model: "gpt-5",
+				api: "openai-responses",
+				usage: ZERO_USAGE,
+				stopReason: "toolUse",
+			},
+			{
+				role: "toolResult",
+				toolCallId: "call_read_large|fc_read_large",
+				toolName: "read",
+				content: [{ type: "text", text: "large output".repeat(10_000) }],
+				isError: false,
+				timestamp: 3,
+			},
+		];
+		preparation.recentMessages = [];
+		const model = makeOpenAiModel({
+			contextWindow: 20_000,
+			remoteCompaction: {
+				enabled: true,
+				v2StreamingEnabled: true,
+				v2Endpoint: "https://compact.example/v1/responses",
+			},
+		});
+		let requestInput: Array<Record<string, unknown>> = [];
+		const fetchMock: FetchImpl = async (_input, init) => {
+			const body: unknown = JSON.parse(String(init?.body));
+			if (!isRecord(body) || !Array.isArray(body.input) || !body.input.every(isRecord)) {
+				throw new Error("expected V2 compaction input");
+			}
+			requestInput = body.input;
+			return sseResponse([
+				{
+					type: "response.output_item.done",
+					output_index: 0,
+					item: { type: "compaction", encrypted_content: "enc_trimmed" },
+				},
+				{
+					type: "response.completed",
+					response: { usage: { input_tokens: 100, output_tokens: 2, total_tokens: 102 } },
+				},
+			]);
+		};
+
+		await compact(preparation, model, "test-key", undefined, undefined, { fetch: fetchMock });
+
+		expect(requestInput.some(item => item.type === "function_call" && item.call_id === "call_read_large")).toBe(true);
+		expect(requestInput.find(item => item.type === "function_call_output")?.output).toBe(
+			CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE,
+		);
+		expect(requestInput.at(-1)).toEqual({ type: "compaction_trigger" });
 	});
 
 	test("re-expands a prior V2 compaction's originals when no candidate can reuse the replay", async () => {
@@ -1496,6 +2266,78 @@ describe("compact() remote compaction failure handling", () => {
 		expect(JSON.stringify(sameProviderActive?.messagesToSummarize ?? [])).not.toContain("ORIGINAL ALPHA port 4242");
 	});
 
+	test("retains the V2 non-auth failure when the V1 fallback fails authentication", async () => {
+		const preparation = makePreparation();
+		preparation.settings = { ...preparation.settings, remoteStreamingV2Enabled: true };
+		const model = makeOpenAiModel({
+			remoteCompaction: { enabled: true, v2StreamingEnabled: true },
+		});
+		const requestedUrls: string[] = [];
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			requestedUrls.push(url);
+			return url.endsWith("/responses/compact")
+				? new Response("authentication failed", { status: 401, statusText: "Unauthorized" })
+				: new Response("V2 transport failed", { status: 400, statusText: "Bad Request" });
+		};
+
+		const error = await compact(preparation, model, "test-key", undefined, undefined, { fetch: fetchMock }).catch(
+			cause => cause,
+		);
+
+		expect(requestedUrls.map(url => new URL(url).pathname)).toEqual(["/v1/responses", "/v1/responses/compact"]);
+		expect(error).toBeInstanceOf(NativeCompactionError);
+		expect(error).toMatchObject({ cause: { status: 400 } });
+		expect(AIError.is(AIError.classify(error), AIError.Flag.AuthFailed)).toBe(false);
+	});
+
+	test("keeps native compaction auth-classified when every attempted protocol fails authentication", async () => {
+		const preparation = makePreparation();
+		preparation.settings = { ...preparation.settings, remoteStreamingV2Enabled: true };
+		const model = makeOpenAiModel({
+			remoteCompaction: { enabled: true, v2StreamingEnabled: true },
+		});
+		const requestedUrls: string[] = [];
+		const fetchMock: FetchImpl = async input => {
+			requestedUrls.push(String(input));
+			return new Response("authentication failed", { status: 401, statusText: "Unauthorized" });
+		};
+
+		const error = await compact(preparation, model, "test-key", undefined, undefined, { fetch: fetchMock }).catch(
+			cause => cause,
+		);
+
+		expect(requestedUrls.map(url => new URL(url).pathname)).toEqual(["/v1/responses", "/v1/responses/compact"]);
+		expect(error).toBeInstanceOf(NativeCompactionError);
+		expect(error).toMatchObject({ cause: { status: 401 } });
+		expect(AIError.is(AIError.classify(error), AIError.Flag.AuthFailed)).toBe(true);
+	});
+
+	test("V2 native failure falls back to V1 without generic summarization", async () => {
+		const completeSpy = vi.spyOn(ai, "completeSimple").mockResolvedValue(localSummaryMessage("local summary"));
+		const preparation = makePreparation();
+		preparation.settings = { ...preparation.settings, remoteStreamingV2Enabled: true };
+		const model = makeOpenAiModel({
+			remoteCompaction: { enabled: true, v2StreamingEnabled: true },
+		});
+		const requestedUrls: string[] = [];
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			requestedUrls.push(url);
+			if (url.endsWith("/responses/compact")) {
+				return Response.json({ output: [{ type: "compaction", encrypted_content: "enc-v1" }] });
+			}
+			return new Response("V2 unavailable", { status: 502, statusText: "Bad Gateway" });
+		};
+
+		const result = await compact(preparation, model, "test-key", undefined, undefined, { fetch: fetchMock });
+
+		expect(requestedUrls.some(url => url.endsWith("/responses"))).toBe(true);
+		expect(requestedUrls.some(url => url.endsWith("/responses/compact"))).toBe(true);
+		expect(result.shortSummary).toBe("Remote compaction");
+		expect(completeSpy).not.toHaveBeenCalled();
+	});
+
 	test("user abort during the remote compact request rejects without falling back to local summarization", async () => {
 		// Contract: Esc is a cancellation, not a remote failure. Before the fix
 		// the AbortError was swallowed by the fallback catch and compaction kept
@@ -1569,16 +2411,54 @@ describe("compact() remote compaction failure handling", () => {
 		});
 	});
 
-	test("remote compact server failure without abort still falls back to local summarization", async () => {
+	test("uses an explicit remote endpoint after provider-native compaction fails", async () => {
+		const completeSpy = vi.spyOn(ai, "completeSimple").mockResolvedValue(localSummaryMessage("local fallback"));
+		const preparation = makePreparation();
+		preparation.settings = {
+			...preparation.settings,
+			remoteEndpoint: "http://summary.test/v1/chat/completions",
+			remoteStreamingV2Enabled: true,
+		};
+		const model = makeOpenAiModel({
+			remoteCompaction: { enabled: true, v2StreamingEnabled: true },
+		});
+		const requestedUrls: string[] = [];
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			requestedUrls.push(url);
+			if (url === preparation.settings.remoteEndpoint) {
+				const summary =
+					requestedUrls.filter(requested => requested === url).length === 1
+						? "configured remote history summary"
+						: "configured remote short summary";
+				return Response.json({ choices: [{ message: { content: summary } }] });
+			}
+			return new Response("native compaction unavailable", { status: 400, statusText: "Bad Request" });
+		};
+
+		const result = await compact(preparation, model, "test-key", undefined, undefined, { fetch: fetchMock });
+
+		expect(requestedUrls.map(url => new URL(url).pathname)).toEqual([
+			"/v1/responses",
+			"/v1/responses/compact",
+			"/v1/chat/completions",
+			"/v1/chat/completions",
+		]);
+		expect(result.summary).toContain("configured remote history summary");
+		expect(result.shortSummary).toBe("configured remote short summary");
+		expect(completeSpy).not.toHaveBeenCalled();
+	});
+
+	test("native compaction server failure rejects without generic summarization", async () => {
 		const completeSpy = vi.spyOn(ai, "completeSimple").mockResolvedValue(localSummaryMessage("local summary"));
 		const fetchMock: FetchImpl = async () =>
 			new Response("nope", { status: 500, statusText: "Internal Server Error" });
 
-		const result = await compact(makePreparation(), makeOpenAiModel(), "test-key", undefined, undefined, {
-			fetch: fetchMock,
-		});
-
-		expect(result.summary).toContain("local summary");
-		expect(completeSpy).toHaveBeenCalled();
+		await expect(
+			compact(makePreparation(), makeOpenAiModel(), "test-key", undefined, undefined, {
+				fetch: fetchMock,
+			}),
+		).rejects.toThrow("Remote compaction failed");
+		expect(completeSpy).not.toHaveBeenCalled();
 	});
 });

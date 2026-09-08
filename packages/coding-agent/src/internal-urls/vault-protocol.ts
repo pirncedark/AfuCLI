@@ -405,6 +405,16 @@ function getCachedVaultRoot(ref: VaultReference): string | undefined {
 	return cached ? path.resolve(cached) : undefined;
 }
 
+/** Vault roots already resolved by the protocol handler, for native edit policy. */
+export function cachedVaultRoots(): Array<{ name: string; root: string }> {
+	const roots: Array<{ name: string; root: string }> = [];
+	if (cachedActiveVaultPath) roots.push({ name: "_", root: path.resolve(cachedActiveVaultPath) });
+	for (const [name, root] of cachedVaultDirectory ?? []) {
+		roots.push({ name, root: path.resolve(root) });
+	}
+	return roots;
+}
+
 function findExistingAncestorSync(targetPath: string, rootPath: string): string {
 	let current = targetPath;
 	while (true) {
@@ -787,7 +797,7 @@ export class VaultProtocolHandler implements ProtocolHandler {
 		const cacheKey = parsed.ref.active ? "_" : (parsed.ref.vault ?? "_");
 		let cliInfo = cachedVaultInfo.get(cacheKey);
 		if (cliInfo === undefined) {
-			const result = await this.#spawn(["vault", "info", ...this.#vaultCliArg(parsed.ref)], context);
+			const result = await this.#spawn([...this.#vaultCliArg(parsed.ref), "vault", "info"], context);
 			assertCliSuccess("vault info", result);
 			cliInfo = result.stdout.trim();
 			cachedVaultInfo.set(cacheKey, cliInfo);
@@ -926,7 +936,7 @@ export class VaultProtocolHandler implements ProtocolHandler {
 		context?: ResolveContext,
 	): Promise<InternalResource> {
 		const invocation = buildObsidianCliInvocation(parsed);
-		const args = [...invocation.args, ...this.#vaultCliArg(parsed.ref)];
+		const args = [...this.#vaultCliArg(parsed.ref), ...invocation.args];
 		const result = await this.#spawn(args, context);
 		assertCliSuccess(invocation.opLabel, result);
 		return {

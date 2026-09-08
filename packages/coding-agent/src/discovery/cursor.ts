@@ -24,7 +24,7 @@ import type { Settings } from "../capability/settings";
 import { settingsCapability } from "../capability/settings";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
 import {
-	buildRuleFromMarkdown,
+	discoverRuleFromMarkdown,
 	createSourceMeta,
 	expandEnvVarsDeep,
 	getProjectPath,
@@ -57,6 +57,7 @@ function parseMCPServers(
 		const serverConfig = config as Record<string, unknown>;
 		items.push({
 			name,
+			enabled: typeof serverConfig.enabled === "boolean" ? serverConfig.enabled : undefined,
 			command: serverConfig.command as string | undefined,
 			args: serverConfig.args as string[] | undefined,
 			env: serverConfig.env as Record<string, string> | undefined,
@@ -86,15 +87,17 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 
 	const projectContentPromise = projectPath ? readFile(projectPath) : Promise.resolve(null);
 
-	if (userContent && userPath) {
-		const result = parseMCPServers(userContent, userPath, "user");
+	// Load project entries before user entries so a project `enabled: false`
+	// claims its dedupe key before a same-named user server can survive (#7654).
+	const projectContent = await projectContentPromise;
+	if (projectContent && projectPath) {
+		const result = parseMCPServers(projectContent, projectPath, "project");
 		items.push(...result.items);
 		if (result.warning) warnings.push(result.warning);
 	}
 
-	const projectContent = await projectContentPromise;
-	if (projectContent && projectPath) {
-		const result = parseMCPServers(projectContent, projectPath, "project");
+	if (userContent && userPath) {
+		const result = parseMCPServers(userContent, userPath, "user");
 		items.push(...result.items);
 		if (result.warning) warnings.push(result.warning);
 	}
@@ -138,8 +141,8 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	return { items, warnings };
 }
 
-function transformMDCRule(name: string, content: string, path: string, source: SourceMeta): Rule {
-	return buildRuleFromMarkdown(name, content, path, source, { stripNamePattern: /\.(mdc|md)$/ });
+function transformMDCRule(name: string, content: string, path: string, source: SourceMeta): Rule | null {
+	return discoverRuleFromMarkdown(name, content, path, source, { stripNamePattern: /\.(mdc|md)$/ });
 }
 
 // =============================================================================

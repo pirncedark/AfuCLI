@@ -43,6 +43,7 @@ async function callSyntheticSearch(
 	query: string,
 	signal?: AbortSignal,
 	fetchImpl: FetchImpl = fetch,
+	timeoutMs?: number,
 ): Promise<SyntheticSearchResponse> {
 	const response = await fetchImpl(SYNTHETIC_SEARCH_URL, {
 		method: "POST",
@@ -51,7 +52,7 @@ async function callSyntheticSearch(
 			Authorization: `Bearer ${apiKey}`,
 		},
 		body: JSON.stringify({ query }),
-		signal: withHardTimeout(signal),
+		signal: withHardTimeout(signal, timeoutMs),
 	});
 
 	if (!response.ok) {
@@ -80,10 +81,15 @@ export async function searchSynthetic(params: SearchParamsWithFetch): Promise<Se
 		: params.query;
 
 	const fetchImpl = params.fetch;
-	const data = await withAuth(keyOrResolver, key => callSyntheticSearch(key, query, params.signal, fetchImpl), {
-		signal: params.signal,
-		missingKeyMessage: "Synthetic credentials not found. Set SYNTHETIC_API_KEY or login with 'omp /login synthetic'.",
-	});
+	const data = await withAuth(
+		keyOrResolver,
+		key => callSyntheticSearch(key, query, params.signal, fetchImpl, params.timeoutMs),
+		{
+			signal: params.signal,
+			missingKeyMessage:
+				"Synthetic credentials not found. Set SYNTHETIC_API_KEY or login with 'omp /login synthetic'.",
+		},
+	);
 	const sources: SearchSource[] = [];
 
 	for (const result of data.results ?? []) {

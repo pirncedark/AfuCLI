@@ -10,6 +10,7 @@ import type {
 	AuthCredential,
 	AuthCredentialSnapshot,
 	AuthCredentialSnapshotEntry,
+	DisabledCredentialSummary,
 	StoredCredentialBlock,
 } from "../auth-storage";
 import type { ClientUsageClientSummary, ClientUsageReport, UsageHistoryEntry, UsageReport } from "../usage";
@@ -86,6 +87,12 @@ export interface CredentialDisableResponse {
 	ok: boolean;
 }
 
+/** GET /v1/credentials/disabled response body — tombstones of auto-disabled rows. */
+export interface DisabledCredentialsResponse {
+	generatedAt: number;
+	disabled: DisabledCredentialSummary[];
+}
+
 /** POST /v1/credential/:id/block request body. */
 export type CredentialBlockRequest = CredentialBlockSnapshot;
 
@@ -157,6 +164,12 @@ export type SnapshotStreamEvent = SnapshotStreamSnapshotEvent | SnapshotStreamEn
  * unauthenticated for liveness probes; everything else requires a bearer.
  */
 export const AUTH_BROKER_API_PREFIX = "/v1";
+
+/** Request header used by clients to advertise optional auth-broker protocol features. */
+export const AUTH_BROKER_CAPABILITIES_HEADER = "OMP-Auth-Broker-Capabilities";
+
+/** Client understands independent Codex `chat` and `spark` credential-block scopes. */
+export const AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES = "codex-meter-block-scopes";
 
 /** Default port when none is configured. Loopback-only, no external exposure. */
 export const DEFAULT_AUTH_BROKER_BIND = "127.0.0.1:8765";

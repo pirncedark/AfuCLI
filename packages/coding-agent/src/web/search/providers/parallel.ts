@@ -7,6 +7,7 @@ import {
 	ParallelApiError,
 	type ParallelSearchResult,
 	parseParallelErrorResponse,
+	parseParallelJsonResponse,
 	parseParallelSearchPayload,
 } from "../../parallel";
 import { formatQuery, parseSearchQuery, type StructuredQuery } from "../query";
@@ -28,6 +29,13 @@ interface ParallelSourcePolicy {
 	after_date?: string;
 }
 
+const RECENCY_DAYS: Record<NonNullable<SearchParams["recency"]>, number> = {
+	day: 1,
+	week: 7,
+	month: 30,
+	year: 365,
+};
+
 /** Site values may carry paths (`github.com/anthropics`); Parallel takes bare hosts. */
 function toHosts(sites: readonly string[]): string[] {
 	const hosts = new Set<string>();
@@ -39,19 +47,23 @@ function toHosts(sites: readonly string[]): string[] {
 }
 
 /**
- * Map parsed `site:`/`-site:`/`after:` directives onto Parallel's
- * `source_policy`. Per Parallel docs, `exclude_domains` is ignored when
- * `include_domains` is set, so exclusions are only sent without an allow
- * list (the central lenient filter enforces them regardless).
+ * Map parsed `site:`/`-site:`/`after:` directives and the relative recency
+ * option onto Parallel's `source_policy`. An explicit `after:` bound wins.
+ * Per Parallel docs, `exclude_domains` is ignored when `include_domains` is
+ * set, so exclusions are only sent without an allow list (the central lenient
+ * filter enforces them regardless).
  */
-function toSourcePolicy(parsed: StructuredQuery): ParallelSourcePolicy | undefined {
+function toSourcePolicy(parsed: StructuredQuery, recency?: SearchParams["recency"]): ParallelSourcePolicy | undefined {
 	const policy: ParallelSourcePolicy = {};
 	const include = toHosts(parsed.sites);
 	const exclude = toHosts(parsed.excludedSites);
 	if (include.length) policy.include_domains = include;
 	else if (exclude.length) policy.exclude_domains = exclude;
 	if (parsed.after) policy.after_date = parsed.after;
-	return Object.keys(policy).length ? policy : undefined;
+	else if (recency) {
+		policy.after_date = new Date(Date.now() - RECENCY_DAYS[recency] * 86_400_000).toISOString().slice(0, 10);
+	}
+	return policy.include_domains || policy.exclude_domains || policy.after_date ? policy : undefined;
 }
 
 async function searchWithAuthStorage(
@@ -59,6 +71,7 @@ async function searchWithAuthStorage(
 	queries: string[],
 	params: {
 		signal?: AbortSignal;
+		timeoutMs?: number;
 		fetch?: FetchImpl;
 	},
 	authStorage: AuthStorage,
@@ -97,14 +110,14 @@ async function searchWithAuthStorage(
 					},
 					...(sourcePolicy && { source_policy: sourcePolicy }),
 				}),
-				signal: withHardTimeout(params.signal),
+				signal: withHardTimeout(params.signal, params.timeoutMs),
 			});
 
 			if (!response.ok) {
 				throw parseParallelErrorResponse(response.status, await response.text());
 			}
 
-			const payload: unknown = await response.json();
+			const payload = await parseParallelJsonResponse(response, "search");
 			return parseParallelSearchPayload(payload, { parseMetadata: false });
 		},
 		{ signal: params.signal },
@@ -115,7 +128,9 @@ export async function searchParallel(
 	params: {
 		query: string;
 		num_results?: number;
+		recency?: SearchParams["recency"];
 		signal?: AbortSignal;
+		timeoutMs?: number;
 		fetch?: FetchImpl;
 		parsedQuery?: StructuredQuery;
 	},
@@ -124,9 +139,9 @@ export async function searchParallel(
 ): Promise<SearchResponse> {
 	const numResults = clampNumResults(params.num_results, DEFAULT_NUM_RESULTS, MAX_NUM_RESULTS);
 	const parsed = params.parsedQuery ?? parseSearchQuery(params.query);
-	// Back-compat: without directives the upstream request is byte-identical.
+	// Directives are removed only where Parallel has a native equivalent.
 	const query = parsed.hasDirectives ? formatQuery(parsed, PARALLEL_QUERY_SYNTAX) : params.query;
-	const sourcePolicy = parsed.hasDirectives ? toSourcePolicy(parsed) : undefined;
+	const sourcePolicy = toSourcePolicy(parsed, params.recency);
 
 	try {
 		const result = await searchWithAuthStorage(
@@ -134,6 +149,7 @@ export async function searchParallel(
 			[query],
 			{
 				signal: params.signal,
+				timeoutMs: params.timeoutMs,
 				fetch: params.fetch,
 			},
 			authStorage,
@@ -171,7 +187,9 @@ export class ParallelProvider extends SearchProvider {
 			{
 				query: params.query,
 				num_results: params.numSearchResults ?? params.limit,
+				recency: params.recency,
 				signal: params.signal,
+				timeoutMs: params.timeoutMs,
 				fetch: params.fetch,
 				parsedQuery: params.parsedQuery,
 			},

@@ -5,9 +5,10 @@
  * `omp auth-broker status` (liveness checks). All endpoints except
  * `/v1/healthz` require a bearer token.
  */
+
+import { type } from "@oh-my-pi/omptype";
 import { readSseEvents } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
-import type { AuthCredential } from "../auth-storage";
+import type { AuthCredential, DisabledCredentialSummary } from "../auth-storage";
 import type {
 	ClientUsageReportRequest,
 	ClientUsageReportResponse,
@@ -20,6 +21,7 @@ import type {
 	CredentialRefreshResponse,
 	CredentialUploadRequest,
 	CredentialUploadResponse,
+	DisabledCredentialsResponse,
 	HealthzResponse,
 	SnapshotResponse,
 	SnapshotStreamEvent,
@@ -27,6 +29,7 @@ import type {
 	UsageResponse,
 	UsageStaleResponse,
 } from "./types";
+import { AUTH_BROKER_CAPABILITIES_HEADER, AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES } from "./types";
 import {
 	clientUsageReportResponseSchema,
 	clientUsageSummaryResponseSchema,
@@ -35,6 +38,7 @@ import {
 	credentialDisableResponseSchema,
 	credentialRefreshResponseSchema,
 	credentialUploadResponseSchema,
+	disabledCredentialsResponseSchema,
 	healthzResponseSchema,
 	snapshotResponseSchema,
 	snapshotStreamEventSchema,
@@ -42,6 +46,24 @@ import {
 	usageResponseSchema,
 	usageStaleResponseSchema,
 } from "./wire-schemas";
+
+/** Response schema per endpoint, keyed by the name `#request` callers pass. */
+const RESPONSE_SCHEMAS = {
+	clientUsageReportResponseSchema,
+	clientUsageSummaryResponseSchema,
+	credentialBlockResponseSchema,
+	credentialBlocksDeleteResponseSchema,
+	credentialDisableResponseSchema,
+	credentialRefreshResponseSchema,
+	credentialUploadResponseSchema,
+	disabledCredentialsResponseSchema,
+	healthzResponseSchema,
+	usageHistoryResponseSchema,
+	usageResponseSchema,
+	usageStaleResponseSchema,
+} as const;
+
+type AuthBrokerResponseSchemaName = keyof typeof RESPONSE_SCHEMAS;
 
 export interface AuthBrokerClientOptions {
 	/** Base URL (e.g. `https://broker.tailnet:8765`). Trailing slashes are trimmed. */
@@ -121,7 +143,7 @@ export class AuthBrokerClient {
 
 	healthz(signal?: AbortSignal): Promise<HealthzResponse> {
 		return this.#request<HealthzResponse>("GET", "/v1/healthz", {
-			schema: healthzResponseSchema,
+			schema: "healthzResponseSchema",
 			auth: false,
 			signal,
 		});
@@ -134,7 +156,9 @@ export class AuthBrokerClient {
 		const query = new URLSearchParams();
 		if (opts.waitMs !== undefined) query.set("wait", String(opts.waitMs));
 		const path = `/v1/snapshot${query.size > 0 ? `?${query.toString()}` : ""}`;
-		const headers: Record<string, string> = {};
+		const headers: Record<string, string> = {
+			[AUTH_BROKER_CAPABILITIES_HEADER]: AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
+		};
 		if (opts.ifGenerationGt !== undefined) headers["If-None-Match"] = `"${opts.ifGenerationGt}"`;
 		const timeoutMs =
 			opts.waitMs !== undefined && opts.waitMs > 0 ? Math.max(this.#timeoutMs, opts.waitMs + 1000) : undefined;
@@ -175,6 +199,7 @@ export class AuthBrokerClient {
 		const headers: Record<string, string> = {
 			Accept: "text/event-stream",
 			Authorization: `Bearer ${this.#token}`,
+			[AUTH_BROKER_CAPABILITIES_HEADER]: AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
 		};
 		if (opts.signal?.aborted) {
 			throw new AuthBrokerError("Auth broker request aborted", { cause: opts.signal.reason });
@@ -243,12 +268,23 @@ export class AuthBrokerClient {
 		}
 	}
 
-	fetchUsage(signal?: AbortSignal): Promise<UsageResponse> {
-		// Validates the envelope (`generatedAt`, `reports[].provider`, `limits`,
-		// `metadata`) but leaves provider-specific extension fields permissive so
-		// the broker can ship new shapes ahead of the client. `raw` is accepted
-		// but normally stripped by the broker before send.
-		return this.#request<UsageResponse>("GET", "/v1/usage", { schema: usageResponseSchema, signal });
+	/**
+	 * Fetch aggregate broker usage with a timeout sized for serialized
+	 * same-provider account probes.
+	 */
+	fetchUsage(options: { signal?: AbortSignal; maxAccountsPerProvider?: number } = {}): Promise<UsageResponse> {
+		const requestedAccountCount = options.maxAccountsPerProvider;
+		const accountCount =
+			typeof requestedAccountCount === "number" && Number.isFinite(requestedAccountCount)
+				? Math.max(1, Math.floor(requestedAccountCount))
+				: 1;
+		const perAccountTimeoutMs = Math.max(DEFAULT_TIMEOUT_MS, this.#timeoutMs);
+		const timeoutMs = perAccountTimeoutMs * (accountCount + 1);
+		return this.#request<UsageResponse>("GET", "/v1/usage", {
+			schema: "usageResponseSchema",
+			signal: options.signal,
+			timeoutMs,
+		});
 	}
 
 	/** Recorded usage-limit snapshots from the broker host, oldest first. */
@@ -260,14 +296,14 @@ export class AuthBrokerClient {
 		if (query?.sinceMs !== undefined) params.set("sinceMs", String(query.sinceMs));
 		if (query?.provider) params.set("provider", query.provider);
 		const path = `/v1/usage/history${params.size > 0 ? `?${params.toString()}` : ""}`;
-		return this.#request<UsageHistoryResponse>("GET", path, { schema: usageHistoryResponseSchema, signal });
+		return this.#request<UsageHistoryResponse>("GET", path, { schema: "usageHistoryResponseSchema", signal });
 	}
 
 	/** Report this client's batched observed request usage for per-install burn tracking. */
 	reportClientUsage(report: ClientUsageReportRequest, signal?: AbortSignal): Promise<ClientUsageReportResponse> {
 		return this.#request<ClientUsageReportResponse>("POST", "/v1/usage/observed", {
 			body: report,
-			schema: clientUsageReportResponseSchema,
+			schema: "clientUsageReportResponseSchema",
 			signal,
 		});
 	}
@@ -278,21 +314,21 @@ export class AuthBrokerClient {
 		if (query?.sinceMs !== undefined) params.set("sinceMs", String(query.sinceMs));
 		const path = `/v1/usage/clients${params.size > 0 ? `?${params.toString()}` : ""}`;
 		return this.#request<ClientUsageSummaryResponse>("GET", path, {
-			schema: clientUsageSummaryResponseSchema,
+			schema: "clientUsageSummaryResponseSchema",
 			signal,
 		});
 	}
 
 	notifyUsageStale(signal?: AbortSignal): Promise<UsageStaleResponse> {
 		return this.#request<UsageStaleResponse>("POST", "/v1/usage/stale", {
-			schema: usageStaleResponseSchema,
+			schema: "usageStaleResponseSchema",
 			signal,
 		});
 	}
 
 	async refreshCredential(id: number, signal?: AbortSignal): Promise<CredentialRefreshResponse> {
 		return this.#request<CredentialRefreshResponse>("POST", `/v1/credential/${id}/refresh`, {
-			schema: credentialRefreshResponseSchema,
+			schema: "credentialRefreshResponseSchema",
 			signal,
 		});
 	}
@@ -301,9 +337,30 @@ export class AuthBrokerClient {
 		const body: CredentialDisableRequest = { cause };
 		return this.#request<CredentialDisableResponse>("POST", `/v1/credential/${id}/disable`, {
 			body,
-			schema: credentialDisableResponseSchema,
+			schema: "credentialDisableResponseSchema",
 			signal,
 		});
+	}
+
+	/**
+	 * Disabled-credential tombstones (identity + cause, no token material).
+	 * Returns an empty list against brokers predating `GET
+	 * /v1/credentials/disabled` (404).
+	 */
+	async listDisabledCredentials(provider?: string, signal?: AbortSignal): Promise<DisabledCredentialSummary[]> {
+		const params = new URLSearchParams();
+		if (provider) params.set("provider", provider);
+		const path = `/v1/credentials/disabled${params.size > 0 ? `?${params.toString()}` : ""}`;
+		try {
+			const response = await this.#request<DisabledCredentialsResponse>("GET", path, {
+				schema: "disabledCredentialsResponseSchema",
+				signal,
+			});
+			return response.disabled;
+		} catch (error) {
+			if (error instanceof AuthBrokerError && error.status === 404) return [];
+			throw error;
+		}
 	}
 
 	async uploadCredential(
@@ -314,7 +371,7 @@ export class AuthBrokerClient {
 		const body: CredentialUploadRequest = { provider, credential };
 		return this.#request<CredentialUploadResponse>("POST", "/v1/credential", {
 			body,
-			schema: credentialUploadResponseSchema,
+			schema: "credentialUploadResponseSchema",
 			signal,
 		});
 	}
@@ -327,14 +384,14 @@ export class AuthBrokerClient {
 		const body: CredentialBlockRequest = block;
 		return this.#request<CredentialBlockResponse>("POST", `/v1/credential/${id}/block`, {
 			body,
-			schema: credentialBlockResponseSchema,
+			schema: "credentialBlockResponseSchema",
 			signal,
 		});
 	}
 
 	async deleteCredentialBlocks(id: number, signal?: AbortSignal): Promise<CredentialBlocksDeleteResponse> {
 		return this.#request<CredentialBlocksDeleteResponse>("DELETE", `/v1/credential/${id}/blocks`, {
-			schema: credentialBlocksDeleteResponseSchema,
+			schema: "credentialBlocksDeleteResponseSchema",
 			signal,
 		});
 	}
@@ -342,12 +399,18 @@ export class AuthBrokerClient {
 	async #request<t>(
 		method: "GET" | "POST" | "DELETE",
 		path: string,
-		opts: { schema: (input: unknown) => unknown; auth?: boolean; body?: unknown; signal?: AbortSignal },
+		opts: {
+			schema: AuthBrokerResponseSchemaName;
+			auth?: boolean;
+			body?: unknown;
+			signal?: AbortSignal;
+			timeoutMs?: number;
+		},
 	): Promise<t> {
 		const response = await this.#fetchRaw(method, path, opts);
 		const text = await response.text();
 		const raw = this.#parseJson(text, response.status);
-		const validated = opts.schema(raw);
+		const validated = RESPONSE_SCHEMAS[opts.schema](raw);
 		if (validated instanceof type.errors) {
 			throw new AuthBrokerError("Auth broker response failed schema validation", {
 				status: response.status,
@@ -382,7 +445,7 @@ export class AuthBrokerClient {
 	): Promise<Response> {
 		const auth = opts.auth ?? true;
 		const url = `${this.#baseUrl}${path}`;
-		const headers: Record<string, string> = { Accept: "application/json", ...(opts.headers ?? {}) };
+		const headers: Record<string, string> = { Accept: "application/json", ...opts.headers };
 		if (auth) headers.Authorization = `Bearer ${this.#token}`;
 		let payload: string | undefined;
 		if (opts.body !== undefined) {
@@ -408,7 +471,15 @@ export class AuthBrokerClient {
 					signal,
 				});
 				if (!response.ok && response.status !== 304) {
-					const text = await response.text();
+					let text = "";
+					try {
+						text = await response.text();
+					} catch (cause) {
+						throw new AuthBrokerError(`Auth broker request failed: ${response.status} ${response.statusText}`, {
+							status: response.status,
+							cause,
+						});
+					}
 					throw new AuthBrokerError(`Auth broker request failed: ${response.status} ${response.statusText}`, {
 						status: response.status,
 						body: text,
@@ -419,6 +490,7 @@ export class AuthBrokerClient {
 				lastError = error;
 				// Caller-driven abort wins over retry — the caller said stop.
 				if (opts.signal?.aborted) {
+					if (error instanceof AuthBrokerError && error.status !== undefined) throw error;
 					throw new AuthBrokerError("Auth broker request aborted", { cause: opts.signal.reason });
 				}
 				if (error instanceof AuthBrokerError && error.status !== undefined) {

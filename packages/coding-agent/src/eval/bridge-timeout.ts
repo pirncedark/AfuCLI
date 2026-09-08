@@ -2,8 +2,8 @@
  * Timeout suspension for in-flight host-side eval bridge calls.
  *
  * The eval watchdog caps a cell's `timeout` as a budget on the cell runtime's
- * own work. Host-side `agent()` / `parallel()` / `completion()` bridge calls hand
- * control to the outer TypeScript process, where the Python kernel or JS VM is
+ * own work. Host-side waits on `agent()` / `completion()` handles hand control
+ * to the outer TypeScript process, where the Python kernel or JS VM is
  * only waiting for a result. While that delegated work is in flight, the cell
  * timeout must be ignored completely; once the bridge returns and the runtime is
  * back in control, the watchdog starts a fresh timeout window.
@@ -29,8 +29,11 @@ export function isEvalTimeoutControlEvent(event: JsStatusEvent): boolean {
 /** Optional behavior for a timeout pause around a host bridge call. */
 export interface BridgeTimeoutPauseOptions {
 	/**
-	 * Marks the pause as an `agent()` call whose already-started work must finish
-	 * before an external eval abort reaches the kernel.
+	 * Holds an external eval abort back from the *kernel* until this bridge call
+	 * settles, so the runtime is never torn down mid-phase (`agent()` isolation
+	 * worktree setup and merge/cherry-pick). It does not shield the delegated
+	 * work itself: the bridge hands subagents the caller's real signal, so a
+	 * turn cancel still stops them immediately.
 	 */
 	deferExternalAbort?: boolean;
 }

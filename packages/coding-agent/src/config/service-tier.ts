@@ -16,6 +16,11 @@ export type ServiceTierOpenAISettingValue = (typeof SERVICE_TIER_OPENAI_VALUES)[
 export type ServiceTierAnthropicSettingValue = (typeof SERVICE_TIER_ANTHROPIC_VALUES)[number];
 export type ServiceTierGoogleSettingValue = (typeof SERVICE_TIER_GOOGLE_VALUES)[number];
 
+/** Whether a runtime value is a supported OpenAI service-tier setting. */
+export function isServiceTierOpenAISettingValue(value: string): value is ServiceTierOpenAISettingValue {
+	return SERVICE_TIER_OPENAI_VALUES.some(tier => tier === value);
+}
+
 /** Whether a runtime value names a provider family with an independent service-tier knob. */
 export function isServiceTierFamily(value: unknown): value is ServiceTierFamily {
 	return value === "openai" || value === "anthropic" || value === "google";

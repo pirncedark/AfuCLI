@@ -12,7 +12,14 @@ import threading
 import time
 import unittest
 
-from omp_rpc import RpcClient, RpcCommandError, RpcConcurrencyError, RpcError, host_tool
+from omp_rpc import (
+    AgentEndEvent,
+    RpcClient,
+    RpcCommandError,
+    RpcConcurrencyError,
+    RpcError,
+    host_tool,
+)
 from omp_rpc.client import _RpcFrameDecoder
 
 
@@ -70,6 +77,8 @@ FAKE_SERVER = textwrap.dedent(
         }
 
     registered_host_tools = []
+    host_event_tool_call_id = "toolu_host_1"
+    host_event_tool_name = "echo_host"
 
     def current_state():
         return {
@@ -82,6 +91,9 @@ FAKE_SERVER = textwrap.dedent(
             "interruptMode": interrupt_mode,
             "sessionId": "fake-session",
             "sessionName": session_name,
+            "fastModeEnabled": False,
+            "fastModeActive": True,
+            "tokensPerSecond": 7.25,
             "autoCompactionEnabled": auto_compaction_enabled,
             "messageCount": len(messages),
             "queuedMessageCount": 0,
@@ -317,6 +329,21 @@ FAKE_SERVER = textwrap.dedent(
                 "compact",
                 {"summary": "trimmed", "shortSummary": "trimmed", "firstKeptEntryId": "entry-1", "tokensBefore": 123},
             )
+        elif command_type == "set_fast_mode":
+            enabled = command.get("enabled")
+            if not isinstance(enabled, bool):
+                respond(
+                    request_id,
+                    "set_fast_mode",
+                    success=False,
+                    error="set_fast_mode requires boolean enabled",
+                )
+            else:
+                respond(
+                    request_id,
+                    "set_fast_mode",
+                    {"enabled": False, "active": True},
+                )
         elif command_type == "set_auto_compaction":
             auto_compaction_enabled = command["enabled"]
             respond(request_id, "set_auto_compaction", {})
@@ -391,12 +418,42 @@ FAKE_SERVER = textwrap.dedent(
                 continue
             if message == "needs host tool":
                 print(json.dumps({"type": "agent_start"}), flush=True)
+                host_event_tool_call_id = "toolu_host_1"
+                host_event_tool_name = "echo_host"
                 print(
                     json.dumps(
                         {
                             "type": "host_tool_call",
                             "id": "host-call-1",
                             "toolCallId": "toolu_host_1",
+                            "toolName": "echo_host",
+                            "arguments": {"message": "hello"},
+                        }
+                    ),
+                    flush=True,
+                )
+                continue
+            if message == "needs xd host tool":
+                print(json.dumps({"type": "agent_start"}), flush=True)
+                host_event_tool_call_id = "toolu_write_1"
+                host_event_tool_name = "write"
+                print(
+                    json.dumps(
+                        {
+                            "type": "tool_execution_start",
+                            "toolCallId": "toolu_write_1",
+                            "toolName": "write",
+                            "args": {"path": "xd://echo_host", "content": '{"message": "hello"}'},
+                        }
+                    ),
+                    flush=True,
+                )
+                print(
+                    json.dumps(
+                        {
+                            "type": "host_tool_call",
+                            "id": "host-call-2",
+                            "toolCallId": "toolu_write_1",
                             "toolName": "echo_host",
                             "arguments": {"message": "hello"},
                         }
@@ -418,8 +475,8 @@ FAKE_SERVER = textwrap.dedent(
                 json.dumps(
                     {
                         "type": "tool_execution_update",
-                        "toolCallId": "toolu_host_1",
-                        "toolName": "echo_host",
+                        "toolCallId": host_event_tool_call_id,
+                        "toolName": host_event_tool_name,
                         "args": {"message": "hello"},
                         "partialResult": command["partialResult"],
                     }
@@ -431,8 +488,8 @@ FAKE_SERVER = textwrap.dedent(
                 json.dumps(
                     {
                         "type": "tool_execution_end",
-                        "toolCallId": "toolu_host_1",
-                        "toolName": "echo_host",
+                        "toolCallId": host_event_tool_call_id,
+                        "toolName": host_event_tool_name,
                         "result": command["result"],
                         "isError": command.get("isError", False),
                     }
@@ -756,6 +813,67 @@ BROKEN_STARTUP_SERVER = textwrap.dedent(
     """
 )
 
+FORWARD_COMPAT_SERVER = textwrap.dedent(
+    """
+    import json
+    import sys
+    import time
+
+    print(json.dumps({"type": "ready"}), flush=True)
+    for raw_line in sys.stdin:
+        command = json.loads(raw_line)
+        print(
+            json.dumps(
+                {
+                    "id": command.get("id"),
+                    "type": "response",
+                    "command": command["type"],
+                    "success": True,
+                }
+            ),
+            flush=True,
+        )
+        if command["type"] != "prompt":
+            continue
+        if command.get("message") == "malformed terminal":
+            print(
+                json.dumps(
+                    {
+                        "type": "agent_end",
+                        "messages": [{"role": "future_role"}],
+                        "isTerminal": True,
+                    }
+                ),
+                flush=True,
+            )
+            time.sleep(2)
+            continue
+        print(
+            json.dumps(
+                {
+                    "type": "auto_compaction_start",
+                    "reason": "future_reason",
+                    "action": "future_action",
+                }
+            ),
+            flush=True,
+        )
+        print(
+            json.dumps(
+                {"type": "agent_end", "messages": [], "isTerminal": False}
+            ),
+            flush=True,
+        )
+        time.sleep(0.15)
+        print(
+            json.dumps(
+                {"type": "agent_end", "messages": [], "isTerminal": True}
+            ),
+            flush=True,
+        )
+    """
+)
+
 
 class RpcClientTests(unittest.TestCase):
     def make_client(self, server: str = FAKE_SERVER, **kwargs: object) -> RpcClient:
@@ -845,10 +963,20 @@ class RpcClientTests(unittest.TestCase):
             self.assertEqual(
                 state.model.id if state.model else None, "claude-sonnet-4-5"
             )
+            self.assertFalse(state.fast_mode_enabled)
+            self.assertTrue(state.fast_mode_active)
+            self.assertEqual(state.tokens_per_second, 7.25)
 
             result = client.bash("echo hello")
             self.assertEqual(result.output, "hello\n")
             self.assertEqual(result.exit_code, 0)
+
+    def test_set_fast_mode_preserves_provider_tier_state(self) -> None:
+        with self.make_client() as client:
+            result = client.set_fast_mode(False)
+
+            self.assertFalse(result.enabled)
+            self.assertTrue(result.active)
 
     def test_prompt_and_wait_returns_assistant_text(self) -> None:
         with self.make_client() as client:
@@ -906,6 +1034,62 @@ class RpcClientTests(unittest.TestCase):
                 update_events[0].partial_result["content"][0]["text"], "working:hello"
             )
             self.assertEqual(len(end_events), 1)
+            self.assertEqual(end_events[0].result["content"][0]["text"], "host:hello")
+
+    def test_xd_dispatched_custom_tool_events_carry_host_tool_name(self) -> None:
+        """Events for an xd:// device dispatch are renamed to the executed host tool.
+
+        With `tools.xdev` on, omp invokes a custom tool through `write
+        xd://<name>` and the wire events carry the transport tool (`write`).
+        Consumers must observe the host-tool name on update/end events
+        regardless of transport — roboomp's terminal-action detection
+        triple-posted PR reviews when end events only said `write`
+        (oh-my-pi#6696). `tool_execution_start` precedes the `host_tool_call`
+        frame on the wire and keeps the transport name.
+        """
+
+        def echo_host(args: dict[str, str], context) -> str:
+            context.send_update(f"working:{args['message']}")
+            return f"host:{args['message']}"
+
+        with self.make_client(
+            custom_tools=(
+                host_tool(
+                    name="echo_host",
+                    description="Echo from the Python host process",
+                    parameters={
+                        "type": "object",
+                        "properties": {"message": {"type": "string"}},
+                        "required": ["message"],
+                        "additionalProperties": False,
+                    },
+                    execute=echo_host,
+                ),
+            )
+        ) as client:
+            turn = client.prompt_and_wait("needs xd host tool", timeout=2.0)
+            start_names = [
+                event.tool_name
+                for event in turn.events
+                if getattr(event, "type", None) == "tool_execution_start"
+            ]
+            update_events = [
+                event
+                for event in turn.events
+                if getattr(event, "type", None) == "tool_execution_update"
+            ]
+            end_events = [
+                event
+                for event in turn.events
+                if getattr(event, "type", None) == "tool_execution_end"
+            ]
+
+            self.assertEqual(start_names, ["write"])
+            self.assertEqual(
+                [event.tool_name for event in update_events], ["echo_host"]
+            )
+            self.assertEqual([event.tool_name for event in end_events], ["echo_host"])
+            self.assertEqual(end_events[0].tool_call_id, "toolu_write_1")
             self.assertEqual(end_events[0].result["content"][0]["text"], "host:hello")
 
     def test_extension_ui_round_trip(self) -> None:
@@ -1143,6 +1327,39 @@ class RpcClientTests(unittest.TestCase):
 
         self.assertEqual(seen_extension_errors, ["boom"])
         self.assertEqual(seen_unknown, ["unknown_future_event"])
+
+    def test_additive_notification_values_do_not_stop_the_reader(self) -> None:
+        unknown_errors: list[str | None] = []
+
+        with self.make_client(server=FORWARD_COMPAT_SERVER) as client:
+            client.on_unknown_notification(
+                lambda event: unknown_errors.append(event.parse_error)
+            )
+            turn = client.prompt_and_wait("forward compatible", timeout=2.0)
+
+        terminal_events = [
+            event for event in turn.events if isinstance(event, AgentEndEvent)
+        ]
+        self.assertEqual(
+            [event.is_terminal for event in terminal_events], [False, True]
+        )
+        self.assertEqual(len(unknown_errors), 1)
+        self.assertIn("auto_compaction_start.reason", unknown_errors[0] or "")
+
+    def test_malformed_terminal_agent_end_wakes_waiter(self) -> None:
+        unknown_errors: list[str | None] = []
+
+        with self.make_client(server=FORWARD_COMPAT_SERVER) as client:
+            client.on_unknown_notification(
+                lambda event: unknown_errors.append(event.parse_error)
+            )
+            with self.assertRaisesRegex(
+                RpcError, "Failed to parse terminal agent_end"
+            ):
+                client.prompt_and_wait("malformed terminal", timeout=1.0)
+
+        self.assertEqual(len(unknown_errors), 1)
+        self.assertIn("messages[0].role", unknown_errors[0] or "")
 
     def test_ui_confirmation_and_cancel_round_trip(self) -> None:
         with self.make_client() as client:

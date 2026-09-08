@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	enforceInlineByteCap,
 	formatHeadTruncationNotice,
 	formatMiddleElisionMarker,
 	formatTailTruncationNotice,
@@ -152,6 +153,17 @@ describe("truncateTail", () => {
 		expect(result.content).toBe("ghij");
 		expect(result.truncatedBy).toBe("bytes");
 		expect(result.lastLinePartial).toBe(true);
+	});
+
+	test("fills the remaining byte budget from a giant line before smaller trailing lines", () => {
+		const result = truncateTail("abcdefghijk\n}\n```", { maxLines: 10, maxBytes: 10 });
+
+		expect(result.content).toBe("hijk\n}\n```");
+		expect(result.truncatedBy).toBe("bytes");
+		expect(result.outputLines).toBe(3);
+		expect(result.outputBytes).toBe(10);
+		expect(result.partialByteWindows).toBe(true);
+		expect(result.lastLinePartial).toBe(false);
 	});
 });
 
@@ -543,7 +555,7 @@ describe("truncation notice formatting", () => {
 		expect(formatTailTruncationNotice(truncation)).toBe("");
 	});
 
-	test("formatTailTruncationNotice supports partial-line and complete-line notices", () => {
+	test("formatTailTruncationNotice distinguishes partial leading and final lines", () => {
 		const partialLineTruncation = truncateTail("abcdefghij", { maxLines: 10, maxBytes: 4 });
 		const partialLineNotice = formatTailTruncationNotice(partialLineTruncation, {
 			fullOutputPath: "/tmp/full.log",
@@ -559,6 +571,11 @@ describe("truncation notice formatting", () => {
 
 		const byteTruncation = truncateTail("aaa\nbbbb\ncc", { maxLines: 10, maxBytes: 6 });
 		expect(formatTailTruncationNotice(byteTruncation)).toBe("\n\n[Showing lines 3-3 of 3]");
+
+		const leadingPartialTruncation = truncateTail("abcdefghijk\n}\n```", { maxLines: 10, maxBytes: 10 });
+		expect(formatTailTruncationNotice(leadingPartialTruncation)).toBe(
+			"\n\n[Showing last 10B across lines 1-3 of 3; line 1 is partial]",
+		);
 	});
 
 	test("formatHeadTruncationNotice returns empty string for non-truncated results", () => {
@@ -606,17 +623,65 @@ describe("truncateMiddle", () => {
 		expect(result.elidedBytes).toBeGreaterThan(0);
 	});
 
-	test("falls back to tail-only when head budget cannot accept the first line", () => {
+	test("uses non-overlapping byte windows when the first line exceeds the head budget", () => {
 		const giantFirstLine = `${"x".repeat(200)}\nshort-2\nshort-3`;
 		const result = truncateMiddle(giantFirstLine, {
 			maxBytes: 40,
 			maxLines: 10,
-			maxHeadBytes: 8, // first line is 200 bytes — exceeds head budget
+			maxHeadBytes: 8,
 			maxHeadLines: 1,
 		});
 		expect(result.truncated).toBe(true);
-		// Should not contain the elision marker; it's a regular tail truncation.
-		expect(result.content).not.toContain("elided");
+		expect(result.truncatedBy).toBe("middle");
+		expect(result.content.startsWith("xxxxxxxx")).toBe(true);
+		expect(result.content.endsWith("short-3")).toBe(true);
+		expect(result.content).toContain("elided");
+		expect(result.elidedBytes).toBeGreaterThan(0);
+		expect(result.headLines).toBe(1);
+		expect(result.tailLines).toBe(3);
+		expect(result.partialByteWindows).toBe(true);
+		expect(result.lastLinePartial).toBe(false);
+	});
+
+	test("does not duplicate overlapping fallback windows", () => {
+		const content = `${"x".repeat(5000)}\n${Array.from({ length: 100 }, (_, i) => `line-${i}`).join("\n")}`;
+		const result = truncateMiddle(content, { maxBytes: 8192, maxLines: 80 });
+
+		expect(result.truncatedBy).toBe("middle");
+		expect(result.elidedBytes).toBeGreaterThan(0);
+		expect(result.content).not.toContain("[…0B elided…]");
+		expect(result.headLines).toBe(1);
+		expect(result.tailLines).toBeLessThanOrEqual(40);
+		expect(result.outputBytes).toBeLessThanOrEqual(8192 + 64);
+	});
+
+	test("marks multi-line partial byte windows so exact ranges are omitted", () => {
+		const content = `${"x".repeat(20_000)}\n${"y".repeat(20_000)}`;
+		const result = truncateMiddle(content, { maxBytes: 8192, maxLines: 80 });
+
+		expect(result.truncatedBy).toBe("middle");
+		expect(result.partialByteWindows).toBe(true);
+		expect(result.elidedBytes).toBeGreaterThan(0);
+	});
+
+	test("keeps a giant trailing line within budget", () => {
+		const content = `label\n${"x".repeat(20_000)}`;
+		const result = truncateMiddle(content, { maxBytes: 8192, maxLines: 80 });
+
+		expect(result.truncated).toBe(true);
+		expect(result.truncatedBy).toBe("middle");
+		expect(result.content.startsWith("label\n")).toBe(true);
+		expect(result.content).toContain("elided");
+		expect(result.outputBytes).toBeLessThanOrEqual(8192 + 64);
+	});
+
+	test("marks single-line byte windows so line ranges can be omitted", () => {
+		const result = truncateMiddle("x".repeat(20_000), { maxBytes: 8192, maxLines: 80 });
+
+		expect(result.truncatedBy).toBe("middle");
+		expect(result.partialByteWindows).toBe(true);
+		expect(result.headLines).toBe(1);
+		expect(result.tailLines).toBe(1);
 	});
 
 	test("formatMiddleElisionMarker uses lines, falling back to bytes for <=1 line", () => {
@@ -685,6 +750,36 @@ describe("OutputSink head-retain mode", () => {
 		expect(dumped.truncated).toBe(false);
 		// Counters realign to the authoritative buffer + the subsequent push.
 		expect(dumped.totalBytes).toBe(byteLength("OK\n[raw output: artifact://8]\n"));
+	});
+
+	test("middle-elided dump body fits the inline budget (no double truncation)", async () => {
+		// Regression: the head and tail windows each had their own full budget,
+		// so an elided dump body could reach headBytes + spillThreshold and
+		// re-trip enforceInlineByteCap at the tool-result boundary — truncating
+		// a second time and saving a duplicate artifact whose id disagreed with
+		// the truncation notice's `Read artifact://N for full output`.
+		const spillThreshold = 1000;
+		const sink = new OutputSink({ spillThreshold, headBytes: 400 });
+		const lines = Array.from({ length: 400 }, (_, i) => `line ${i}`).join("\n");
+		sink.push(lines);
+
+		const dumped = await sink.dump();
+		expect(dumped.truncated).toBe(true);
+		expect(dumped.elidedLines ?? 0).toBeGreaterThan(0);
+		// Head window + elision marker + tail window share the one budget
+		// (small slack for the marker and separators).
+		expect(byteLength(dumped.output)).toBeLessThanOrEqual(spillThreshold + 64);
+
+		let saved: string | undefined;
+		const capped = await enforceInlineByteCap(dumped.output, {
+			maxBytes: spillThreshold + 2048,
+			saveArtifact: full => {
+				saved = full;
+				return "duplicate";
+			},
+		});
+		expect(capped).toBe(dumped.output);
+		expect(saved).toBeUndefined();
 	});
 });
 

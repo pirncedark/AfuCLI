@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
-import { readArchiveEntries, writeArchive } from "@oh-my-pi/pi-coding-agent/utils/zip";
+import { readArchiveEntries, writeArchive } from "@oh-my-pi/pi-utils/ar";
 
 // A read-only step that mis-dispatches `read` as `write` passes the full read
 // expression (`src/foo.tsx:1-260:raw`) as the target. Because a literal colon
@@ -101,6 +101,40 @@ describe("write refuses read-selector misfires", () => {
 		expect(result.isError).toBeUndefined();
 		const entries = await readArchiveEntries({ bytes: await Bun.file(archivePath).bytes(), format: "zip" });
 		expect(entries.get(member)).toEqual(new Uint8Array());
+		await fs.rm(dir, { recursive: true, force: true });
+	});
+
+	it("rejects a semicolon-joined selector list with non-empty content and creates nothing", async () => {
+		const dir = await makeWorkspace();
+		const write = new WriteTool(session(dir));
+		const target = "a.txt:1-2;b/c.txt:3-4";
+		await expect(write.execute("c", { path: target, content: "{}" })).rejects.toThrow(
+			/semicolon-joined list of 2 read-tool selectors/,
+		);
+		expect(await Bun.file(path.join(dir, target)).exists()).toBe(false);
+		expect(await Bun.file(path.join(dir, "a.txt:1-2;b/c.txt:3-4")).exists()).toBe(false);
+		expect(await fs.readdir(dir)).toEqual(["src"]);
+		await fs.rm(dir, { recursive: true, force: true });
+	});
+
+	it("still writes a real path that merely contains a semicolon (no per-segment selectors)", async () => {
+		const dir = await makeWorkspace();
+		const write = new WriteTool(session(dir));
+		const target = "notes;draft.txt";
+		const res = await write.execute("c", { path: target, content: "hi" });
+		expect(res.isError).toBeUndefined();
+		expect(await Bun.file(path.join(dir, target)).text()).toBe("hi");
+		await fs.rm(dir, { recursive: true, force: true });
+	});
+
+	it("keeps an existing literal file whose name looks like a selector list writable", async () => {
+		const dir = await makeWorkspace();
+		const write = new WriteTool(session(dir));
+		const target = "report:1-2;archive:3-4";
+		await Bun.write(path.join(dir, target), "old");
+		const res = await write.execute("c", { path: target, content: "new" });
+		expect(res.isError).toBeUndefined();
+		expect(await Bun.file(path.join(dir, target)).text()).toBe("new");
 		await fs.rm(dir, { recursive: true, force: true });
 	});
 });

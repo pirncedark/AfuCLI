@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import type {
 	SessionNotification,
 	SessionUpdate,
@@ -5,10 +6,10 @@ import type {
 	ToolCallContent,
 	ToolCallLocation,
 	ToolKind,
-} from "@agentclientprotocol/sdk";
+} from "@oh-my-pi/pi-utils/acp";
 import { parseXdUrl } from "../../internal-urls/xd-protocol";
 import type { AgentSessionEvent } from "../../session/agent-session";
-import { resolveToCwd } from "../../tools/path-utils";
+import { resolveToCwd, splitPathAndSelPreferringLiteralSync } from "../../tools/path-utils";
 import type { TodoStatus } from "../../tools/todo";
 import { canonicalizeMessage } from "../../utils/thinking-display";
 
@@ -58,6 +59,10 @@ interface BinaryLikeContent extends TypedValue {
 
 interface PathContainer {
 	path?: unknown;
+}
+
+interface ResolvedPathContainer {
+	resolvedPath?: unknown;
 }
 
 interface OldPathContainer {
@@ -141,6 +146,39 @@ function xdevDispatchDevice(toolName: string, args: unknown): string | undefined
 	return parseXdUrl(path)?.name ?? undefined;
 }
 
+/** Whether a Hub call carries peer-to-peer coordination rather than process control. */
+function isInternalHubMessageTool(toolName: string, args: unknown): boolean {
+	let hubArgs = args;
+	if (toolName !== "hub") {
+		if (xdevDispatchDevice(toolName, args) !== "hub" || typeof args !== "object" || args === null) {
+			return false;
+		}
+		const content = Reflect.get(args, "content");
+		if (typeof content !== "string") return false;
+		try {
+			hubArgs = JSON.parse(content);
+		} catch {
+			return false;
+		}
+	}
+	if (typeof hubArgs !== "object" || hubArgs === null) return false;
+	const op = Reflect.get(hubArgs, "op");
+	switch (op) {
+		case "list":
+		case "inbox":
+			return true;
+		case "send":
+			return typeof Reflect.get(hubArgs, "to") === "string";
+		case "wait":
+			// A bare wait or an `ids` wait settles on background-job delivery,
+			// whose snapshot IS the job result (hub.md) — keep those visible.
+			// Only a peer-scoped wait (`from`, no jobs) is internal messaging.
+			return typeof Reflect.get(hubArgs, "from") === "string" && Reflect.get(hubArgs, "ids") === undefined;
+		default:
+			return false;
+	}
+}
+
 export function mapToolKind(toolName: string, args?: unknown): ToolKind {
 	// An xd:// device write executes the mounted tool — "edit" would make ACP
 	// clients render it as a file modification to a nonexistent path (and
@@ -186,6 +224,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		case "message_end":
 			return mapAssistantMessageEnd(event, sessionId, options);
 		case "tool_execution_start": {
+			if (isInternalHubMessageTool(event.toolName, event.args)) return [];
 			const update = buildToolCallStartUpdate({
 				toolCallId: event.toolCallId,
 				toolName: event.toolName,
@@ -196,6 +235,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 			return [toSessionNotification(sessionId, update)];
 		}
 		case "tool_execution_update": {
+			if (isInternalHubMessageTool(event.toolName, event.args)) return [];
 			const content = mergeToolUpdateContent(
 				buildToolStartContent(event.toolName, event.args),
 				extractToolCallContent(event.partialResult, options),
@@ -209,21 +249,20 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 			if (content.length > 0) {
 				update.content = content;
 			}
-			const locations = extractToolLocations(event.args, options.cwd);
+			const locations = extractToolLocations(event.args, options.cwd, event.toolName);
 			if (locations.length > 0) {
 				update.locations = locations;
 			}
 			return [toSessionNotification(sessionId, update)];
 		}
 		case "tool_execution_end": {
+			const args = getToolExecutionEndArgs(event, options);
+			if (isInternalHubMessageTool(event.toolName, args)) return [];
 			const resultContent = [
 				...extractDiffToolCallContent(event.result),
 				...extractToolCallContent(event.result, options),
 			];
-			const content = mergeToolUpdateContent(
-				buildToolStartContent(event.toolName, getToolExecutionEndArgs(event, options)),
-				resultContent,
-			);
+			const content = mergeToolUpdateContent(buildToolStartContent(event.toolName, args), resultContent);
 			const update: SessionUpdate = {
 				sessionUpdate: "tool_call_update",
 				toolCallId: event.toolCallId,
@@ -461,7 +500,7 @@ export function buildToolCallStartUpdate(input: {
 	if (content.length > 0) {
 		update.content = content;
 	}
-	const locations = extractToolLocations(input.args, input.cwd);
+	const locations = extractToolLocations(input.args, input.cwd, input.toolName);
 	if (locations.length > 0) {
 		update.locations = locations;
 	}
@@ -608,7 +647,37 @@ function toAcpLocationPath(value: string, cwd?: string): string {
  */
 const INTERNAL_URL_SUBJECT = /^[a-z][a-z0-9+.-]*:\/\//i;
 
-function extractToolLocations(args: unknown, cwd?: string): ToolCallLocation[] {
+function existingFileLocationPath(raw: string | undefined, cwd?: string): string | undefined {
+	if (!raw || INTERNAL_URL_SUBJECT.test(raw)) return undefined;
+	const resolved = toAcpLocationPath(raw, cwd);
+	try {
+		return fs.statSync(resolved).isFile() ? resolved : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Return the single existing file represented by a `read` argument.
+ *
+ * ACP locations are editor navigation targets, not tool inputs. Read inputs may
+ * name selectors, delimited paths, globs, directories, archive members, or
+ * internal resources, so only a path that resolves to a regular file is safe
+ * to publish. Literal selector-shaped filenames retain read-tool precedence.
+ */
+function readLocationBasePath(
+	raw: string | undefined,
+	cwd: string | undefined,
+	toolName: string | undefined,
+): string | undefined {
+	if (raw === undefined || toolName !== "read") return raw;
+	if (!cwd || INTERNAL_URL_SUBJECT.test(raw)) return undefined;
+
+	const candidate = splitPathAndSelPreferringLiteralSync(raw, cwd).path;
+	return existingFileLocationPath(candidate, cwd);
+}
+
+function extractToolLocations(args: unknown, cwd?: string, toolName?: string): ToolCallLocation[] {
 	const locations: ToolCallLocation[] = [];
 	const seen = new Set<string>();
 	const pushPath = (raw: string | undefined) => {
@@ -619,7 +688,7 @@ function extractToolLocations(args: unknown, cwd?: string): ToolCallLocation[] {
 		locations.push({ path });
 	};
 
-	pushPath(extractStringProperty<PathContainer>(args, "path"));
+	pushPath(readLocationBasePath(extractStringProperty<PathContainer>(args, "path"), cwd, toolName));
 	pushPath(extractStringProperty<OldPathContainer>(args, "oldPath"));
 	pushPath(extractStringProperty<NewPathContainer>(args, "newPath"));
 
@@ -632,6 +701,13 @@ function extractToolLocationsFromResult(result: unknown, cwd?: string): ToolCall
 	const details = (result as { details?: unknown }).details;
 	if (typeof details !== "object" || details === null) return [];
 	const direct = extractToolLocations(details, cwd);
+	const resolvedFile = existingFileLocationPath(
+		extractStringProperty<ResolvedPathContainer>(details, "resolvedPath"),
+		cwd,
+	);
+	if (resolvedFile && !direct.some(location => location.path === resolvedFile)) {
+		direct.push({ path: resolvedFile });
+	}
 	const perFile = (details as { perFileResults?: unknown }).perFileResults;
 	if (!Array.isArray(perFile)) {
 		return direct;
@@ -945,9 +1021,12 @@ function extractReadableText(value: unknown): string | undefined {
 		if (text.length > 0) {
 			return normalizeText(text);
 		}
-		if (hasBinaryContentBlock(contentBlocks)) {
-			return undefined;
-		}
+		// A structured result envelope (`{ content: [...] }`) whose blocks carry no
+		// plain text has nothing readable to surface, and its data already rides the
+		// ACP frame as `rawOutput`. Serializing the whole envelope to JSON would just
+		// render a raw blob as the tool row (e.g. hub wait progress, issue #9511), so
+		// stop here instead of falling through to the JSON fallback.
+		return undefined;
 	}
 	if (extractDetailsImages(value)) {
 		return undefined;
@@ -998,13 +1077,6 @@ function getContentType(value: unknown): string | undefined {
 	}
 	const type = (value as TypedValue).type;
 	return typeof type === "string" ? type : undefined;
-}
-
-function hasBinaryContentBlock(blocks: unknown[]): boolean {
-	return blocks.some(block => {
-		const type = getContentType(block);
-		return type === "image" || type === "audio";
-	});
 }
 
 function extractStringProperty<T extends object>(value: unknown, key: keyof T): string | undefined {

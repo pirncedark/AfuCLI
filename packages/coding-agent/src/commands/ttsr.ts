@@ -8,6 +8,7 @@ import * as path from "node:path";
  * shows every TTSR-registered rule the current project/user config would load.
  */
 import { Args, Command, Flags } from "@oh-my-pi/pi-utils/cli";
+import { ttsrHelp as commandHelp } from "../cli/command-help";
 import {
 	runTtsrCommand,
 	TTSR_ACTIONS,
@@ -19,8 +20,7 @@ import {
 import type { TtsrMatchSource } from "../export/ttsr";
 
 export default class Ttsr extends Command {
-	static description = "Inspect and test Time-Traveling Stream Rules (TTSR)";
-
+	static description = commandHelp.description;
 	static args = {
 		action: Args.string({
 			description: "TTSR action",
@@ -50,6 +50,9 @@ export default class Ttsr extends Command {
 			char: "p",
 			description: "Candidate file path for scope/glob matching and AST language inference",
 		}),
+		agent: Flags.string({
+			description: "Agent name to evaluate rule `agents` scoping as (ttsr test); defaults to main",
+		}),
 		verbose: Flags.boolean({ char: "v", description: "Show every evaluated rule, not just triggered ones" }),
 		json: Flags.boolean({ description: "Output JSON" }),
 		"no-gitignore": Flags.boolean({ description: "Include files excluded by .gitignore (ttsr scan)" }),
@@ -65,6 +68,7 @@ export default class Ttsr extends Command {
 		"omp ttsr test --file src/foo.ts",
 		"omp ttsr test --file src/foo.ts --source text",
 		"omp ttsr test --rule .omp/rules/no-any.md --source tool --path src/foo.ts 'const x: any = 1'",
+		"omp ttsr test --agent scout 'const x: any = 1'",
 		"echo 'Box::leak(&mut v)' | omp ttsr test --file - --path src/lib.rs",
 		"omp ttsr test --source tool --tool edit --path src/foo.ts 'const x: any = 1'",
 		"omp ttsr scan",
@@ -99,6 +103,7 @@ export default class Ttsr extends Command {
 						tool: flags.tool,
 						filePath: flags.path,
 						verbose: flags.verbose,
+						agent: flags.agent,
 					}
 				: undefined;
 

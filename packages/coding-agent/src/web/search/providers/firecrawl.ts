@@ -14,13 +14,13 @@ import {
 } from "@oh-my-pi/pi-ai";
 import type { SearchResponse, SearchSource } from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";
+import { resolveFirecrawlUrl } from "../../firecrawl";
 import { formatQuery, GOOGLE_QUERY_SYNTAX, parseSearchQuery, type StructuredQuery } from "../query";
 import { clampNumResults } from "../utils";
 import type { SearchParams } from "./base";
 import { SearchProvider } from "./base";
 import { classifyProviderHttpError, withHardTimeout } from "./utils";
 
-const FIRECRAWL_SEARCH_URL = "https://api.firecrawl.dev/v2/search";
 const DEFAULT_NUM_RESULTS = 10;
 const MAX_NUM_RESULTS = 100;
 
@@ -38,6 +38,7 @@ export interface FirecrawlSearchParams {
 	/** Explicit `tbs` (custom date range); takes precedence over `recency`. */
 	tbs?: string;
 	signal?: AbortSignal;
+	timeoutMs?: number;
 	fetch?: FetchImpl;
 }
 
@@ -45,14 +46,23 @@ interface FirecrawlWebResult {
 	title?: string | null;
 	url?: string | null;
 	description?: string | null;
+	snippet?: string | null;
 	markdown?: string | null;
 }
 
 interface FirecrawlSearchResponse {
+	success?: boolean;
+	error?: string | null;
 	id?: string | null;
-	data?: {
-		web?: FirecrawlWebResult[] | null;
-	} | null;
+	data?:
+		| FirecrawlWebResult[]
+		| {
+				web?: FirecrawlWebResult[] | null;
+				news?: FirecrawlWebResult[] | null;
+				images?: FirecrawlWebResult[] | null;
+		  }
+		| null;
+	results?: FirecrawlWebResult[] | null;
 }
 
 /** Resolve Firecrawl API key through the shared auth storage pipeline. */
@@ -87,11 +97,11 @@ async function callFirecrawlSearch(
 	if (apiKey) {
 		headers.Authorization = `Bearer ${apiKey}`;
 	}
-	const response = await (params.fetch ?? fetch)(FIRECRAWL_SEARCH_URL, {
+	const response = await (params.fetch ?? fetch)(resolveFirecrawlUrl("/search"), {
 		method: "POST",
 		headers,
 		body: JSON.stringify(buildRequestBody(params)),
-		signal: withHardTimeout(params.signal),
+		signal: withHardTimeout(params.signal, params.timeoutMs),
 	});
 
 	if (!response.ok) {
@@ -105,7 +115,11 @@ async function callFirecrawlSearch(
 		);
 	}
 
-	return (await response.json()) as FirecrawlSearchResponse;
+	const data = (await response.json()) as FirecrawlSearchResponse;
+	if (data.success === false) {
+		throw new SearchProviderError("firecrawl", data.error?.trim() || "Firecrawl request failed");
+	}
+	return data;
 }
 
 /** ISO `YYYY-MM-DD` to Google `MM/DD/YYYY` for `tbs=cdr` custom date ranges. */
@@ -127,6 +141,11 @@ function buildDateTbs(parsed: StructuredQuery): string | undefined {
 	return parts.join(",");
 }
 
+function getWebResults(data: FirecrawlSearchResponse): FirecrawlWebResult[] {
+	if (Array.isArray(data.data)) return data.data;
+	if (data.data && Array.isArray(data.data.web)) return data.data.web;
+	return data.results ?? [];
+}
 /** Execute Firecrawl web search. */
 export async function searchFirecrawl(params: SearchParams): Promise<SearchResponse> {
 	const parsed = params.parsedQuery ?? parseSearchQuery(params.query);
@@ -145,6 +164,7 @@ export async function searchFirecrawl(params: SearchParams): Promise<SearchRespo
 		recency: params.recency,
 		tbs,
 		signal: params.signal,
+		timeoutMs: params.timeoutMs,
 		fetch: params.fetch,
 	};
 	const keyResolver = params.authStorage.resolver("firecrawl", {
@@ -167,12 +187,12 @@ export async function searchFirecrawl(params: SearchParams): Promise<SearchRespo
 
 	const sources: SearchSource[] = [];
 
-	for (const result of data.data?.web ?? []) {
+	for (const result of getWebResults(data)) {
 		if (!result.url) continue;
 		sources.push({
 			title: result.title ?? result.url,
 			url: result.url,
-			snippet: result.description ?? result.markdown ?? undefined,
+			snippet: result.description ?? result.snippet ?? result.markdown ?? undefined,
 		});
 	}
 
@@ -190,18 +210,20 @@ export class FirecrawlProvider extends SearchProvider {
 	readonly label = "Firecrawl";
 
 	/**
-	 * Auto-chain admission: requires a credential so an unconfigured Firecrawl
-	 * doesn't displace other providers that the user has set up with API keys.
+	 * Auto-chain admission requires either a credential or an explicitly
+	 * configured self-hosted endpoint. Hosted keyless mode remains explicit-only
+	 * so it does not displace providers the user configured.
 	 */
 	isAvailable(authStorage: AuthStorage): boolean {
-		return authStorage.hasAuth("firecrawl") || !!getEnvApiKey("firecrawl");
+		const configuredBaseUrl = process.env.FIRECRAWL_BASE_URL ?? process.env.FIRECRAWL_API_URL;
+		return !!configuredBaseUrl?.trim() || authStorage.hasAuth("firecrawl") || !!getEnvApiKey("firecrawl");
 	}
 
 	/**
 	 * Firecrawl supports keyless mode, so an explicit user selection
 	 * (`webSearch: firecrawl`) works without any credential configured.
 	 */
-	isExplicitlyAvailable(_authStorage: AuthStorage): boolean {
+	override isExplicitlyAvailable(_authStorage: AuthStorage): boolean {
 		return true;
 	}
 

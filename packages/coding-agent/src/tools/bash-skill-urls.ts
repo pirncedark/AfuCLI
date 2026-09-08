@@ -1,19 +1,33 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { resolveContainedPathSync } from "../discovery/contained-path";
+import type { Rule } from "../capability/rule";
 import type { Skill } from "../extensibility/skills";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { validateRelativePath } from "../internal-urls/skill-protocol";
 import type { InternalResource, ResolveContext } from "../internal-urls/types";
+import type { ImageAttachmentEntry } from ".";
 import { normalizeLocalScheme } from "./path-utils";
 import { ToolError } from "./tool-errors";
 
 /** Regex to find skill:// tokens in command text. */
-const SKILL_URL_PATTERN = /'skill:\/\/[^'\s")`\\]+'|"skill:\/\/[^"\s')`\\]+"|skill:\/\/[^\s'")`\\]+/g;
+const SKILL_URL_PATTERN = /'skill:\/\/[^'\s")`\\]+'|"skill:\/\/[^"\s')`\\]+"|skill:\/\/[^\s'")`\\;&|<>($]+/g;
 
+// Unquoted URLs stop before shell syntax so expansion cannot quote an adjacent
+// operator or substitution into the resolved path.
 const INTERNAL_URL_PATTERN_INCLUDING_NORMALIZED_LOCAL =
-	/'(?:skill|agent|artifact|plan|memory|rule|local):\/\/[^'\s")`\\]+'|"(?:skill|agent|artifact|plan|memory|rule|local):\/\/[^"\s')`\\]+"|(?:skill|agent|artifact|plan|memory|rule|local):\/\/[^\s'")`\\]+|'local:\/[^'\s")`\\]+'|"local:\/[^"\s')`\\]+"|(?<![./\\\\\w-])local:\/[^\s'")`\\]+/g;
+	/'(?:skill|agent|artifact|plan|memory|rule|local|attachment):\/\/[^'\s")`\\]+'|"(?:skill|agent|artifact|plan|memory|rule|local|attachment):\/\/[^"\s')`\\]+"|(?:skill|agent|artifact|plan|memory|rule|local|attachment):\/\/[^\s'")`\\;&|<>($]+|'local:\/[^'\s")`\\]+'|"local:\/[^"\s')`\\]+"|(?<![./\\\\\w-])local:\/[^\s'")`\\;&|<>($]+/g;
 
-const SUPPORTED_INTERNAL_SCHEMES = ["skill", "agent", "artifact", "plan", "memory", "rule", "local"] as const;
+const SUPPORTED_INTERNAL_SCHEMES = [
+	"skill",
+	"agent",
+	"artifact",
+	"plan",
+	"memory",
+	"rule",
+	"local",
+	"attachment",
+] as const;
 
 type SupportedInternalScheme = (typeof SUPPORTED_INTERNAL_SCHEMES)[number];
 
@@ -24,11 +38,17 @@ interface InternalUrlResolver {
 
 export interface InternalUrlExpansionOptions {
 	skills: readonly Skill[];
+	attachments?: readonly ImageAttachmentEntry[];
 	noEscape?: boolean;
 	internalRouter?: InternalUrlResolver;
 	localOptions?: LocalProtocolOptions;
 	cwd?: string;
+	sessionFile?: string;
+	sessionId?: string;
+	agentRegistry?: ResolveContext["agentRegistry"];
 	ensureLocalParentDirs?: boolean;
+	/** Calling session's agent-scoped applicable rules — lets rule:// resolve without process-global state. */
+	rules?: readonly Rule[];
 }
 
 /**
@@ -88,6 +108,20 @@ export function resolveSkillUrlToPath(url: string, skills: readonly Skill[]): st
 	const resolvedBaseDir = path.resolve(skill.baseDir);
 	if (!resolvedPath.startsWith(resolvedBaseDir + path.sep) && resolvedPath !== resolvedBaseDir) {
 		throw new ToolError("Path traversal is not allowed in skill:// URLs");
+	}
+	// Agent Plugin skills (§4.1): the resource must canonically resolve within
+	// the plugin root. Fail closed: a dangling or unresolvable path is rejected
+	// rather than handed to bash, where writing through it could create the
+	// outside target. Symlinks may target other files inside the same package.
+	if (skill.containRoot) {
+		const contained = resolveContainedPathSync(skill.containRoot, resolvedPath);
+		if (contained.status === "outside") {
+			throw new ToolError(`skill:// path resolves outside the plugin root: ${url}`);
+		}
+		if (contained.status === "missing") {
+			throw new ToolError(`skill:// path does not exist: ${url}`);
+		}
+		return contained.realPath;
 	}
 
 	return resolvedPath;
@@ -225,10 +259,15 @@ function shellEscape(p: string): string {
 async function resolveInternalUrlToPath(
 	rawUrl: string,
 	skills: readonly Skill[],
+	attachments: readonly ImageAttachmentEntry[],
 	internalRouter?: InternalUrlResolver,
 	localOptions?: LocalProtocolOptions,
 	ensureLocalParentDirs?: boolean,
 	cwd?: string,
+	sessionFile?: string,
+	sessionId?: string,
+	agentRegistry?: ResolveContext["agentRegistry"],
+	rules?: readonly Rule[],
 ): Promise<string> {
 	const url = normalizeLocalScheme(rawUrl);
 	const scheme = extractScheme(url);
@@ -238,6 +277,14 @@ async function resolveInternalUrlToPath(
 
 	if (scheme === "skill") {
 		return resolveSkillUrlToPath(url, skills);
+	}
+
+	if (scheme === "attachment") {
+		const attachment = attachments.find(entry => entry.uri === url);
+		if (!attachment) {
+			throw new ToolError(`Unknown attachment URL in bash command: ${url}`);
+		}
+		return path.resolve(attachment.sourcePath);
 	}
 
 	if (scheme === "local") {
@@ -262,7 +309,14 @@ async function resolveInternalUrlToPath(
 
 	let resource: InternalResource;
 	try {
-		resource = await internalRouter.resolve(url, { cwd, pathOnly: true });
+		resource = await internalRouter.resolve(url, {
+			cwd,
+			pathOnly: true,
+			sessionFile,
+			sessionId,
+			agentRegistry,
+			rules,
+		});
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		throw new ToolError(`Failed to resolve ${scheme}:// URL in bash command: ${url}\n${message}`);
@@ -295,7 +349,7 @@ export function expandSkillUrls(command: string, skills: readonly Skill[]): stri
 /**
  * Expand supported internal URLs in a bash command string to shell-escaped absolute paths.
  * Unresolvable URLs and literal mentions inside larger quoted text are left unchanged.
- * Supported schemes: skill://, agent://, artifact://, memory://, rule://, local://
+ * Supported schemes: skill://, agent://, artifact://, memory://, rule://, local://, attachment://
  */
 export async function expandInternalUrls(command: string, options: InternalUrlExpansionOptions): Promise<string> {
 	if (!command.includes("://") && !command.includes("local:/")) return command;
@@ -319,10 +373,15 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 			resolvedPath = await resolveInternalUrlToPath(
 				url,
 				options.skills,
+				options.attachments ?? [],
 				options.internalRouter,
 				options.localOptions,
 				options.ensureLocalParentDirs,
 				options.cwd,
+				options.sessionFile,
+				options.sessionId,
+				options.agentRegistry,
+				options.rules,
 			);
 		} catch {
 			continue;

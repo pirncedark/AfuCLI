@@ -12,7 +12,7 @@ import type {
 	AgentToolUpdateCallback,
 } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
-import { logger } from "@oh-my-pi/pi-utils";
+import { isRecord, logger } from "@oh-my-pi/pi-utils";
 import { getDefault, type Settings } from "../config/settings";
 import { formatGroupedDiagnosticMessages } from "../lsp/utils";
 import type { Theme } from "../modes/theme/theme";
@@ -44,6 +44,12 @@ export interface TruncationMeta {
 	artifactId?: string;
 	/** Next offset for pagination (head truncation only) */
 	nextOffset?: number;
+	/**
+	 * The single shown line is a byte-capped preview of one oversized line, not
+	 * a complete line. `outputBytes`/`totalBytes` are the preview vs full line
+	 * size; renders a distinct "partial" notice instead of a line range.
+	 */
+	partialLine?: boolean;
 }
 
 /**
@@ -91,6 +97,10 @@ export interface TruncationOptions {
 	startLine?: number;
 	totalFileLines?: number;
 	artifactId?: string;
+	/** Byte budget that stopped the read, when truncation is byte-limited. */
+	maxBytes?: number;
+	/** Override the derived continuation line; `null` suppresses an unsafe continuation hint. */
+	nextOffset?: number | null;
 }
 
 export interface TruncationSummaryOptions {
@@ -125,7 +135,7 @@ export class OutputMetaBuilder {
 	truncation(result: TruncationResult, options: TruncationOptions): this {
 		if (!result.truncated) return this;
 
-		const { direction, startLine = 1, totalFileLines, artifactId } = options;
+		const { direction, startLine = 1, totalFileLines, artifactId, maxBytes } = options;
 		const outputLines = result.outputLines ?? result.totalLines;
 		const outputBytes = result.outputBytes ?? result.totalBytes;
 		const isMiddle = direction === "middle" || result.truncatedBy === "middle";
@@ -137,6 +147,24 @@ export class OutputMetaBuilder {
 
 		const effectiveTotalLines = totalFileLines ?? result.totalLines;
 
+		if (result.firstLineExceedsLimit) {
+			// The window collected no complete line; the body is a byte-capped
+			// preview of one oversized line. Describe that partial line instead of
+			// deriving an empty range that renders "Showing 0 of N lines".
+			this.#meta.truncation = {
+				direction,
+				truncatedBy: "bytes",
+				totalLines: effectiveTotalLines,
+				totalBytes: result.totalBytes,
+				outputLines,
+				outputBytes,
+				shownRange: { start: startLine, end: startLine },
+				partialLine: true,
+				artifactId,
+			};
+			return this;
+		}
+
 		if (isMiddle) {
 			const elidedLines = result.elidedLines ?? Math.max(0, effectiveTotalLines - outputLines);
 			const elidedBytes = result.elidedBytes ?? Math.max(0, result.totalBytes - outputBytes);
@@ -144,8 +172,8 @@ export class OutputMetaBuilder {
 			// `headLines` lines and the last `tailLines` lines of the source; lines
 			// in the middle (count == elidedLines) are dropped.
 			const keptLines = Math.max(0, outputLines - 1); // -1 for marker line
-			const headLines = Math.ceil(keptLines / 2);
-			const tailLines = keptLines - headLines;
+			const headLines = result.headLines ?? Math.ceil(keptLines / 2);
+			const tailLines = result.tailLines ?? keptLines - headLines;
 			this.#meta.truncation = {
 				direction: "middle",
 				truncatedBy: "middle",
@@ -153,9 +181,15 @@ export class OutputMetaBuilder {
 				totalBytes: result.totalBytes,
 				outputLines,
 				outputBytes,
-				headRange: headLines > 0 ? { start: 1, end: headLines } : undefined,
-				tailRange:
-					tailLines > 0 ? { start: effectiveTotalLines - tailLines + 1, end: effectiveTotalLines } : undefined,
+				...(effectiveTotalLines > 1 && !result.partialByteWindows
+					? {
+							headRange: headLines > 0 ? { start: 1, end: headLines } : undefined,
+							tailRange:
+								tailLines > 0
+									? { start: effectiveTotalLines - tailLines + 1, end: effectiveTotalLines }
+									: undefined,
+						}
+					: {}),
 				elidedLines,
 				elidedBytes,
 				artifactId,
@@ -181,9 +215,15 @@ export class OutputMetaBuilder {
 			totalBytes: result.totalBytes,
 			outputLines,
 			outputBytes,
+			maxBytes,
 			shownRange: { start: shownStart, end: shownEnd },
 			artifactId,
-			nextOffset: direction === "head" ? shownEnd + 1 : undefined,
+			nextOffset:
+				direction === "head"
+					? options.nextOffset === null
+						? undefined
+						: (options.nextOffset ?? shownEnd + 1)
+					: undefined,
 		};
 
 		return this;
@@ -455,9 +495,23 @@ export function formatTruncationMetaNotice(truncation: TruncationMeta): string {
 		const tailPart = tail ? `${tail.start}-${tail.end}` : "";
 		if (headPart && tailPart) {
 			notice = `Showing ${headPart} and ${tailPart} of ${totalLines}; ${elidedLines.toLocaleString()} middle line${elidedLines === 1 ? "" : "s"} (${formatBytes(elidedBytes)}) elided`;
+		} else if (elidedBytes > 0) {
+			notice = `Showing head and tail bytes of ${totalLines.toLocaleString()} line${totalLines === 1 ? "" : "s"}; ${formatBytes(elidedBytes)} elided`;
 		} else {
-			notice = `Showing ${truncation.outputLines} of ${totalLines} lines; middle elided`;
+			notice = `Showing ${Math.min(truncation.outputLines, totalLines)} of ${totalLines} lines; middle elided`;
 		}
+		if (truncation.nextOffset != null) {
+			notice += `. Use :${truncation.nextOffset} to continue`;
+		}
+		if (truncation.artifactId != null) {
+			notice += `. ${formatFullOutputReference(truncation.artifactId)}`;
+		}
+		return notice;
+	}
+
+	if (truncation.partialLine) {
+		const line = truncation.shownRange?.start ?? 1;
+		notice = `Showing line ${line} (partial, ${formatBytes(truncation.outputBytes)} of ${formatBytes(truncation.totalBytes)}) of ${truncation.totalLines}`;
 		if (truncation.artifactId != null) {
 			notice += `. ${formatFullOutputReference(truncation.artifactId)}`;
 		}
@@ -632,6 +686,26 @@ export function resolveOutputSinkHeadBytes(s: Settings | undefined): number {
 }
 
 /**
+ * Slack on top of the configured spill threshold before the final-defense
+ * inline byte cap fires. The OutputSink already bounds inline bodies to the
+ * threshold; only notice slop (wall time, exit code, elision marker,
+ * `[raw output: artifact://N]` footer) rides above it. The slack keeps the
+ * cap a genuine last resort for paths that bypass the sink (e.g. ACP
+ * client-bridge terminals) instead of re-truncating — and re-saving — every
+ * sink-elided result (the double-artifact `Artifact: N+1` vs `artifact://N`
+ * mismatch).
+ */
+const INLINE_CAP_SLACK_BYTES = 2 * 1024;
+
+/**
+ * Resolve the `enforceInlineByteCap` budget for streaming tools (bash/ssh)
+ * from session settings: the user's spill threshold plus notice slack.
+ */
+export function resolveInlineByteCapBudget(s: Settings | undefined): number {
+	return getSpillConfig(s).threshold + INLINE_CAP_SLACK_BYTES;
+}
+
+/**
  * Resolve the per-line column cap from session settings. Shared by streaming
  * executors (bash/python/ssh/eval via OutputSink) and the `read` tool's
  * line-buffer post-processing, so one setting controls both surfaces.
@@ -654,12 +728,22 @@ async function spillLargeResultToArtifact(
 ): Promise<AgentToolResult> {
 	const sessionManager = context?.sessionManager;
 	if (!sessionManager) return result;
-	if (toolName === "read") return result;
 	const { threshold, tailBytes, tailLines, headBytes } = getSpillConfig(context?.settings);
 
 	// Skip if tool already saved an artifact
 	const existingMeta: OutputMeta | undefined = result.details?.meta;
 	if (existingMeta?.truncation?.artifactId) return result;
+
+	// Reading an artifact already addresses recoverable full output. Spilling that
+	// read would only create a redundant artifact containing another artifact's
+	// page (and can repeat indefinitely on subsequent reads).
+	if (
+		toolName === "read" &&
+		existingMeta?.source?.type === "internal" &&
+		existingMeta.source.value.startsWith("artifact://")
+	) {
+		return result;
+	}
 
 	// Measure total text content
 	const textParts: string[] = [];
@@ -722,8 +806,8 @@ async function spillLargeResultToArtifact(
 		const elidedLines = truncated.elidedLines ?? Math.max(0, truncated.totalLines - outputLines);
 		const elidedBytes = truncated.elidedBytes ?? Math.max(0, truncated.totalBytes - outputBytes);
 		const keptLines = Math.max(0, outputLines - 1); // -1 for marker line
-		const headLines = Math.ceil(keptLines / 2);
-		const tailLineCount = keptLines - headLines;
+		const headLines = truncated.headLines ?? Math.ceil(keptLines / 2);
+		const tailLineCount = truncated.tailLines ?? keptLines - headLines;
 		truncationMeta = {
 			direction: "middle",
 			truncatedBy: "middle",
@@ -732,14 +816,19 @@ async function spillLargeResultToArtifact(
 			outputLines,
 			outputBytes,
 			maxBytes: headBytes + tailBytes,
-			headRange: headLines > 0 ? { start: 1, end: headLines } : undefined,
-			tailRange:
-				tailLineCount > 0
-					? { start: truncated.totalLines - tailLineCount + 1, end: truncated.totalLines }
-					: undefined,
+			...(truncated.totalLines > 1 && !truncated.partialByteWindows
+				? {
+						headRange: headLines > 0 ? { start: 1, end: headLines } : undefined,
+						tailRange:
+							tailLineCount > 0
+								? { start: truncated.totalLines - tailLineCount + 1, end: truncated.totalLines }
+								: undefined,
+					}
+				: {}),
 			elidedLines,
 			elidedBytes,
 			artifactId,
+			nextOffset: existingMeta?.truncation?.nextOffset,
 		};
 	} else {
 		const shownStart = truncated.totalLines - outputLines + 1;
@@ -753,11 +842,50 @@ async function spillLargeResultToArtifact(
 			maxBytes: tailBytes,
 			shownRange: { start: shownStart, end: truncated.totalLines },
 			artifactId,
+			nextOffset: existingMeta?.truncation?.nextOffset,
 		};
 	}
 
-	const newMeta: OutputMeta = { ...(existingMeta ?? {}), truncation: truncationMeta };
-	const newDetails = { ...(result.details ?? {}), meta: newMeta };
+	const newMeta: OutputMeta = { ...existingMeta, truncation: truncationMeta };
+	const newDetails = { ...result.details, meta: newMeta };
+
+	// Prune the raw payload only MCP results duplicate into `details.rawContent`.
+	// Identify them by the required `serverName` + `mcpToolName` markers (the same
+	// signature the MCP renderer uses) so a property-name collision on an
+	// SDK/extension tool's intentionally unconstrained details can never trigger
+	// this transformation. Everything already stored elsewhere is dropped so
+	// `rawContent` cannot re-inflate the on-disk size: text blocks and
+	// `resource.text` are captured verbatim by the artifact, and image data
+	// survives on the result content (and eval's `images`). Resource URI/MIME/blob
+	// metadata has no other home, so it is retained.
+	if (
+		typeof newDetails.serverName === "string" &&
+		typeof newDetails.mcpToolName === "string" &&
+		Array.isArray(newDetails.rawContent)
+	) {
+		const structuredContent: unknown[] = [];
+		for (const block of newDetails.rawContent) {
+			if (!isRecord(block)) {
+				structuredContent.push(block);
+				continue;
+			}
+			// Text and image payloads live in the artifact / result content.
+			if (block.type === "text" || block.type === "image") continue;
+			// Resource text is folded into the artifact; keep the rest of the resource.
+			if (block.type === "resource" && isRecord(block.resource) && "text" in block.resource) {
+				const resource = { ...block.resource };
+				delete resource.text;
+				structuredContent.push({ ...block, resource });
+				continue;
+			}
+			structuredContent.push(block);
+		}
+		if (structuredContent.length > 0) {
+			newDetails.rawContent = structuredContent;
+		} else {
+			delete newDetails.rawContent;
+		}
+	}
 
 	return { ...result, content: newContent, details: newDetails };
 }

@@ -47,6 +47,8 @@ export interface SearchParams {
 	recency?: "day" | "week" | "month" | "year";
 	systemPrompt: string;
 	signal?: AbortSignal;
+	/** Hard timeout for this provider's search transport, in milliseconds. */
+	timeoutMs?: number;
 	fetch?: FetchImpl;
 	maxOutputTokens?: number;
 	numSearchResults?: number;

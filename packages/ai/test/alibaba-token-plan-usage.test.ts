@@ -5,7 +5,10 @@ import {
 	alibabaTokenPlanRankingStrategy,
 	alibabaTokenPlanUsageProvider,
 } from "@oh-my-pi/pi-ai/usage/alibaba-token-plan";
-import { serializeAlibabaTokenPlanCredential } from "@oh-my-pi/pi-catalog/wire/alibaba-token-plan";
+import {
+	ALIBABA_TOKEN_PLAN_CN_BASE_URL,
+	serializeAlibabaTokenPlanCredential,
+} from "@oh-my-pi/pi-catalog/wire/alibaba-token-plan";
 
 function params(apiKey: string): UsageFetchParams {
 	return {
@@ -27,13 +30,17 @@ describe("QwenCloud Token Plan opt-in usage", () => {
 			}
 			return Promise.resolve(
 				Response.json({
-					code: "200",
-					successResponse: true,
 					data: {
-						per5HourPercentage: 0.25,
-						per5HourResetTime: 1_800_000_000_000,
-						per1WeekPercentage: 0.5,
-						per1WeekResetTime: 1_800_100_000_000,
+						DataV2: {
+							data: {
+								data: {
+									per5HourPercentage: 0.25,
+									per5HourResetTime: 1_800_000_000_000,
+									per1WeekPercentage: 0.5,
+									per1WeekResetTime: 1_800_100_000_000,
+								},
+							},
+						},
 					},
 				}),
 			);
@@ -48,7 +55,7 @@ describe("QwenCloud Token Plan opt-in usage", () => {
 		expect(new Headers(requests[0]?.init?.headers).get("Cookie")).toBe(cookie);
 		expect(requests[0]?.init?.redirect).toBe("manual");
 		expect(requests[1]?.url).toBe(
-			"https://home.qwencloud.com/data/api.json?product=sfm_bailian&action=IntlBroadScopeAspnGateway",
+			"https://cs-data.qwencloud.com/data/api.json?product=sfm_bailian&action=IntlBroadScopeAspnGateway&api=zeldaHttp.apikeyMgr.%2Ftokenplan%2Fpersonal%2Fapi%2Fv2%2Fusage",
 		);
 		const usageHeaders = new Headers(requests[1]?.init?.headers);
 		expect(usageHeaders.get("Cookie")).toBe(cookie);
@@ -59,8 +66,22 @@ describe("QwenCloud Token Plan opt-in usage", () => {
 		expect(usageHeaders.get("x-csrf-token")).toBe("csrf-token");
 		expect(requests[1]?.init?.redirect).toBe("manual");
 		const body = new URLSearchParams(String(requests[1]?.init?.body));
+		expect(body.get("sec_token")).toBe("sec-token");
 		expect(body.get("params")).toBe(
-			JSON.stringify({ Api: "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage", Data: {} }),
+			JSON.stringify({
+				Api: "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage",
+				Data: {
+					cornerstoneParam: {
+						domain: "home.qwencloud.com",
+						consoleSite: "QWENCLOUD",
+						console: "ONE_CONSOLE",
+						xsp_lang: "en-US",
+						protocol: "V2",
+						productCode: "p_efm",
+					},
+				},
+				V: "1.0",
+			}),
 		);
 		expect(report).toMatchObject({
 			provider: "alibaba-token-plan",
@@ -82,6 +103,84 @@ describe("QwenCloud Token Plan opt-in usage", () => {
 		const windows = alibabaTokenPlanRankingStrategy.findWindowLimits(report, { modelId: "qwen3.7-plus" });
 		expect(windows.primary?.id).toBe("credits:5h");
 		expect(windows.secondary?.id).toBe("credits:7d");
+	});
+
+	test("fetches China quota through the Beijing console gateway", async () => {
+		const requests: { url: string; init?: RequestInit }[] = [];
+		const fetchMock: FetchImpl = (input, init) => {
+			requests.push({ url: String(input), init });
+			if (requests.length === 1) {
+				return Promise.resolve(
+					new Response('<script>window.ALIYUN_CONSOLE_CONFIG = { SEC_TOKEN: "cn-sec-token" };</script>'),
+				);
+			}
+			return Promise.resolve(
+				Response.json({
+					code: "200",
+					data: {
+						DataV2: {
+							data: {
+								data: {
+									per1WeekPercentage: 0.7913113,
+									per1WeekResetTime: 1_786_716_480_000,
+								},
+							},
+						},
+					},
+					successResponse: true,
+				}),
+			);
+		};
+		const cookie = "login_aliyunid_csrf=cn-csrf; aliyun_lang=zh";
+		const credential = serializeAlibabaTokenPlanCredential("sk-sp-beijing", cookie, ALIBABA_TOKEN_PLAN_CN_BASE_URL);
+
+		const report = await alibabaTokenPlanUsageProvider.fetchUsage(params(credential), { fetch: fetchMock });
+
+		expect(requests).toHaveLength(2);
+		expect(requests[0]?.url).toBe("https://bailian.console.aliyun.com/cn-beijing?tab=plan");
+		expect(new Headers(requests[0]?.init?.headers).get("Cookie")).toBe(cookie);
+		expect(requests[1]?.url).toBe(
+			"https://bailian-cs.console.aliyun.com/data/api.json?action=BroadScopeAspnGateway&product=sfm_bailian&api=zeldaHttp.apikeyMgr.%2Ftokenplan%2Fpersonal%2Fapi%2Fv2%2Fusage",
+		);
+		const usageHeaders = new Headers(requests[1]?.init?.headers);
+		expect(usageHeaders.get("Origin")).toBe("https://bailian.console.aliyun.com");
+		expect(usageHeaders.get("Referer")).toBe("https://bailian.console.aliyun.com/cn-beijing?tab=plan");
+		const body = new URLSearchParams(String(requests[1]?.init?.body));
+		expect(body.get("action")).toBe("BroadScopeAspnGateway");
+		expect(body.get("region")).toBe("cn-beijing");
+		expect(body.get("sec_token")).toBe("cn-sec-token");
+		const gatewayParams: unknown = JSON.parse(body.get("params") ?? "null");
+		expect(gatewayParams).toMatchObject({
+			Api: "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage",
+			Data: {
+				cornerstoneParam: {
+					feTraceId: expect.any(String),
+					feURL: "https://bailian.console.aliyun.com/cn-beijing?tab=plan#/efm/subscription/token-plan/personal",
+					protocol: "V2",
+					console: "ONE_CONSOLE",
+					productCode: "p_efm",
+					switchAgent: 12608464,
+					switchUserType: 3,
+					domain: "bailian.console.aliyun.com",
+					consoleSite: "BAILIAN_ALIYUN",
+					userNickName: "",
+					userPrincipalName: "",
+					xsp_lang: "zh-CN",
+				},
+			},
+			V: "1.0",
+		});
+		expect(report).toMatchObject({
+			provider: "alibaba-token-plan",
+			limits: [
+				{
+					id: "credits:7d",
+					window: { id: "7d", durationMs: 604_800_000, resetsAt: 1_786_716_480_000 },
+					amount: { usedFraction: 0.7913113, unit: "percent" },
+				},
+			],
+		});
+		expect(report?.limits).toHaveLength(1);
 	});
 
 	test("does not claim quota support for API-key-only credentials", async () => {

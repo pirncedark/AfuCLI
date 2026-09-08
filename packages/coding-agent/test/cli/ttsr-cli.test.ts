@@ -67,7 +67,11 @@ async function run(args: TtsrCommandArgs): Promise<void> {
 	}
 }
 
-async function writeTempRule(condition: string, scope: string[], astCondition?: string): Promise<string> {
+async function writeTempRule(
+	condition: string,
+	scope: string[],
+	options: { astCondition?: string; agents?: string[] } = {},
+): Promise<string> {
 	// Stable basename "test-rule.md" so buildRuleFromMarkdown derives name
 	// "test-rule" — assertions rely on it. Each call uses a unique parent dir
 	// to avoid collisions across tests.
@@ -75,8 +79,9 @@ async function writeTempRule(condition: string, scope: string[], astCondition?: 
 	fs.mkdirSync(dir, { recursive: true });
 	const tmp = path.join(dir, "test-rule.md");
 	const fm: string[] = [`description: test rule`, `condition: "${condition.replace(/"/g, '\\"')}"`];
-	if (astCondition) fm.push(`astCondition: "${astCondition.replace(/"/g, '\\"')}"`);
+	if (options.astCondition) fm.push(`astCondition: "${options.astCondition.replace(/"/g, '\\"')}"`);
 	fm.push(`scope: [${scope.map(s => `"${s}"`).join(", ")}]`);
+	if (options.agents) fm.push(`agents: [${options.agents.map(a => `"${a}"`).join(", ")}]`);
 	await Bun.write(tmp, `---\n${fm.join("\n")}\n---\nbody\n`);
 	return tmp;
 }
@@ -168,11 +173,9 @@ describe("omp ttsr", () => {
 
 		it("astCondition matches via checkAstSnapshot with a tool + .ts path", async () => {
 			captureStreams();
-			const rulePath = await writeTempRule(
-				"never-matches-regex-zzz",
-				["tool:edit(*.ts)"],
-				"($X as { $$$BODY }).$PROP",
-			);
+			const rulePath = await writeTempRule("never-matches-regex-zzz", ["tool:edit(*.ts)"], {
+				astCondition: "($X as { $$$BODY }).$PROP",
+			});
 			const test: TtsrTestArgs = {
 				rule: rulePath,
 				source: "tool",
@@ -182,6 +185,70 @@ describe("omp ttsr", () => {
 			await run({ action: "test", test });
 			expect(stdout).toContain("Triggered");
 			expect(stdout).toContain("astCondition");
+		});
+
+		it("infers tool/edit context for a newly-allowlisted .cs file", async () => {
+			captureStreams();
+			const rulePath = await writeTempRule("class", ["tool:edit(*.cs)"]);
+			const snippetPath = await writeTempSnippet("class A {}", "cs");
+			await run({ action: "test", test: { rule: rulePath, file: snippetPath, source: undefined }, json: true });
+			const report = JSON.parse(stdout);
+			expect(report.source).toBe("tool");
+			expect(report.tool).toBe("edit");
+			expect(report.triggered).toHaveLength(1);
+			// A recognized source file needs no context-mismatch note.
+			expect(report.inferenceNote).toBeUndefined();
+		});
+
+		it("emits an inference note when a supplied file path falls through to text source", async () => {
+			captureStreams();
+			const rulePath = await writeTempRule("class", ["tool:edit(*.cs)"]);
+			const snippetPath = await writeTempSnippet("class A {}", "unknownext");
+			await run({ action: "test", test: { rule: rulePath, file: snippetPath, source: undefined }, json: true });
+			const report = JSON.parse(stdout);
+			expect(report.source).toBe("text");
+			expect(report.inferenceNote).toContain(".unknownext");
+			expect(report.inferenceNote).toContain("--source tool --tool edit");
+			// The tool-scoped rule is a false negative here — the note explains why.
+			expect(report.triggered).toHaveLength(0);
+		});
+
+		it("renders the inferred text-source note in human-readable output", async () => {
+			captureStreams();
+			const rulePath = await writeTempRule("class", ["tool:edit(*.cs)"]);
+			const snippetPath = await writeTempSnippet("class A {}", "unknownext");
+			await run({ action: "test", test: { rule: rulePath, file: snippetPath, source: undefined } });
+			expect(stdout).toContain("note: inferred --source text from '.unknownext'");
+			expect(stdout).toContain("--source tool --tool edit");
+		});
+
+		it("omits the inference note when --source is explicit", async () => {
+			captureStreams();
+			const rulePath = await writeTempRule("class", ["tool:edit(*.cs)"]);
+			const snippetPath = await writeTempSnippet("class A {}", "unknownext");
+			await run({ action: "test", test: { rule: rulePath, file: snippetPath, source: "text" }, json: true });
+			const report = JSON.parse(stdout);
+			expect(report.inferenceNote).toBeUndefined();
+		});
+
+		it("triggers for a matching --agent and rejects for a non-matching one", async () => {
+			captureStreams();
+			const rulePath = await writeTempRule(": any", ["tool:edit(*.ts)"], { agents: ["scout"] });
+			const test: TtsrTestArgs = {
+				rule: rulePath,
+				source: "tool",
+				filePath: "src/foo.ts",
+				snippet: "const x: any = 1",
+				agent: "scout",
+			};
+			await run({ action: "test", test });
+			expect(stdout).toContain("Triggered");
+			expect(stdout).toContain("agents: scout");
+
+			captureStreams();
+			await run({ action: "test", test: { ...test, agent: "main" }, json: true });
+			const report = JSON.parse(stdout);
+			expect(report.error).toMatch(/scoped to agents/);
 		});
 	});
 
@@ -428,11 +495,9 @@ describe("omp ttsr", () => {
 			setProjectDir(projectDir);
 
 			await Bun.write(path.join(projectDir, "src/foo.ts"), "const y = (x as\n{ z }).z;");
-			const rulePath = await writeTempRule(
-				"never-matches-regex-zzz",
-				["tool:edit(src/**/*.ts)"],
-				"($X as { $$$BODY }).$PROP",
-			);
+			const rulePath = await writeTempRule("never-matches-regex-zzz", ["tool:edit(src/**/*.ts)"], {
+				astCondition: "($X as { $$$BODY }).$PROP",
+			});
 			const scan: TtsrScanArgs = {
 				directory: "src",
 				rule: rulePath,

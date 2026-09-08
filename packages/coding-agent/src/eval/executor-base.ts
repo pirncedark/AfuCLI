@@ -15,6 +15,16 @@ import { registerPyToolBridge } from "./py/tool-bridge";
  */
 export type CancelledErrorClass = new (timedOut: boolean) => Error & { timedOut: boolean };
 
+/** Raised when callers reference kernel-owned state before its retained kernel exists. */
+export class EvalKernelNotRunningError extends Error {
+	constructor(language: string) {
+		super(
+			`${language} kernel is not running; tools defined with @tool / tool() live in the kernel and must be (re)defined in an eval cell first`,
+		);
+		this.name = "EvalKernelNotRunningError";
+	}
+}
+
 /** Managed-env values a kernel patch may carry (`null` clears, `undefined` skips). */
 export type KernelEnvPatch = Record<string, string | null | undefined>;
 
@@ -61,7 +71,6 @@ export interface GenericKernel<TEnv> {
 			env?: TEnv;
 			id: string;
 			signal?: AbortSignal;
-			timeoutMs?: number;
 			onChunk: (text: string) => Promise<void> | void;
 			onDisplay: (output: KernelDisplayOutput) => Promise<void> | void;
 		},
@@ -116,9 +125,13 @@ export async function waitForPromiseWithCancellation<T>(
 	promise: Promise<T>,
 	options: { signal?: AbortSignal; deadlineMs?: number },
 	cancelledErrorClass: CancelledErrorClass,
+	timedOutResolver?: (error: unknown, signal?: AbortSignal) => boolean,
 ): Promise<T> {
 	if (options.signal?.aborted) {
-		throw new cancelledErrorClass(isTimedOutCancellation(options.signal.reason, cancelledErrorClass, options.signal));
+		throw new cancelledErrorClass(
+			timedOutResolver?.(options.signal.reason, options.signal) ??
+				isTimedOutCancellation(options.signal.reason, cancelledErrorClass, options.signal),
+		);
 	}
 	const remainingMs = getRemainingTimeoutMs(options.deadlineMs);
 	if (remainingMs !== undefined && remainingMs <= 0) {
@@ -139,7 +152,8 @@ export async function waitForPromiseWithCancellation<T>(
 			finish(() =>
 				reject(
 					new cancelledErrorClass(
-						isTimedOutCancellation(options.signal?.reason, cancelledErrorClass, options.signal),
+						timedOutResolver?.(options.signal?.reason, options.signal) ??
+							isTimedOutCancellation(options.signal?.reason, cancelledErrorClass, options.signal),
 					),
 				),
 			);
@@ -158,6 +172,15 @@ export async function waitForPromiseWithCancellation<T>(
 	return await resultPromise;
 }
 
+/**
+ * Derived abort signal for the kernel, holding back an external abort while a
+ * bridge call marked `deferExternalAbort` is in flight.
+ *
+ * Scope is deliberately narrow: only `kernel.execute` consumes
+ * {@link BridgeAbortShield.signal}. Work dispatched through the tool bridge
+ * keeps the caller's real signal so a turn cancel reaches spawned subagents
+ * immediately — deferral protects the runtime, never the delegated work.
+ */
 interface BridgeAbortShield {
 	signal: AbortSignal | undefined;
 	abortRequested: boolean;
@@ -267,9 +290,32 @@ interface ManagedKernelEnvOptions {
 	bridge?: { url: string; token: string };
 	localRoots?: Record<string, string>;
 }
+interface ManagedKernelEnvPolicy {
+	sparse?: boolean;
+}
 
-export function buildManagedKernelEnvPatch(options: ManagedKernelEnvOptions): Record<string, string | null> {
+export function buildManagedKernelEnvPatch(options: ManagedKernelEnvOptions): Record<string, string | null>;
+export function buildManagedKernelEnvPatch(
+	options: ManagedKernelEnvOptions,
+	policy: { sparse: true },
+): Record<string, string | undefined>;
+export function buildManagedKernelEnvPatch(
+	options: ManagedKernelEnvOptions,
+	policy?: ManagedKernelEnvPolicy,
+): KernelEnvPatch {
 	const localRoots = options.localRoots;
+	if (policy?.sparse) {
+		const patch: Record<string, string | undefined> = {};
+		if (options.sessionFile) patch.PI_SESSION_FILE = options.sessionFile;
+		if (options.artifactsDir) patch.PI_ARTIFACTS_DIR = options.artifactsDir;
+		if (options.bridge) {
+			patch.PI_TOOL_BRIDGE_URL = options.bridge.url;
+			patch.PI_TOOL_BRIDGE_TOKEN = options.bridge.token;
+			patch.PI_TOOL_BRIDGE_SESSION = options.bridgeSessionId ?? "";
+		}
+		if (localRoots) patch.PI_EVAL_LOCAL_ROOTS = JSON.stringify(localRoots);
+		return patch;
+	}
 	return {
 		PI_SESSION_FILE: options.sessionFile ?? null,
 		PI_ARTIFACTS_DIR: options.artifactsDir ?? null,
@@ -280,13 +326,18 @@ export function buildManagedKernelEnvPatch(options: ManagedKernelEnvOptions): Re
 	};
 }
 
-export function buildManagedKernelEnv(options: ManagedKernelEnvOptions): Record<string, string> | undefined {
-	const patch = buildManagedKernelEnvPatch(options);
+export function buildManagedKernelEnv(
+	options: ManagedKernelEnvOptions,
+	policy?: ManagedKernelEnvPolicy,
+): Record<string, string> | undefined {
+	const patch = policy?.sparse
+		? buildManagedKernelEnvPatch(options, { sparse: true })
+		: buildManagedKernelEnvPatch(options);
 	const env: Record<string, string> = {};
 	let hasKeys = false;
 	for (const key of MANAGED_KERNEL_ENV_KEYS) {
 		const value = patch[key];
-		if (value !== null) {
+		if (typeof value === "string") {
 			env[key] = value;
 			hasKeys = true;
 		}
@@ -313,6 +364,45 @@ export function attachSessionOwner(
 	}
 }
 
+/** Owner registry shared by every language's live/starting session records. */
+export interface SessionOwners {
+	ownerIds: Set<string>;
+	hasFallbackOwner: boolean;
+}
+
+/**
+ * Resolve the session key an owner's eval cell runs on, forking `reset` away
+ * from shared kernels.
+ *
+ * Eval sessions are shared across agents by design (subagents inherit the
+ * parent's eval session id), so honoring `reset` on a co-owned kernel would
+ * destroy every other agent's state — including cells executing at that
+ * moment. When the requester does not exclusively own the live base session,
+ * its reset resolves to a deterministic per-owner fork key: the requester
+ * starts a fresh private kernel while co-owners keep the shared one. Once
+ * forked, the owner keeps resolving to its fork, and per-owner dispose reaps
+ * the fork since the requester is its only registered owner.
+ */
+export function resolveOwnerScopedSessionKey(options: {
+	baseKey: string;
+	ownerId: string | undefined;
+	reset: boolean;
+	/** True when a live or starting session exists under `key`. */
+	hasSession: (key: string) => boolean;
+	/** Owner registry for the session under `key`, when inspectable. */
+	getOwners: (key: string) => SessionOwners | undefined;
+}): string {
+	const { baseKey, ownerId } = options;
+	if (ownerId === undefined) return baseKey;
+	const forkKey = `${baseKey}\0fork\0${ownerId}`;
+	if (options.hasSession(forkKey)) return forkKey;
+	if (!options.reset) return baseKey;
+	const base = options.getOwners(baseKey);
+	if (!base) return baseKey;
+	const exclusive = !base.hasFallbackOwner && base.ownerIds.size === 1 && base.ownerIds.has(ownerId);
+	return exclusive ? baseKey : forkKey;
+}
+
 // ---------------------------------------------------------------------------
 // Base executor implementation
 // ---------------------------------------------------------------------------
@@ -324,25 +414,14 @@ export interface ExecuteWithKernelBaseParams<
 	kernel: GenericKernel<TEnv>;
 	code: string;
 	options: TOptions | undefined;
-	/** Prefix for the per-execution run id (e.g. `"py"`, `"rb"`, `"jl"`). */
+	/** Prefix for the per-execution run id (e.g. `"py"`). */
 	runIdPrefix: string;
 	/** Human-readable language label used in the failure log line. */
 	errorLogLabel: string;
-	/**
-	 * Julia surfaces eval-timeout control events through its normal status path,
-	 * so they must NOT be filtered out the way the JS-status backends do.
-	 */
-	isJulia?: boolean;
 	cancelledErrorClass: CancelledErrorClass;
 	buildKernelEnvPatch: (options: TOptions) => TEnv;
 	formatKernelTimeoutAnnotation: (executionTimeoutMs: number | undefined, kernelKilled: boolean) => string;
 	formatTimeoutAnnotation: (executionTimeoutMs: number | undefined) => string | undefined;
-	/**
-	 * Override how the wall-clock deadline is derived from options. Defaults to
-	 * {@link getExecutionDeadlineMs}; Julia passes the pre-computed `deadlineMs`
-	 * straight through instead of re-deriving from `timeoutMs`.
-	 */
-	resolveDeadlineMs?: (options: TOptions | undefined) => number | undefined;
 }
 
 export async function executeWithKernelBase<
@@ -355,12 +434,10 @@ export async function executeWithKernelBase<
 		options,
 		runIdPrefix,
 		errorLogLabel,
-		isJulia,
 		cancelledErrorClass,
 		buildKernelEnvPatch,
 		formatKernelTimeoutAnnotation,
 		formatTimeoutAnnotation,
-		resolveDeadlineMs,
 	} = params;
 
 	const settings = await Settings.init();
@@ -373,15 +450,31 @@ export async function executeWithKernelBase<
 	});
 
 	const displayOutputs: KernelDisplayOutput[] = [];
-	const deadlineMs = (resolveDeadlineMs ?? getExecutionDeadlineMs)(options);
-	let executionTimeoutMs: number | undefined;
-	const abortShield = createBridgeAbortShield(options?.signal);
+	const deadlineMs = getExecutionDeadlineMs(options);
+	const remainingMs = getRemainingTimeoutMs(deadlineMs);
+	const executionTimeoutMs = remainingMs !== undefined && remainingMs > 0 ? remainingMs : undefined;
+	// The wall-clock timeout must abort through the same shield the bridge
+	// watches. A kernel-internal timer SIGINTs the runner but leaves in-flight
+	// bridge calls (wait() over agent()/completion() handles or tool.*) blocked
+	// in urllib worker threads; the runner then wedges waiting for them, never
+	// emits `done`, and the SIGINT escalation kills
+	// the kernel — losing every variable. Expiring via the shield rejects those
+	// bridge calls, so the workers unwind and the cell settles as a clean
+	// KeyboardInterrupt. It also inherits critical-phase deferral: a timeout
+	// landing mid-merge waits for the resume instead of settling the cell on
+	// top of a half-applied git operation.
+	const timeoutSignal = executionTimeoutMs !== undefined ? AbortSignal.timeout(executionTimeoutMs) : undefined;
+	const abortSource =
+		options?.signal && timeoutSignal
+			? AbortSignal.any([options.signal, timeoutSignal])
+			: (timeoutSignal ?? options?.signal);
+	const abortShield = createBridgeAbortShield(abortSource);
 
 	const collectDisplay = (output: KernelDisplayOutput): void => {
 		if (output.type === "status") {
 			abortShield.handleStatus?.(output.event);
 			options?.onStatus?.(output.event);
-			if (!isJulia && isEvalTimeoutControlEvent(output.event)) return;
+			if (isEvalTimeoutControlEvent(output.event)) return;
 		}
 		displayOutputs.push(output);
 	};
@@ -389,11 +482,21 @@ export async function executeWithKernelBase<
 	const emitStatus: (event: JsStatusEvent) => void =
 		options?.emitStatus ?? (event => collectDisplay({ type: "status", event }));
 	const runId = `${runIdPrefix}-${crypto.randomUUID()}`;
+	// Two aborts cross the bridge, and conflating them is what let a cancelled
+	// turn keep working. Delegated work (above all the subagents `agent()`
+	// spawns) gets the caller's real signal so it dies with the turn — shielding
+	// it here made Python fan-outs outlive a cancel indefinitely,
+	// while JS cells, which never route through this shield, stopped fine. The
+	// shielded signal only governs how long the host waits on a call, holding
+	// the cell open across a critical phase (isolation worktree setup,
+	// merge/cherry-pick) so a cancel can't settle it on top of a half-applied
+	// git operation.
 	const unregisterBridge =
 		options?.toolSession && options?.bridgeSessionId
 			? registerPyToolBridge(options.bridgeSessionId, runId, {
 					toolSession: options.toolSession,
-					signal: abortShield.signal,
+					signal: options.signal,
+					shieldedSignal: abortShield.signal,
 					emitStatus,
 					abortRequested: () => {
 						return abortShield.abortRequested;
@@ -402,12 +505,8 @@ export async function executeWithKernelBase<
 			: null;
 
 	try {
-		const remainingMs = getRemainingTimeoutMs(deadlineMs);
-		if (remainingMs !== undefined) {
-			if (remainingMs <= 0) {
-				throw new cancelledErrorClass(true);
-			}
-			executionTimeoutMs = remainingMs;
+		if (remainingMs !== undefined && remainingMs <= 0) {
+			throw new cancelledErrorClass(true);
 		}
 
 		const result = await kernel.execute(code, {
@@ -415,7 +514,6 @@ export async function executeWithKernelBase<
 			env: buildKernelEnvPatch(options ?? ({} as TOptions)),
 			id: runId,
 			signal: abortShield.signal,
-			timeoutMs: executionTimeoutMs,
 			onChunk: text => sink.push(text),
 			onDisplay: output => collectDisplay(output),
 		});
@@ -424,7 +522,9 @@ export async function executeWithKernelBase<
 			const timedOut = result.timedOut || abortShield.timedOut;
 			const annotation = timedOut
 				? formatKernelTimeoutAnnotation(executionTimeoutMs ?? options?.idleTimeoutMs, result.kernelKilled ?? false)
-				: undefined;
+				: result.kernelKilled && !abortShield.abortRequested
+					? "Kernel died during execution; completion is uncertain. The cell was not replayed; check for partial side effects before retrying."
+					: undefined;
 			const dumped = await sink.dump(annotation);
 			return {
 				exitCode: undefined,

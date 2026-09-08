@@ -4,10 +4,10 @@
  * Handles `omp setup` for onboarding and `omp setup <component>` for optional dependencies.
  */
 import * as path from "node:path";
-import { $which, APP_NAME, getProjectDir, getPythonEnvDir } from "@oh-my-pi/pi-utils";
-import { $ } from "bun";
-import chalk from "chalk";
+import { APP_NAME, getProjectDir, getPythonEnvDir } from "@oh-my-pi/pi-utils";
+import chalk from "@oh-my-pi/pi-utils/chalk";
 import { Settings, settings } from "../config/settings";
+import { checkPythonKernelAvailability } from "../eval/py/kernel";
 import { theme } from "../modes/theme/theme";
 import { downloadSttModel, isSttModelCached } from "../stt/downloader";
 import { isSttModelKey, STT_MODEL_OPTIONS } from "../stt/models";
@@ -66,7 +66,7 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 	};
 }
 
-interface PythonCheckResult {
+export interface PythonCheckResult {
 	available: boolean;
 	pythonPath?: string;
 	usingManagedEnv?: boolean;
@@ -82,25 +82,14 @@ function managedPythonPath(): string {
 /**
  * Check Python environment and kernel dependencies.
  */
-async function checkPythonSetup(): Promise<PythonCheckResult> {
-	const result: PythonCheckResult = {
-		available: false,
+export async function checkPythonSetup(cwd: string, interpreter?: string): Promise<PythonCheckResult> {
+	const availability = await checkPythonKernelAvailability(cwd, interpreter, { forceProbe: true });
+	return {
+		available: availability.ok,
+		pythonPath: availability.pythonPath,
+		usingManagedEnv: availability.pythonPath === managedPythonPath(),
 		managedEnvPath: MANAGED_PYTHON_ENV,
 	};
-
-	const systemPythonPath = $which("python") ?? $which("python3");
-	const managedPath = managedPythonPath();
-	const hasManagedEnv = await Bun.file(managedPath).exists();
-
-	const pythonPath = systemPythonPath ?? (hasManagedEnv ? managedPath : undefined);
-	if (!pythonPath) {
-		return result;
-	}
-	const probe = await $`${pythonPath} -c "import sys;sys.exit(0)"`.quiet().nothrow();
-	result.pythonPath = pythonPath;
-	result.available = probe.exitCode === 0;
-	result.usingManagedEnv = pythonPath === managedPath;
-	return result;
 }
 
 /**
@@ -126,7 +115,10 @@ export async function runSetupCommand(cmd: SetupCommandArgs): Promise<void> {
 }
 
 async function handlePythonSetup(flags: { json?: boolean; check?: boolean }): Promise<void> {
-	const check = await checkPythonSetup();
+	const cwd = getProjectDir();
+	const projectSettings = await Settings.init({ cwd });
+	const interpreter = projectSettings.get("python.interpreter")?.trim() || undefined;
+	const check = await checkPythonSetup(cwd, interpreter);
 
 	if (flags.json) {
 		console.log(JSON.stringify(check, null, 2));
@@ -136,7 +128,7 @@ async function handlePythonSetup(flags: { json?: boolean; check?: boolean }): Pr
 
 	if (!check.pythonPath) {
 		console.error(chalk.red(`${theme.status.error} Python not found`));
-		console.error(chalk.dim("Install Python 3.8+ and ensure it's in your PATH"));
+		console.error(chalk.dim("Install Python 3.8+ or set python.interpreter to its executable path"));
 		process.exit(1);
 	}
 

@@ -6,6 +6,7 @@
  */
 import * as path from "node:path";
 import {
+	$envExact,
 	getAgentDbPath,
 	getAgentDir,
 	getAuthBrokerSnapshotCachePath,
@@ -17,7 +18,7 @@ import {
 import { YAML } from "bun";
 import { AuthStorage } from "../auth-storage";
 import * as AIError from "../error";
-import { AuthBrokerClient } from "./client";
+import { AuthBrokerClient, AuthBrokerError } from "./client";
 import { type AuthBrokerAccountPool, RemoteAuthCredentialStore } from "./remote-store";
 import { readAuthBrokerSnapshotCache, writeAuthBrokerSnapshotCache } from "./snapshot-cache";
 import { DEFAULT_SNAPSHOT_CACHE_TTL_MS, type SnapshotResponse } from "./types";
@@ -53,7 +54,7 @@ export function getAuthBrokerTokenFilePath(): string {
  */
 async function defaultResolveConfigValue(config: string): Promise<string | undefined> {
 	if (config.startsWith("!")) return undefined;
-	const envValue = process.env[config];
+	const envValue = $envExact(config);
 	return envValue || config;
 }
 
@@ -254,9 +255,9 @@ export async function discoverAuthStorage(options: DiscoverAuthStorageOptions = 
 					}
 				: undefined;
 
-		let initialSnapshot: SnapshotResponse | undefined;
+		let cachedSnapshot: SnapshotResponse | undefined;
 		if (ttlMs > 0) {
-			initialSnapshot =
+			cachedSnapshot =
 				(await readAuthBrokerSnapshotCache({
 					path: cachePath,
 					token: brokerConfig.token,
@@ -267,15 +268,25 @@ export async function discoverAuthStorage(options: DiscoverAuthStorageOptions = 
 					return null;
 				})) ?? undefined;
 		}
-		if (!initialSnapshot) {
+
+		let initialSnapshot = cachedSnapshot;
+		if (!cachedSnapshot) {
+			// No usable cache: block on the broker so a misconfigured/unreachable
+			// broker or revoked token fails startup with an actionable error
+			// (issue #8096) instead of yielding an empty credential store.
 			const initialResult = await client.fetchSnapshot();
 			if (initialResult.status !== 200)
-				throw new AIError.AuthBrokerError("Auth broker returned no initial snapshot", {
+				throw new AuthBrokerError("Auth broker returned no initial snapshot", {
 					status: initialResult.status,
 				});
 			initialSnapshot = initialResult.snapshot;
 			persist?.(initialSnapshot);
 		}
+		// Fresh cache: stale-while-revalidate. The store's constructor starts its
+		// background snapshot stream (or long-poll) immediately, which delivers
+		// the current generation within one RTT without blocking startup on a
+		// broker round trip. A token revoked since the cache was written surfaces
+		// through that background path exactly like a mid-session revocation.
 		const store = new RemoteAuthCredentialStore({
 			client,
 			initialSnapshot,

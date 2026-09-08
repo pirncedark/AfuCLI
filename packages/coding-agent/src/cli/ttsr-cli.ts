@@ -9,13 +9,23 @@
  *
  * `omp ttsr list` — show every TTSR-registered rule the current project/user
  * config would load, with its conditions, scope, and source.
+ *
+ * `--agent <name>` on `omp ttsr test` evaluates the rule's `agents` frontmatter
+ * scoping as that agent (default "main"); `omp ttsr list`/`scan` stay unfiltered.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { AstMatchStrictness, astMatch, FileType, type GlobMatch, glob } from "@oh-my-pi/pi-natives";
+import chalk from "@oh-my-pi/pi-utils/chalk";
 import { getProjectDir } from "@oh-my-pi/pi-utils/dirs";
-import chalk from "chalk";
-import { BUILTIN_DEFAULTS_PROVIDER_ID, compileRuleCondition, type Rule, ruleCapability } from "../capability/rule";
+import {
+	BUILTIN_DEFAULTS_PROVIDER_ID,
+	compileRuleCondition,
+	MAIN_AGENT_RULE_NAME,
+	ruleAppliesToAgent,
+	type Rule,
+	ruleCapability,
+} from "../capability/rule";
 import { bucketRules } from "../capability/rule-buckets";
 import { Settings } from "../config/settings";
 import type { TtsrSettings } from "../config/settings-schema";
@@ -52,6 +62,8 @@ export interface TtsrTestArgs {
 	filePath?: string;
 	/** Show every evaluated rule, not just triggered ones. */
 	verbose?: boolean;
+	/** Agent name to evaluate rule `agents` scoping as; defaults to "main". */
+	agent?: string;
 }
 
 export interface TtsrScanArgs {
@@ -83,6 +95,7 @@ interface RuleMatchDetail {
 	/** All conditions defined on the rule (for verbose display). */
 	defined: { regex: string[]; ast: string[] };
 	skippedAst?: string;
+	agents?: string[];
 }
 
 interface TestReport {
@@ -94,12 +107,19 @@ interface TestReport {
 	evaluated: number;
 	triggered: RuleMatchDetail[];
 	notTriggered: RuleMatchDetail[];
+	/**
+	 * Set when a file path was supplied but the match source was inferred as
+	 * `text` (extension absent from {@link SOURCE_FILE_EXT}), so callers can
+	 * surface why a source file was evaluated against a prose context.
+	 */
+	inferenceNote?: string;
+	agent: string;
 }
 
 const STDIN_MARKER = "-";
 /** Extensions treated as source files for default tool-context inference. */
 const SOURCE_FILE_EXT =
-	/^\.(ts|tsx|js|jsx|mjs|cjs|rs|py|go|java|kt|swift|c|cc|cpp|h|hpp|rb|php|lua|css|scss|html|json|ya?ml|toml|md|mdc)$/i;
+	/^\.(ts|tsx|js|jsx|mjs|cjs|rs|py|go|java|kt|swift|c|cc|cpp|h|hpp|rb|php|lua|css|scss|html|json|ya?ml|toml|md|mdc|cs|razor|cshtml|fs|fsx|vb|sh|bash|sql|zig|dart|scala|ex|exs|proto|tf)$/i;
 
 const BINARY_PROBE_BYTES = 8192;
 const DEFAULT_MAX_SCAN_BYTES = 5 * 1024 * 1024;
@@ -232,6 +252,7 @@ async function evaluate(
 			sourceProvider: rule._source?.provider,
 			matched: { regex, ast },
 			defined: { regex: rule.condition ?? [], ast: rule.astCondition ?? [] },
+			agents: rule.agents,
 		};
 		if (!astEligible && (rule.astCondition ?? []).length > 0) {
 			detail.skippedAst = "astCondition requires --source tool and a --path with a file extension";
@@ -263,7 +284,7 @@ function filterTtsrRulesForScan(
 	});
 }
 
-async function loadProjectTtsrRules(cwd: string): Promise<{ rules: Rule[]; manager: TtsrManager }> {
+async function loadProjectTtsrRules(cwd: string, agentName?: string): Promise<{ rules: Rule[]; manager: TtsrManager }> {
 	const settingsInstance = await Settings.init({ cwd });
 	initializeWithSettings(settingsInstance);
 	const ttsrSettings = settingsInstance.getGroup("ttsr");
@@ -272,6 +293,7 @@ async function loadProjectTtsrRules(cwd: string): Promise<{ rules: Rule[]; manag
 	bucketRules(result.items, manager, {
 		builtinRules: ttsrSettings.builtinRules,
 		disabledRules: ttsrSettings.disabledRules,
+		agentName,
 	});
 	return { rules: manager.getRules(), manager };
 }
@@ -303,8 +325,17 @@ async function readIsolatedRule(rulePath: string): Promise<Rule> {
 	});
 }
 
-async function loadIsolatedRule(rulePath: string): Promise<{ rules: Rule[]; manager: TtsrManager }> {
+async function loadIsolatedRule(
+	rulePath: string,
+	agentName: string,
+): Promise<{ ok: true; rules: Rule[]; manager: TtsrManager } | { ok: false; unavailableMsg: string }> {
 	const rule = await readIsolatedRule(rulePath);
+	if (!ruleAppliesToAgent(rule, agentName)) {
+		return {
+			ok: false,
+			unavailableMsg: `Rule "${rule.name}" is scoped to agents [${(rule.agents ?? []).join(", ")}] and does not apply to agent "${agentName}". Re-run with --agent <one of those names>.`,
+		};
+	}
 	const manager = await createTtsrManager({
 		enabled: true,
 		contextMode: "discard",
@@ -319,7 +350,7 @@ async function loadIsolatedRule(rulePath: string): Promise<{ rules: Rule[]; mana
 			`Rule "${rule.name}" has no usable TTSR condition. Add a \`condition\` (regex) or \`astCondition\` (ast-grep pattern) to its frontmatter.`,
 		);
 	}
-	return { rules: manager.getRules(), manager };
+	return { ok: true, rules: manager.getRules(), manager };
 }
 
 async function loadIsolatedScanRule(rulePath: string): Promise<Rule[]> {
@@ -342,18 +373,40 @@ async function runTest(args: TtsrTestArgs, json: boolean, cwd: string): Promise<
 		args.source ?? (filePath && SOURCE_FILE_EXT.test(path.extname(filePath)) ? "tool" : "text");
 	const tool = args.tool ?? (source === "tool" ? "edit" : undefined);
 
+	// A supplied source file whose extension is unknown falls through to the
+	// text (prose) context, where tool-scoped rules can never match. Surface
+	// that so a false negative reads as a context mismatch, not a bad regex.
+	const inferenceNote =
+		!args.source && filePath && source === "text"
+			? `inferred --source text from '${path.extname(filePath) || filePath}' (not in the source-file extension set); pass --source tool --tool edit to evaluate tool-scoped rules`
+			: undefined;
+
 	const context: TtsrMatchContext = {
 		source,
 		toolName: tool,
 		filePaths: filePath ? [filePath] : undefined,
 	};
 
-	const { rules, manager } = args.rule ? await loadIsolatedRule(args.rule) : await loadProjectTtsrRules(cwd);
+	const agent = (args.agent ?? "").trim().toLowerCase() || MAIN_AGENT_RULE_NAME;
+	const loaded = args.rule
+		? await loadIsolatedRule(args.rule, agent)
+		: { ok: true as const, ...(await loadProjectTtsrRules(cwd, agent)) };
+
+	if (!loaded.ok) {
+		if (json) {
+			process.stdout.write(`${JSON.stringify({ error: loaded.unavailableMsg })}\n`);
+		} else {
+			process.stderr.write(`${chalk.yellow(loaded.unavailableMsg)}\n`);
+		}
+		process.exit(1);
+	}
+
+	const { rules, manager } = loaded;
 
 	if (rules.length === 0) {
 		const msg = args.rule
 			? "Rule registered but produced no TTSR entry."
-			: "No TTSR rules registered for this project. Add a `condition` or `astCondition` to a rule file, then re-run.";
+			: `No TTSR rules registered for this project as agent "${agent}". Rules scoped to other agents via \`agents\` are excluded — run \`omp ttsr list\` to see every rule, or pass --agent <name>.`;
 		if (json) {
 			process.stdout.write(`${JSON.stringify({ error: msg })}\n`);
 		} else {
@@ -373,6 +426,8 @@ async function runTest(args: TtsrTestArgs, json: boolean, cwd: string): Promise<
 		evaluated: rules.length,
 		triggered,
 		notTriggered,
+		inferenceNote,
+		agent,
 	};
 
 	if (json) {
@@ -387,9 +442,12 @@ function renderTestReport(report: TestReport, verbose: boolean, isolated: boolea
 	const ctxLabel = report.source === "tool" ? `tool:${report.tool ?? "?"}` : report.source;
 	const pathLabel = report.filePath ? ` path=${report.filePath}` : "";
 	process.stdout.write(
-		`${chalk.bold("TTSR test")} — source=${chalk.cyan(ctxLabel)}${pathLabel} snippet=${chalk.dim(`${report.snippetBytes}b`)}\n`,
+		`${chalk.bold("TTSR test")} — source=${chalk.cyan(ctxLabel)}${pathLabel} agent=${chalk.cyan(report.agent)} snippet=${chalk.dim(`${report.snippetBytes}b`)}\n`,
 	);
 	process.stdout.write(`${chalk.dim(`  "${report.snippetPreview}"`)}\n\n`);
+	if (report.inferenceNote) {
+		process.stdout.write(`${chalk.yellow(`note: ${report.inferenceNote}`)}\n\n`);
+	}
 
 	if (report.triggered.length === 0) {
 		process.stdout.write(`${chalk.red("No rules triggered.")} (evaluated ${report.evaluated})\n`);
@@ -421,6 +479,9 @@ function renderRuleDetail(detail: RuleMatchDetail, hit: boolean): void {
 	if (ast.length > 0) {
 		condParts.push(`astCondition: ${ast.map(c => chalk.magenta(c)).join(", ")}`);
 	}
+	if ((detail.agents ?? []).length > 0) {
+		condParts.push(`agents: ${detail.agents!.join(", ")}`);
+	}
 	if (detail.skippedAst) {
 		condParts.push(chalk.dim(`astCondition: ${detail.skippedAst}`));
 	}
@@ -443,6 +504,7 @@ async function runList(json: boolean, cwd: string): Promise<void> {
 					astCondition: r.astCondition ?? [],
 					scope: r.scope ?? [],
 					globs: r.globs ?? [],
+					agents: r.agents ?? [],
 					description: r.description,
 				})),
 			)}\n`,
@@ -462,6 +524,7 @@ async function runList(json: boolean, cwd: string): Promise<void> {
 		if ((rule.astCondition ?? []).length > 0) condParts.push(`astCondition: ${rule.astCondition!.join(", ")}`);
 		if ((rule.scope ?? []).length > 0) condParts.push(`scope: ${rule.scope!.join(", ")}`);
 		if ((rule.globs ?? []).length > 0) condParts.push(`globs: ${rule.globs!.join(", ")}`);
+		if ((rule.agents ?? []).length > 0) condParts.push(`agents: ${rule.agents!.join(", ")}`);
 		const provider = rule._source?.provider ? chalk.dim(` [${rule._source.provider}]`) : "";
 		process.stdout.write(
 			`  ${chalk.bold(rule.name)}${provider} ${chalk.dim(condParts.join("  ") || "no conditions")}\n`,
@@ -678,6 +741,7 @@ async function scanRulePlanMatchesContent(
 		sourceProvider: plan.rule._source?.provider,
 		matched: { regex: matchedRegex, ast: matchedAst },
 		defined: { regex: plan.rule.condition ?? [], ast: plan.rule.astCondition ?? [] },
+		agents: plan.rule.agents,
 	};
 }
 

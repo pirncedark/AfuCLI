@@ -18,7 +18,7 @@ import { type MCPServer, mcpCapability } from "../capability/mcp";
 import { type Rule, ruleCapability } from "../capability/rule";
 import type { LoadContext, LoadResult } from "../capability/types";
 import {
-	buildRuleFromMarkdown,
+	discoverRuleFromMarkdown,
 	createSourceMeta,
 	expandEnvVarsDeep,
 	getProjectPath,
@@ -48,6 +48,7 @@ function parseServerConfig(
 	return {
 		server: {
 			name,
+			enabled: typeof server.enabled === "boolean" ? server.enabled : undefined,
 			command: server.command as string | undefined,
 			args: server.args as string[] | undefined,
 			env: server.env as Record<string, string> | undefined,
@@ -71,10 +72,11 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 	]);
 
 	const projectContent = projectPath ? await readFile(projectPath) : null;
-
+	// Load project entries before user entries so a project `enabled: false`
+	// claims its dedupe key before a same-named user server can survive (#7654).
 	const configs: Array<{ content: string | null; path: string | null; scope: "user" | "project" }> = [
-		{ content: userContent, path: userPath, scope: "user" },
 		{ content: projectContent, path: projectPath, scope: "project" },
+		{ content: userContent, path: userPath, scope: "user" },
 	];
 
 	for (const { content, path, scope } of configs) {
@@ -107,7 +109,10 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 		const content = await readFile(userPath);
 		if (content) {
 			const source = createSourceMeta(PROVIDER_ID, userPath, "user");
-			items.push(buildRuleFromMarkdown("global_rules.md", content, userPath, source, { ruleName: "global_rules" }));
+			const rule = discoverRuleFromMarkdown("global_rules.md", content, userPath, source, {
+				ruleName: "global_rules",
+			});
+			if (rule) items.push(rule);
 		}
 	}
 
@@ -117,7 +122,7 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 		const result = await loadFilesFromDir<Rule>(ctx, projectRulesDir, PROVIDER_ID, "project", {
 			extensions: ["md"],
 			transform: (name, content, path, source) =>
-				buildRuleFromMarkdown(name, content, path, source, { stripNamePattern: /\.md$/ }),
+				discoverRuleFromMarkdown(name, content, path, source, { stripNamePattern: /\.md$/ }),
 		});
 		items.push(...result.items);
 		if (result.warnings) warnings.push(...result.warnings);

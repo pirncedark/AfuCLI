@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
 import {
+	buildTransformedCodexRequestBody,
 	convertCodexResponsesMessages,
 	convertOpenAICodexResponsesTools,
 	normalizeCodexToolChoice,
@@ -16,12 +18,15 @@ import {
 	convertResponsesAssistantMessage,
 	processResponsesStream,
 } from "@oh-my-pi/pi-ai/providers/openai-shared";
-import type { AssistantMessage, Model, ModelSpec, Tool, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
+import type { AssistantMessage, Context, Model, ModelSpec, Tool, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
 import { sanitizeOpenAIResponsesHistoryItemsForReplay } from "@oh-my-pi/pi-ai/utils";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { type } from "arktype";
 
-function model<TApi extends "openai-responses" | "openai-codex-responses">(api: TApi, id = "gpt-5.4"): Model<TApi> {
+function model<TApi extends "openai-responses" | "openai-codex-responses">(
+	api: TApi,
+	id = "gpt-5.4",
+	supportsComputerUse?: boolean,
+): Model<TApi> {
 	return buildModel({
 		id,
 		name: id,
@@ -33,6 +38,7 @@ function model<TApi extends "openai-responses" | "openai-codex-responses">(api: 
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 400_000,
 		maxTokens: 128_000,
+		...(supportsComputerUse !== undefined ? { supportsComputerUse } : {}),
 	} as ModelSpec<TApi>);
 }
 
@@ -95,6 +101,34 @@ describe("OpenAI GA computer contract", () => {
 		expect(JSON.stringify(params)).not.toContain("display_height");
 	});
 
+	test("reconciles a queued computer choice after direct and proxy model switches", () => {
+		const direct = model("openai-responses");
+		const proxy = buildModel({
+			...direct,
+			baseUrl: "https://proxy.example.com/v1",
+			compat: direct.compatConfig,
+		} as ModelSpec<"openai-responses">);
+		const context: Context = {
+			messages: [{ role: "user", content: "inspect", timestamp: 1 }],
+			tools: [computerTool],
+		};
+
+		expect(direct.supportsComputerUse).toBe(true);
+		expect(proxy.supportsComputerUse).toBe(false);
+		const directRequest = buildParams(
+			direct,
+			context,
+			{ toolChoice: { type: "function", name: "computer" } },
+			undefined,
+		);
+		expect(directRequest.params.tools).toEqual([{ type: "computer" }]);
+		expect(directRequest.params.tool_choice).toEqual({ type: "computer" });
+
+		const proxyRequest = buildParams(proxy, context, { toolChoice: { type: "computer" } }, undefined);
+		expect(proxyRequest.params.tools).toMatchObject([{ type: "function", name: "computer" }]);
+		expect(proxyRequest.params.tool_choice).toEqual({ type: "function", name: "computer" });
+	});
+
 	test("serializes the computer tool as a named function tool for unsupported models", () => {
 		const unsupported = model("openai-responses", "gpt-5.3");
 		const tools = convertTools([computerTool], true, unsupported);
@@ -109,8 +143,11 @@ describe("OpenAI GA computer contract", () => {
 		expect(
 			mapOpenAIResponsesToolChoiceForTools({ type: "function", name: "computer" }, [computerTool], unsupported),
 		).toEqual({ type: "function", name: "computer" });
-		// The native choice stays gated off for unsupported models.
-		expect(mapOpenAIResponsesToolChoiceForTools({ type: "computer" }, [computerTool], unsupported)).toBeUndefined();
+		// A queued native choice is reconciled to the emitted function fallback.
+		expect(mapOpenAIResponsesToolChoiceForTools({ type: "computer" }, [computerTool], unsupported)).toEqual({
+			type: "function",
+			name: "computer",
+		});
 
 		const codexUnsupported = model("openai-codex-responses", "gpt-5.3");
 		expect(codexUnsupported.supportsComputerUse).not.toBe(true);
@@ -126,6 +163,103 @@ describe("OpenAI GA computer contract", () => {
 		});
 	});
 
+	test("uses the function fallback for every tested subscription model in regular and Lite requests", async () => {
+		const otherTool: Tool = { name: "read", description: "read", parameters: type({ path: "string" }) };
+		for (const id of ["gpt-5.3-codex-spark", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]) {
+			const subscription = model("openai-codex-responses", id);
+			const context: Context = {
+				messages: [{ role: "user", content: "capture the screen", timestamp: 1 }],
+				tools: [computerTool, otherTool],
+			};
+			expect(subscription.supportsComputerUse).toBe(false);
+
+			const regular = await buildTransformedCodexRequestBody(subscription, context, {
+				toolChoice: { type: "computer" },
+				responsesLite: false,
+			});
+			expect(regular.tools).toMatchObject([
+				{ type: "function", name: "computer" },
+				{ type: "function", name: "read" },
+			]);
+			expect(regular.tool_choice).toEqual({ type: "function", name: "computer" });
+
+			const lite = await buildTransformedCodexRequestBody(subscription, context, {
+				toolChoice: { type: "computer" },
+				responsesLite: true,
+			});
+			expect(lite.tools).toBeUndefined();
+			expect(lite.input?.[0]).toMatchObject({
+				type: "additional_tools",
+				tools: [{ type: "function", name: "computer" }],
+			});
+			expect(lite.tool_choice).toBe("required");
+		}
+	});
+
+	test("preserves an explicit future Codex native opt-in through regular and Lite requests", async () => {
+		const optedIn = model("openai-codex-responses", "gpt-5.6-terra", true);
+		const context: Context = {
+			messages: [{ role: "user", content: "capture", timestamp: 1 }],
+			tools: [computerTool],
+		};
+		expect(convertOpenAICodexResponsesTools([computerTool], optedIn)).toEqual([{ type: "computer" }]);
+		expect(normalizeCodexToolChoice({ type: "computer" }, [computerTool], optedIn)).toEqual({ type: "computer" });
+		expect(normalizeCodexToolChoice({ type: "function", name: "computer" }, [computerTool], optedIn)).toEqual({
+			type: "computer",
+		});
+
+		const regular = await buildTransformedCodexRequestBody(optedIn, context, {
+			toolChoice: { type: "function", name: "computer" },
+			responsesLite: false,
+		});
+		expect(regular.tools).toEqual([{ type: "computer" }]);
+		expect(regular.tool_choice).toEqual({ type: "computer" });
+
+		const lite = await buildTransformedCodexRequestBody(optedIn, context, {
+			toolChoice: { type: "function", name: "computer" },
+			responsesLite: true,
+		});
+		expect(lite.tools).toBeUndefined();
+		expect(lite.input?.[0]).toEqual({ type: "additional_tools", role: "developer", tools: [{ type: "computer" }] });
+		expect(lite.tool_choice).toBe("required");
+	});
+	test("pairs in-memory computer results for an explicit Codex native opt-in", () => {
+		const optedIn = model("openai-codex-responses", "gpt-5.6-terra", true);
+		const call = assistant([
+			{
+				type: "toolCall",
+				id: "call_native_codex|item_native_codex",
+				name: "computer",
+				arguments: {},
+				providerMetadata: {
+					type: "computer",
+					providerItemId: "item_native_codex",
+					actions: [{ type: "screenshot" }],
+					pendingSafetyChecks: [],
+				},
+			},
+		]);
+		const result: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "call_native_codex|item_native_codex",
+			toolName: "computer",
+			content: [{ type: "image", data: "cG5n", mimeType: "image/png", detail: "original" }],
+			isError: false,
+			timestamp: 2,
+			providerMetadata: {
+				type: "computer",
+				screenshot: { type: "computer_screenshot", image_url: "data:image/png;base64,cG5n" },
+				acknowledgedSafetyChecks: [],
+			},
+		};
+
+		const replay = convertCodexResponsesMessages(optedIn, { messages: [call, result] });
+		expect(replay).toContainEqual(expect.objectContaining({ type: "computer_call", call_id: "call_native_codex" }));
+		expect(replay).toContainEqual(
+			expect.objectContaining({ type: "computer_call_output", call_id: "call_native_codex" }),
+		);
+		expect(replay.some(item => item.type === "function_call_output")).toBe(false);
+	});
 	test("parses batched streamed actions, stable item id, and safety checks", async () => {
 		const output = assistant([]);
 		const emitted: unknown[] = [];
@@ -267,6 +401,126 @@ describe("OpenAI GA computer contract", () => {
 		}
 	});
 
+	test("clears reasoning candidates at every client continuation boundary", () => {
+		const boundaries: Array<[string, Record<string, unknown>]> = [
+			["input message", { role: "user", content: "next turn" }],
+			["input text", { type: "input_text", text: "next turn" }],
+			["input image", { type: "input_image", file_id: "file_input_image" }],
+			["input file", { type: "input_file", file_id: "file_input_file" }],
+			["input audio", { type: "input_audio", input_audio: { data: "base64", format: "wav" } }],
+			["function output", { type: "function_call_output", call_id: "call_function", output: "done" }],
+			["custom output", { type: "custom_tool_call_output", call_id: "call_custom", output: "done" }],
+			[
+				"computer output",
+				{
+					type: "computer_call_output",
+					call_id: "call_computer_output",
+					output: { type: "computer_screenshot", file_id: "file_computer_output" },
+				},
+			],
+			["local shell output", { type: "local_shell_call_output", id: "call_local_shell", output: "done" }],
+			["shell output", { type: "shell_call_output", call_id: "call_shell", output: [], status: "completed" }],
+			["apply patch output", { type: "apply_patch_call_output", call_id: "call_patch", status: "completed" }],
+			["MCP approval", { type: "mcp_approval_response", approval_request_id: "approval_1", approve: true }],
+			["client tool search output", { type: "tool_search_output", execution: "client", tools: [] }],
+			["additional tools", { type: "additional_tools", role: "developer", tools: [] }],
+			["compaction", { type: "compaction", encrypted_content: "compacted-context" }],
+			["legacy compaction summary", { type: "compaction_summary", summary: "compacted context" }],
+			["compaction trigger", { type: "compaction_trigger" }],
+			["item reference", { type: "item_reference", id: "item_reference_1" }],
+		];
+
+		for (const [boundary, item] of boundaries) {
+			const sanitized = sanitizeOpenAIResponsesHistoryItemsForReplay([
+				{
+					type: "reasoning",
+					id: "rs_unrelated_turn",
+					summary: [],
+					encrypted_content: "unrelated-reasoning",
+				},
+				item,
+				{
+					type: "reasoning",
+					id: "rs_computer_turn",
+					summary: [],
+					encrypted_content: "computer-reasoning",
+				},
+				{
+					type: "message",
+					id: "msg_computer_turn",
+					role: "assistant",
+					status: "completed",
+					content: [{ type: "output_text", text: "I will inspect the screen.", annotations: [] }],
+				},
+				{
+					type: "tool_search_output",
+					id: "tool_search_server_1",
+					execution: "server",
+					status: "completed",
+					tools: [],
+				},
+				{
+					type: "computer_call",
+					id: "cu_computer_turn",
+					call_id: "call_computer_turn",
+					action: { type: "screenshot" },
+					pending_safety_checks: [],
+					status: "completed",
+				},
+				{
+					type: "computer_call_output",
+					call_id: "call_computer_turn",
+					output: { type: "computer_screenshot", file_id: "file_computer_turn" },
+				},
+			]);
+			const reasoningIds = sanitized
+				.filter(replayItem => replayItem.type === "reasoning")
+				.map(replayItem => (replayItem as { id?: string }).id);
+			expect({ boundary, reasoningIds }).toEqual({
+				boundary,
+				reasoningIds: [undefined, "rs_computer_turn"],
+			});
+		}
+	});
+
+	test("strips reasoning identity when an orphan native computer call is demoted", () => {
+		const supported = model("openai-responses");
+		const previous = {
+			...assistant([]),
+			providerPayload: {
+				type: "openaiResponsesHistory" as const,
+				provider: "openai" as const,
+				dt: true,
+				items: [
+					{
+						type: "reasoning",
+						id: "rs_orphan_computer",
+						summary: [],
+						encrypted_content: "orphan-computer-reasoning",
+					},
+					{
+						type: "computer_call",
+						id: "cu_orphan_computer",
+						call_id: "call_orphan_computer",
+						actions: [{ type: "screenshot" }],
+						pending_safety_checks: [],
+						status: "completed",
+					},
+				],
+			},
+		};
+		const replay = buildResponsesInput({
+			model: supported,
+			context: { messages: [previous] },
+			strictResponsesPairing: false,
+			supportsImageDetailOriginal: true,
+			nativeHistory: { replay: true, filterReasoning: false },
+		});
+		expect(replay.some(item => item.type === "computer_call" || item.type === "computer_call_output")).toBe(false);
+		expect(JSON.stringify(replay)).toContain("interrupted before a screenshot was recorded");
+		expect(JSON.stringify(replay)).not.toContain("rs_orphan_computer");
+	});
+
 	test("turns a failed computer call without a screenshot into valid recovery history", () => {
 		const context = {
 			messages: [
@@ -307,6 +561,12 @@ describe("OpenAI GA computer contract", () => {
 
 	test("demotes native computer history when replaying to an unsupported model", () => {
 		const unsupported = model("openai-responses", "gpt-5.3");
+		const reasoning = {
+			type: "reasoning",
+			id: "rs_native_1",
+			summary: [],
+			encrypted_content: "native-computer-reasoning",
+		};
 		const call = {
 			type: "computer_call",
 			id: "item_native_1",
@@ -328,7 +588,7 @@ describe("OpenAI GA computer contract", () => {
 				type: "openaiResponsesHistory" as const,
 				provider: "openai" as const,
 				dt: true,
-				items: [call, output],
+				items: [reasoning, call, output],
 			},
 		};
 		const replay = buildResponsesInput({
@@ -341,6 +601,7 @@ describe("OpenAI GA computer contract", () => {
 		expect(replay.some(item => item.type === "computer_call" || item.type === "computer_call_output")).toBe(false);
 		expect(JSON.stringify(replay)).toContain("call_native_1");
 		expect(JSON.stringify(replay)).toContain("file_native_1");
+		expect(JSON.stringify(replay)).not.toContain("rs_native_1");
 	});
 
 	test("full native history replacement clears stale computer call pairing state", () => {
@@ -428,6 +689,12 @@ describe("OpenAI GA computer contract", () => {
 				dt: true,
 				items: [
 					{
+						type: "reasoning",
+						id: "rs_codex_computer",
+						summary: [],
+						encrypted_content: "encrypted-codex-computer-reasoning",
+					},
+					{
 						type: "computer_call",
 						id: "item_codex_computer",
 						call_id: "call_codex_computer",
@@ -445,6 +712,8 @@ describe("OpenAI GA computer contract", () => {
 			},
 		};
 		const replay = convertCodexResponsesMessages(codex, { messages: [previous] });
+		const reasoning = replay.find(item => item.type === "reasoning") as { id?: string } | undefined;
+		expect(reasoning?.id).toBeUndefined();
 		expect(replay.some(item => item.type === "computer_call" || item.type === "computer_call_output")).toBe(false);
 		const call = replay.find(item => item.type === "function_call" && item.call_id === "call_codex_computer");
 		expect(call).toMatchObject({ type: "function_call", name: "computer" });
@@ -454,6 +723,62 @@ describe("OpenAI GA computer contract", () => {
 			true,
 		);
 		expect(JSON.stringify(replay)).toContain("file_codex_computer");
+	});
+
+	test("retains Codex reasoning identity when computer demotion leaves native response IDs", () => {
+		const codex = model("openai-codex-responses");
+		const compacted = {
+			role: "user" as const,
+			content: "compacted history",
+			providerPayload: {
+				type: "openaiResponsesHistory" as const,
+				provider: "openai-codex",
+				items: [
+					{
+						type: "reasoning",
+						id: "rs_codex_mixed",
+						summary: [],
+						encrypted_content: "encrypted-codex-mixed-reasoning",
+					},
+					{
+						type: "message",
+						id: "msg_codex_mixed",
+						role: "assistant",
+						status: "completed",
+						content: [{ type: "output_text", text: "Inspecting the screen." }],
+					},
+					{
+						type: "function_call",
+						id: "fc_codex_mixed",
+						call_id: "call_codex_mixed_tool",
+						name: "inspect",
+						arguments: "{}",
+						status: "completed",
+					},
+					{
+						type: "computer_call",
+						id: "item_codex_mixed_computer",
+						call_id: "call_codex_mixed_computer",
+						actions: [{ type: "screenshot" }],
+						pending_safety_checks: [],
+						status: "completed",
+					},
+					{
+						type: "computer_call_output",
+						call_id: "call_codex_mixed_computer",
+						output: { type: "computer_screenshot", file_id: "file_codex_mixed_computer" },
+						acknowledged_safety_checks: [],
+					},
+				],
+			},
+			timestamp: Date.now(),
+		};
+
+		const replay = convertCodexResponsesMessages(codex, { messages: [compacted] });
+		expect(replay).toContainEqual(expect.objectContaining({ type: "reasoning", id: "rs_codex_mixed" }));
+		expect(replay).toContainEqual(expect.objectContaining({ type: "message", id: "msg_codex_mixed" }));
+		expect(replay).toContainEqual(expect.objectContaining({ type: "function_call", id: "fc_codex_mixed" }));
+		expect(replay.some(item => item.type === "computer_call" || item.type === "computer_call_output")).toBe(false);
 	});
 
 	test("unrolls internal computer calls and screenshot results for Codex replay", () => {
@@ -502,5 +827,71 @@ describe("OpenAI GA computer contract", () => {
 			replay.some(item => item.type === "function_call_output" && item.call_id === "call_internal_computer"),
 		).toBe(true);
 		expect(JSON.stringify(replay)).toContain("data:image/png;base64,cG5n");
+	});
+
+	test("unrolls direct API computer history after switching to a subscription model", async () => {
+		const current = model("openai-codex-responses", "gpt-5.6-terra");
+		const call = assistant([
+			{
+				type: "toolCall",
+				id: "call_direct_computer|item_direct_computer",
+				name: "computer",
+				arguments: {},
+				providerMetadata: {
+					type: "computer",
+					providerItemId: "item_direct_computer",
+					actions: [{ type: "screenshot" }],
+					pendingSafetyChecks: [],
+				},
+			},
+		]);
+		const result: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "call_direct_computer|item_direct_computer",
+			toolName: "computer",
+			content: [{ type: "image", data: "cG5n", mimeType: "image/png", detail: "original" }],
+			isError: false,
+			timestamp: 2,
+			providerMetadata: {
+				type: "computer",
+				screenshot: { type: "computer_screenshot", image_url: "data:image/png;base64,cG5n" },
+				acknowledgedSafetyChecks: [],
+			},
+		};
+
+		const replay = convertCodexResponsesMessages(current, { messages: [call, result] });
+		expect(replay.some(item => item.type === "computer_call" || item.type === "computer_call_output")).toBe(false);
+		expect(replay).toContainEqual(
+			expect.objectContaining({ type: "function_call", name: "computer", call_id: "call_direct_computer" }),
+		);
+		expect(replay).toContainEqual(
+			expect.objectContaining({ type: "function_call_output", call_id: "call_direct_computer" }),
+		);
+
+		const context: Context = {
+			messages: [call, result, { role: "user", content: "continue", timestamp: 3 }],
+			tools: [computerTool],
+		};
+		for (const responsesLite of [false, true]) {
+			const body = await buildTransformedCodexRequestBody(current, context, {
+				toolChoice: { type: "computer" },
+				responsesLite,
+			});
+			const serialized = JSON.stringify(body);
+			expect(serialized).not.toContain('"type":"computer_call"');
+			expect(serialized).not.toContain('"type":"computer_call_output"');
+			expect(serialized).toContain('"type":"function_call"');
+			expect(serialized).toContain('"type":"function_call_output"');
+			if (responsesLite) {
+				expect(body.input?.[0]).toMatchObject({
+					type: "additional_tools",
+					tools: [{ type: "function", name: "computer" }],
+				});
+				expect(body.tool_choice).toBe("required");
+			} else {
+				expect(body.tools).toMatchObject([{ type: "function", name: "computer" }]);
+				expect(body.tool_choice).toEqual({ type: "function", name: "computer" });
+			}
+		}
 	});
 });

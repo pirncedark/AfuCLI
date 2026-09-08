@@ -18,12 +18,14 @@ It reflects the current implementation, including partial semantics and metadata
 - [`packages/coding-agent/src/discovery/omp-plugins.ts`](../packages/coding-agent/src/discovery/omp-plugins.ts)
 - [`packages/coding-agent/src/discovery/builtin-defaults.ts`](../packages/coding-agent/src/discovery/builtin-defaults.ts)
 - [`packages/coding-agent/src/discovery/agents.ts`](../packages/coding-agent/src/discovery/agents.ts)
+- [`packages/coding-agent/src/discovery/github.ts`](../packages/coding-agent/src/discovery/github.ts)
 - [`packages/coding-agent/src/discovery/cursor.ts`](../packages/coding-agent/src/discovery/cursor.ts)
 - [`packages/coding-agent/src/discovery/windsurf.ts`](../packages/coding-agent/src/discovery/windsurf.ts)
 - [`packages/coding-agent/src/discovery/cline.ts`](../packages/coding-agent/src/discovery/cline.ts)
 - [`packages/coding-agent/src/sdk.ts`](../packages/coding-agent/src/sdk.ts)
 - [`packages/coding-agent/src/system-prompt.ts`](../packages/coding-agent/src/system-prompt.ts)
 - [`packages/coding-agent/src/internal-urls/rule-protocol.ts`](../packages/coding-agent/src/internal-urls/rule-protocol.ts)
+- [`packages/coding-agent/src/cli/ttsr-cli.ts`](../packages/coding-agent/src/cli/ttsr-cli.ts)
 - [`packages/utils/src/frontmatter.ts`](../packages/utils/src/frontmatter.ts)
 
 ## 1. Canonical rule shape
@@ -41,6 +43,7 @@ interface Rule {
   condition?: string[];
   astCondition?: string[];
   scope?: string[];
+  agents?: string[];
   interruptMode?: "never" | "prose-only" | "tool-only" | "always";
   _source: SourceMeta;
 }
@@ -60,24 +63,29 @@ Consequence: precedence and deduplication are **name-based only**. Two different
 - `cursor` (priority `50`)
 - `windsurf` (priority `50`)
 - `cline` (priority `40`)
+- `github` (priority `30`)
 - `builtin-defaults` (priority `1`)
 
 ### Native provider (`builtin.ts`)
 
 Loads `.omp` rules from:
 
-- project: `<cwd>/.omp/rules/*.{md,mdc}` when the cwd `.omp` directory exists
-- user: `~/.omp/agent/rules/*.{md,mdc}`
-- sticky user rule: `~/.omp/agent/RULES.md`
-- sticky project rule: nearest ancestor `.omp/RULES.md` while walking from cwd toward the repository root
+- project rules: `<cwd>/.omp/rules/*.{md,mdc}` when the cwd's `.omp/` directory is non-empty
+- user rules: `<active-native-agent-dir>/rules/*.{md,mdc}`
+- sticky user rule: `<active-native-agent-dir>/RULES.md`
+- sticky project rule: `RULES.md` from the nearest non-empty `.omp/` directory selected while walking from cwd toward the repository root; OMP does not continue farther when that directory lacks the file
+
+The active native agent directory is `~/.omp/agent` by default, follows named profiles, and honors `PI_CODING_AGENT_DIR`.
 
 Normalization:
 
 - `name` = filename without `.md`/`.mdc`
 - frontmatter parsed via `parseFrontmatter`
 - `content` = body (frontmatter stripped)
-- `globs`, `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `astCondition`, `scope`, and `interruptMode` are parsed by `buildRuleFromMarkdown`
+- `globs`, `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `astCondition`, `scope`, `agents`, and `interruptMode` are parsed by `buildRuleFromMarkdown`
 - top-level `RULES.md` is synthesized as rule name `RULES` and forced to `alwaysApply: true`
+
+Both sticky files use the fixed name `RULES`. Because native items are appended as project rules, user rules, user sticky `RULES.md`, then project sticky `RULES.md`, the first earlier item named `RULES` wins. Normally this means user sticky content shadows project sticky content; a regular `rules/RULES.md` can shadow both.
 
 Important caveat: `condition` values that look like file globs are converted into `tool:edit(...)` / `tool:write(...)` scope shorthands with catch-all condition `.*`.
 
@@ -88,7 +96,7 @@ Loads from both `.agent` and `.agents` directories:
 - project: walk upward from `cwd` to repo root, loading `<ancestor>/.agent/rules/*.{md,mdc}` and `<ancestor>/.agents/rules/*.{md,mdc}`
 - user: `~/.agent/rules/*.{md,mdc}` and `~/.agents/rules/*.{md,mdc}`
 
-Normalization uses the shared `buildRuleFromMarkdown` path: filename-derived name, stripped frontmatter body, and parsed `globs`, `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `astCondition`, `scope`, and `interruptMode`.
+Normalization uses the shared `buildRuleFromMarkdown` path: filename-derived name, stripped frontmatter body, and parsed `globs`, `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `astCondition`, `scope`, `agents`, and `interruptMode`.
 
 ### Cursor provider (`cursor.ts`)
 
@@ -102,7 +110,7 @@ Normalization (`transformMDCRule`):
 - `description`: kept only if string
 - `alwaysApply`: normalized to a boolean — `true` only when frontmatter has `alwaysApply: true` (anything else becomes `false`)
 - `globs`: accepts array (string elements only) or single string
-- `condition`/legacy `ttsr_trigger`, `astCondition`, `scope`, and `interruptMode` are parsed by shared rule helpers
+- `condition`/legacy `ttsr_trigger`, `astCondition`, `scope`, `agents`, and `interruptMode` are parsed by shared rule helpers
 - `name` from filename without extension
 
 ### Windsurf provider (`windsurf.ts`)
@@ -115,7 +123,7 @@ Loads from:
 Normalization:
 
 - `globs`: array-of-string or single string
-- `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `astCondition`, `scope`, and `interruptMode` parsed by shared rule helpers
+- `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `astCondition`, `scope`, `agents`, and `interruptMode` parsed by shared rule helpers
 - `name` is fixed to `global_rules` for the user global file and derived from filename for project rules
 
 ### Cline provider (`cline.ts`)
@@ -128,8 +136,24 @@ Searches upward from `cwd` for nearest `.clinerules`:
 Normalization:
 
 - `globs`: array-of-string or single string
-- `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `astCondition`, `scope`, and `interruptMode` parsed by shared rule helpers
+- `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `astCondition`, `scope`, `agents`, and `interruptMode` parsed by shared rule helpers
 - `name` is fixed to `clinerules` for a `.clinerules` file and derived from filename for `.clinerules/*.md`
+
+### GitHub provider (`github.ts`)
+
+Loads `*.instructions.md` recursively from:
+
+- project: `<cwd>/.github/instructions/`
+- user: `<dir>/.github/instructions/` for every directory in the comma-separated `COPILOT_CUSTOM_INSTRUCTIONS_DIRS`
+
+The filename without `.instructions.md` is the rule name. Shared Markdown parsing still recognizes normal OMP rule metadata, including TTSR fields. GitHub's `applyTo` is additionally normalized as follows:
+
+- a comma-separated string (or tolerated YAML array) becomes `globs`;
+- `*`, `**`, or `**/*` makes the rule always-apply and clears `globs`;
+- any other glob makes the rule non-always-apply; a missing `description` is generated from the globs;
+- missing `applyTo` produces a rulebook description plus a discovery warning.
+
+Because TTSR bucketing runs before always-apply/rulebook bucketing, a GitHub instruction carrying an accepted `condition` or `astCondition` is still TTSR-only regardless of `applyTo`.
 
 ## 3. Frontmatter parsing behavior and ambiguity
 
@@ -147,7 +171,7 @@ Fallback limitations:
 - Multiline arrays, nested objects, and other indentation-dependent YAML structures are not reconstructed. A valid one-line flow value (for example `[text, thinking]`) can still survive the per-value reparse.
 - An individually malformed value remains a raw string; providers requiring a boolean, list, or object may drop that metadata.
 - `ttsr_trigger` works in fallback (underscore key); hyphenated keys like `thinking-level` also parse and are normalized to camelCase (`thinkingLevel`) — key normalization applies to the YAML path too.
-- Files without valid frontmatter still load as rules with empty metadata and full content body.
+- Files without valid frontmatter still load as rules with empty metadata and full content body. The scope parser also tolerates the common malformed fallback value `scope: "text","thinking"`, though valid YAML (`"text, thinking"` or `[text, thinking]`) is preferred.
 
 ## 4. Provider precedence and deduplication
 
@@ -167,7 +191,8 @@ Effective rule provider order is currently:
 4. `cursor` (50)
 5. `windsurf` (50)
 6. `cline` (40)
-7. `builtin-defaults` (1)
+7. `github` (30)
+8. `builtin-defaults` (1)
 
 ### Intra-provider ordering caveat
 
@@ -180,7 +205,8 @@ Notable source-order differences:
 - `agents` appends project-walk `.agent`/`.agents` rule dirs before user home dirs.
 - `cursor` appends user then project results.
 - `windsurf` appends user `global_rules` first, then project rules.
-- `cline` loads only nearest `.clinerules` source.
+- `cline` loads only the nearest `.clinerules` source.
+- `github` appends cwd project instructions first, followed by each `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` entry in environment-list order.
 - `builtin-defaults` uses the embedded rule source order.
 
 ## 5. Split into Rulebook, Always-Apply, and TTSR buckets
@@ -189,9 +215,10 @@ After rule discovery in `createAgentSession` (`sdk.ts`), `bucketRules(...)` appl
 
 1. Drop rules listed in `ttsr.disabledRules`.
 2. Drop rules from the `builtin-defaults` provider when `ttsr.builtinRules === false`.
-3. Register rules with a non-empty `condition` or `astCondition` into `TtsrManager`; if registration succeeds, the rule is TTSR-only.
-4. Put remaining `alwaysApply === true` rules into `alwaysApplyRules`.
-5. Put remaining rules with `description` into `rulebookRules`.
+3. Drop rules whose `agents` globs do not match the session's agent name (`main` for a top-level session, otherwise the agent definition name); rules without `agents` apply to every agent.
+4. Register rules with a non-empty `condition` or `astCondition` into `TtsrManager`; if registration succeeds, the rule is TTSR-only.
+5. Put remaining `alwaysApply === true` rules into `alwaysApplyRules`.
+6. Put remaining rules with `description` into `rulebookRules`.
 
 ### Bucket behavior
 
@@ -225,6 +252,23 @@ After rule discovery in `createAgentSession` (`sdk.ts`), `bucketRules(...)` appl
 - **Full rule content is auto-injected into the system prompt** (before the rulebook rules section).
 - Rule is also addressable via `rule://<name>` for re-reading.
 
+### `agents`
+
+- Restricts a rule to matching agents. Accepts a YAML sequence, a single string, or a comma-separated string; patterns are lowercased glob patterns matched case-insensitively against the agent definition name (`scout`, `reviewer`, `foreman-*`). Whitespace around commas inside a `{a, b}` glob-brace group is tolerated and normalized away.
+- The literal `main` matches the top-level session; a subagent with no definition name falls back to `sub`. Both `main` and `sub` are reserved: a custom agent definition cannot use either name (`parseAgentFields` rejects it), so neither sentinel can be shadowed by a real agent.
+- Omitted (or an empty list) means the rule applies to every agent — the pre-existing behavior.
+- Filtering happens once, in `bucketRules(...)` at session creation, before TTSR registration: an unmatched rule joins no bucket, is never compiled into `TtsrManager`, and is not addressable via `rule://` in that session.
+- Subagents receive the parent's unfiltered discovered rule list and re-evaluate `agents` under their own name, so a scout-only rule loads in scouts and nowhere else.
+
+  ```yaml
+  agents: [scout, "foreman-*"]
+  ```
+
+  ```yaml
+  # Main agent only; every subagent ignores this rule:
+  agents: main
+  ```
+
 ### `condition`, `astCondition`, `scope`, and `interruptMode`
 
 - `condition` is the regex TTSR trigger field; legacy `ttsr_trigger` / `ttsrTrigger` are accepted as fallback inputs during parsing. A leading `(?i)`, `(?m)`, or `(?s)` inline flag group is translated to the equivalent JavaScript `RegExp` flags.
@@ -252,7 +296,8 @@ After rule discovery in `createAgentSession` (`sdk.ts`), `bucketRules(...)` appl
   scope: "tool:edit(*.ts), tool:write(*.ts)"
   ```
 
-  Valid tokens are `text`, `thinking`, `tool` (or `toolcall`), and `tool:<name>(<path-glob>)`. Do not write `scope: "text","thinking"`: adjacent quoted scalars are not valid YAML; put the comma inside one string or use a YAML sequence.
+  Valid tokens are `text`, `thinking`, `tool` (or `toolcall`), and `tool:<name>(<path-glob>)`. The parser tolerates the malformed fallback spelling `scope: "text","thinking"`, but portable rule files should put the comma inside one YAML string or use a YAML sequence.
+
 - A `condition` token that looks like a file glob becomes `tool:edit(<glob>)` and `tool:write(<glob>)` scope entries plus catch-all condition `.*`; `astCondition` tokens never trigger this shorthand.
 - `interruptMode` can override the global TTSR interrupt mode for the rule.
 
@@ -260,7 +305,7 @@ After rule discovery in `createAgentSession` (`sdk.ts`), `bucketRules(...)` appl
 
 `buildSystemPromptInternal` receives both `rules` (rulebook) and `alwaysApplyRules`.
 
-Always-apply rules are deduped against custom prompt sources (`dedupeAlwaysApplyRules` drops a rule whose content already appears in the SYSTEM/APPEND_SYSTEM customization) and rendered first, injecting their raw content directly into the prompt (inside a `<generic-rules>` block in the default template).
+Always-apply rules are deduped against the effective system/custom/append prompt sources and loaded context-file bodies. A rule whose normalized content already appears in one of those sources is omitted from automatic injection. Remaining raw bodies render before the rulebook listing: inside `<generic-rules>` in the default template and directly in the bundled custom-prompt template.
 
 Rulebook rules are rendered in a `<domain-rules>` block as `- <name> (<globs>): <description>` lines; the URL list in the prompt documents `rule://<name>` and the workflow section tells the model to read relevant rules first. The custom-prompt template (`custom-system-prompt.md`) instead renders `<rule name="...">` entries with `<glob>` children under an explicit "You MUST read `rule://<name>`" instruction.
 
@@ -272,7 +317,11 @@ This is advisory/contextual: prompt text asks the model to read applicable rules
 installed once per top-level session in `sdk.ts`:
 
 ```ts
-setActiveRules([...rulebookRules, ...alwaysApplyRules, ...ttsrManager.getRules()]);
+setActiveRules([
+  ...rulebookRules,
+  ...alwaysApplyRules,
+  ...ttsrManager.getRules(),
+]);
 ```
 
 Implications:
@@ -286,7 +335,7 @@ Implications:
 
 ## 9. Known partial / non-enforced semantics
 
-1. The rule providers currently loaded for `rules` are `native`, `omp-plugins`, `agents`, `cursor`, `windsurf`, `cline`, and embedded `builtin-defaults`; provider files for other tools may parse other config formats but do not register rule loaders.
+1. The rule providers currently loaded for `rules` are `native`, `omp-plugins`, `agents`, `cursor`, `windsurf`, `cline`, `github`, and embedded `builtin-defaults`; provider files for other tools may parse other config formats but do not register rule loaders.
 2. `globs` metadata is surfaced to prompt/UI and is used as a global path gate for TTSR matching, but it is not used to automatically select rulebook rules for `rule://`.
 3. Rule selection for `rule://` includes rulebook, always-apply, and registered TTSR rules (so a triggered TTSR rule can be re-read), but not rules that registered no condition and carry neither a description nor `alwaysApply`.
 4. Discovery warnings (`loadCapability("rules").warnings`) are produced but `createAgentSession` does not currently surface/log them in this path.

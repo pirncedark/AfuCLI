@@ -62,6 +62,7 @@ interface SearXNGResult {
 	title?: string;
 	url?: string;
 	content?: string;
+	snippet?: string;
 	engine?: string;
 	publishedDate?: string;
 	/** SearXNG sometimes uses publishedDate, sometimes just date */
@@ -76,6 +77,7 @@ interface SearXNGResponse {
 	suggestions?: string[];
 	corrections?: string[];
 	unresponsive_engines?: Array<[string, string]>;
+	answers?: unknown[];
 }
 
 interface SearXNGAuth {
@@ -197,11 +199,12 @@ async function fetchEngineNameMap(
 	auth: SearXNGAuth | null,
 	fetchImpl: FetchImpl | undefined,
 	signal: AbortSignal | undefined,
+	timeoutMs?: number,
 ): Promise<Map<string, string> | null> {
 	try {
 		const response = await (fetchImpl ?? fetch)(`${base}/config`, {
 			headers: buildHeaders(auth),
-			signal: withHardTimeout(signal),
+			signal: withHardTimeout(signal, timeoutMs),
 		});
 		if (!response.ok) return null;
 		const config = (await response.json()) as SearXNGConfig;
@@ -224,11 +227,12 @@ function getEngineNameMap(
 	auth: SearXNGAuth | null,
 	fetchImpl: FetchImpl | undefined,
 	signal: AbortSignal | undefined,
+	timeoutMs?: number,
 ): Promise<Map<string, string> | null> {
 	const base = endpoint.replace(/\/+$/, "");
 	let cached = engineNameMapCache.get(base);
 	if (!cached) {
-		cached = fetchEngineNameMap(base, auth, fetchImpl, signal).then(map => {
+		cached = fetchEngineNameMap(base, auth, fetchImpl, signal, timeoutMs).then(map => {
 			if (!map) engineNameMapCache.delete(base);
 			return map;
 		});
@@ -247,13 +251,14 @@ async function resolveEngineNames(
 	auth: SearXNGAuth | null,
 	fetchImpl: FetchImpl | undefined,
 	signal: AbortSignal | undefined,
+	timeoutMs?: number,
 ): Promise<string | undefined> {
 	const entries = raw
 		.split(",")
 		.map(entry => entry.trim())
 		.filter(Boolean);
 	if (!entries.length) return undefined;
-	const map = await getEngineNameMap(endpoint, auth, fetchImpl, signal);
+	const map = await getEngineNameMap(endpoint, auth, fetchImpl, signal, timeoutMs);
 	if (!map) return entries.join(",");
 	return entries.map(entry => map.get(entry.toLowerCase()) ?? entry).join(",");
 }
@@ -269,6 +274,61 @@ function stripExternalBangs(query: string): string {
 		.join(" ");
 }
 
+/** Extract displayable text from both legacy string answers and modern
+ *  structured answer plugins (legacy, translations, weather). */
+function extractAnswerText(answer: unknown): string | undefined {
+	if (typeof answer === "string") return answer.trim() || undefined;
+	if (!answer || typeof answer !== "object") return undefined;
+
+	const record = answer as Record<string, unknown>;
+	if (typeof record.answer === "string") return record.answer.trim() || undefined;
+
+	if (Array.isArray(record.translations)) {
+		const translations: string[] = [];
+		for (const item of record.translations) {
+			if (!item || typeof item !== "object") continue;
+			const text = (item as Record<string, unknown>).text;
+			if (typeof text === "string" && text.trim()) translations.push(text.trim());
+			if (translations.length === 3) break;
+		}
+		if (translations.length) return translations.join("\n");
+	}
+
+	if (record.current && typeof record.current === "object") {
+		const current = record.current as Record<string, unknown>;
+		if (typeof current.summary === "string" && current.summary.trim()) return current.summary.trim();
+		const location =
+			current.location && typeof current.location === "object"
+				? (current.location as Record<string, unknown>).name
+				: undefined;
+		const temperature =
+			current.temperature && typeof current.temperature === "object"
+				? (current.temperature as Record<string, unknown>)
+				: undefined;
+		const temperatureText =
+			temperature && (typeof temperature.val === "string" || typeof temperature.val === "number")
+				? `${temperature.val}${typeof temperature.unit === "string" ? temperature.unit : ""}`
+				: undefined;
+		const condition = typeof current.condition === "string" ? current.condition : undefined;
+		const parts = [location, temperatureText, condition].filter(
+			(part): part is string => typeof part === "string" && part.trim().length > 0,
+		);
+		if (parts.length) return parts.join(": ");
+	}
+
+	return undefined;
+}
+
+function formatAnswers(answers: unknown[] | undefined): string | undefined {
+	const texts: string[] = [];
+	for (const answer of answers ?? []) {
+		const text = extractAnswerText(answer);
+		if (text) texts.push(text);
+		if (texts.length === 3) break;
+	}
+	return texts.length ? texts.join("\n\n") : undefined;
+}
+
 /** Build the search URL and headers for a SearXNG request */
 function buildRequest(
 	endpoint: string,
@@ -279,6 +339,7 @@ function buildRequest(
 		categories?: string;
 		engines?: string;
 		language?: string;
+		safesearch?: 0 | 1 | 2;
 		signal?: AbortSignal;
 	},
 	auth: SearXNGAuth | null,
@@ -305,6 +366,10 @@ function buildRequest(
 		url.searchParams.set("engines", params.engines);
 	}
 
+	if (params.safesearch !== undefined) {
+		url.searchParams.set("safesearch", String(params.safesearch));
+	}
+
 	if (params.language) {
 		url.searchParams.set("language", params.language);
 	}
@@ -323,7 +388,9 @@ async function callSearXNGSearch(
 		categories?: string;
 		engines?: string;
 		language?: string;
+		safesearch?: 0 | 1 | 2;
 		signal?: AbortSignal;
+		timeoutMs?: number;
 		fetch?: FetchImpl;
 	},
 	auth: SearXNGAuth | null,
@@ -332,7 +399,7 @@ async function callSearXNGSearch(
 
 	const response = await (params.fetch ?? fetch)(url, {
 		headers,
-		signal: withHardTimeout(params.signal),
+		signal: withHardTimeout(params.signal, params.timeoutMs),
 	});
 
 	if (!response.ok) {
@@ -352,6 +419,7 @@ export async function searchSearXNG(params: {
 	num_results?: number;
 	recency?: "day" | "week" | "month" | "year";
 	signal?: AbortSignal;
+	timeoutMs?: number;
 	fetch?: FetchImpl;
 }): Promise<SearchResponse> {
 	const numResults = clampNumResults(params.num_results, DEFAULT_NUM_RESULTS, MAX_NUM_RESULTS);
@@ -367,12 +435,23 @@ export async function searchSearXNG(params: {
 
 	let categories: string | undefined;
 	let language: string | undefined;
+	let configuredSafesearch: number | undefined;
 	try {
 		categories = settings.get("searxng.categories") ?? undefined;
 		language = settings.get("searxng.language") ?? undefined;
+		configuredSafesearch = settings.get("searxng.safesearch");
 	} catch {
 		// Settings not initialized yet
 	}
+	if (
+		configuredSafesearch !== undefined &&
+		configuredSafesearch !== 0 &&
+		configuredSafesearch !== 1 &&
+		configuredSafesearch !== 2
+	) {
+		throw new Error("searxng.safesearch must be 0 (off), 1 (moderate), or 2 (strict).");
+	}
+	const safesearch = configuredSafesearch;
 	const configuredEngines = findEngines();
 
 	// SearXNG forwards `q` to downstream engines, so build it with the shared
@@ -386,7 +465,7 @@ export async function searchSearXNG(params: {
 	if (parsed.lang) language = parsed.lang;
 
 	const engines = configuredEngines
-		? await resolveEngineNames(configuredEngines, endpoint, auth, params.fetch, params.signal)
+		? await resolveEngineNames(configuredEngines, endpoint, auth, params.fetch, params.signal, params.timeoutMs)
 		: undefined;
 
 	const response = await callSearXNGSearch(
@@ -397,6 +476,7 @@ export async function searchSearXNG(params: {
 			categories,
 			engines,
 			language,
+			safesearch,
 			fetch: params.fetch,
 		},
 		auth,
@@ -410,7 +490,7 @@ export async function searchSearXNG(params: {
 		sources.push({
 			title: result.title ?? result.url,
 			url: result.url,
-			snippet: result.content?.trim() || undefined,
+			snippet: (result.content ?? result.snippet)?.trim() || undefined,
 			publishedDate: publishedDate ?? undefined,
 			ageSeconds: dateToAgeSeconds(publishedDate),
 		});
@@ -430,6 +510,7 @@ export async function searchSearXNG(params: {
 
 	return {
 		provider: "searxng",
+		answer: formatAnswers(response.answers),
 		sources: limitedSources,
 		relatedQuestions: response.suggestions?.length ? response.suggestions : undefined,
 	};
@@ -455,6 +536,7 @@ export class SearXNGProvider extends SearchProvider {
 			num_results: params.numSearchResults ?? params.limit,
 			recency: params.recency,
 			signal: params.signal,
+			timeoutMs: params.timeoutMs,
 			fetch: params.fetch,
 		});
 	}

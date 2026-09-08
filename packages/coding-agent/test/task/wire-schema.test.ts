@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { TaskTool, taskSchema } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import { getTaskSchema, oneLineLabel } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { type } from "arktype";
 
 // Contract: the task tool's wire shape is flat `{ name?, agent?, task, isolated? }`
 // (batch: `{ context, tasks[] }` of the same items). `agent` defaults to the
@@ -112,7 +112,7 @@ describe("task approval details surface the dispatch", () => {
 		return TaskTool.create({
 			cwd: "/tmp",
 			hasUI: false,
-			settings: Settings.isolated({ "task.isolation.mode": "none", "task.batch": true }),
+			settings: Settings.isolated({ "task.isolation.enabled": false, "task.batch": true }),
 			getSessionFile: () => null,
 			getSessionSpawns: () => spawns,
 		} as unknown as ToolSession);

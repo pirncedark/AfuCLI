@@ -1,10 +1,10 @@
+import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { ToolExample } from "@oh-my-pi/pi-ai";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
-import { isRecord, prompt } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
-import chalk from "chalk";
+import { isRecord, prompt, sanitizeText } from "@oh-my-pi/pi-utils";
+import chalk from "@oh-my-pi/pi-utils/chalk";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import todoDescription from "../prompts/tools/todo.md" with { type: "text" };
@@ -12,7 +12,7 @@ import type { ToolSession } from "../sdk";
 import type { SessionEntry } from "../session/session-entries";
 import { framedBlock, renderStatusLine, renderTreeList } from "../tui";
 import { normalizePathLikeInput, resolveToCwd } from "./path-utils";
-import { formatErrorDetail, formatMoreItems, PREVIEW_LIMITS, pluralize } from "./render-utils";
+import { formatErrorDetail, formatMoreItems, PREVIEW_LIMITS, pluralize, replaceTabs } from "./render-utils";
 
 // =============================================================================
 // Types
@@ -83,7 +83,7 @@ const todoSchema = type({
 	// No `atLeastLength(1)` here: `items` is only meaningful for `init`/`append`,
 	// and both enforce non-empty with op-specific errors. A stray `items: []` on
 	// an op that ignores it (e.g. `view`) must not be a hard schema rejection.
-	"items?": type("string").describe("task content").array().describe("tasks to append"),
+	"items?": type("string").describe("task content").array().describe("tasks for single-phase init or append"),
 	"reason?": type("string").describe("blocker note (block op)"),
 }).describe("apply a single todo operation");
 
@@ -236,6 +236,13 @@ export function todoMatchesAnyDescription(content: string, descriptions: readonl
 	return false;
 }
 
+/** Whether a todo is settled: completed or deliberately abandoned. Shared so
+ *  the collapsed viewport, the HUD progress counters, and the HUD's closed-todo
+ *  auto-clear can never disagree about what "done" hides. */
+export function isClosedTodo<T extends { status: TodoStatus }>(task: T): boolean {
+	return task.status === "completed" || task.status === "abandoned";
+}
+
 /**
  * A todo the collapsed viewport treats as current work: the literal
  * `in_progress` task or a pending task a live subagent is executing. Both
@@ -254,36 +261,33 @@ export interface CollapsedTodoSelection<T> {
 }
 
 /**
- * Walking-viewport selection for a phase's collapsed todo preview (#5873).
+ * Closed rows kept directly above the open window so finishing a task is
+ * visible as it happens. Without this the collapsed viewport only ever renders
+ * unchecked boxes while a phase has open work: every completion silently
+ * removes a row, so a plan mid-flight looks untouched, and the card's
+ * completion strike animation (`completedTasks` → {@link TODO_STRIKE_TOTAL_FRAMES})
+ * animated a row that was never rendered.
+ */
+const COLLAPSED_CLOSED_CONTEXT = 1;
+
+/**
+ * Rows to show for a display base already reduced to the relevant tasks.
  *
- * Policy, applied to `tasks` in todo order:
- * 1. While the phase has open work, completed/abandoned tasks are omitted. A
- *    phase with no open tasks left falls back to its closed tasks so the sticky
- *    HUD's closed-todo persistence still has something to render.
- * 2. Every active task (in-progress, or pending matched to a live subagent) is
+ * 1. Every active task (in-progress, or pending matched to a live subagent) is
  *    placed at the head in stable todo order — never dropped for lying outside
  *    an ordinary window.
- * 3. Remaining rows up to `cap` are filled with the pending tasks that follow
+ * 2. Remaining rows up to `cap` are filled with the pending tasks that follow
  *    the first active one, in todo order (falling back to leading pending tasks
  *    when no active task exists), so a freshly-promoted task leads the preview.
- * 4. When active tasks alone exceed `cap`, only the first `cap` active tasks are
+ * 3. When active tasks alone exceed `cap`, only the first `cap` active tasks are
  *    shown and the summary counts the hidden *active* todos, never replacing
  *    them with unrelated pending rows.
- *
- * The summary otherwise counts the remaining tasks in the display base. Returns
- * the whole base with an empty summary when it already fits.
  */
-export function selectCollapsedTodos<T extends { status: TodoStatus }>(
-	tasks: T[],
+function selectWithinCap<T extends { status: TodoStatus }>(
+	base: T[],
 	isMatched: (task: T) => boolean,
 	cap: number,
 ): CollapsedTodoSelection<T> {
-	const open = tasks.filter(
-		task => task.status === "pending" || task.status === "in_progress" || task.status === "blocked",
-	);
-	// No open work: fall back to the closed tasks so a settled phase still
-	// renders (HUD closed-todo persistence). Closed tasks are never active.
-	const base = open.length > 0 ? open : tasks;
 	if (base.length <= cap) return { items: base, summary: "" };
 
 	const active = base.filter(task => isActiveTodo(task, isMatched));
@@ -310,6 +314,33 @@ export function selectCollapsedTodos<T extends { status: TodoStatus }>(
 	const items = [...active, ...fill];
 	const hidden = base.length - items.length;
 	return { items, summary: hidden > 0 ? formatMoreItems(hidden, "todo") : "" };
+}
+
+/**
+ * Walking-viewport selection for a phase's collapsed todo preview (#5873).
+ *
+ * Applied to `tasks` in todo order: the open tasks run through
+ * {@link selectWithinCap}, led by the last {@link COLLAPSED_CLOSED_CONTEXT}
+ * closed tasks in todo order so a checked row remains visible even when callers
+ * complete work out of sequence. The lead is additive — it never costs an open
+ * row — and a phase with no open work left falls back to its closed tasks so the
+ * sticky HUD's closed-todo persistence still has something to render.
+ *
+ * `summary` counts the open tasks that did not fit; the closed lead is context,
+ * not part of the budget.
+ */
+export function selectCollapsedTodos<T extends { status: TodoStatus }>(
+	tasks: T[],
+	isMatched: (task: T) => boolean,
+	cap: number,
+): CollapsedTodoSelection<T> {
+	const open = tasks.filter(task => !isClosedTodo(task));
+	// Closed tasks are never active, so a settled phase selects over itself.
+	if (open.length === 0) return selectWithinCap(tasks, isMatched, cap);
+	// `done` accepts any named task, so closed tasks are not necessarily a prefix.
+	const lead = tasks.filter(isClosedTodo).slice(-COLLAPSED_CLOSED_CONTEXT);
+	const selected = selectWithinCap(open, isMatched, cap);
+	return { items: [...lead, ...selected.items], summary: selected.summary };
 }
 
 function resolveTaskOrError(
@@ -652,7 +683,10 @@ export function markdownToPhases(md: string): { phases: TodoPhase[]; errors: str
 			continue;
 		}
 
-		const taskMatch = /^[-*+]\s*\[(.?)\]\s+(.+?)\s*$/.exec(trimmed);
+		// Tolerate backslash-escaped brackets (`- \[x\]`): some editors and
+		// markdown serializers escape `[` (and `]`) when round-tripping, yet the
+		// line still renders as a normal `[x]` checkbox. Accept either form.
+		const taskMatch = /^[-*+]\s*\\?\[(.?)\\?\]\s+(.+?)\s*$/.exec(trimmed);
 		if (taskMatch) {
 			if (!currentPhase) {
 				currentPhase = { name: "Todos", tasks: [] };
@@ -929,9 +963,27 @@ export function phaseRomanNumeral(oneBasedIndex: number): string {
 	return out;
 }
 
-/** Display-only phase header: `I. Foundation`. State and prompts never see this. */
+/**
+ * Every render boundary in this file funnels display text through here.
+ *
+ * `sanitizeText` strips ANSI/C0 sequences but deliberately preserves tabs, and
+ * a raw tab punches holes in bordered TUI output, so both are needed. The raw
+ * value stays untouched everywhere else: task content and phase names are the
+ * identity keys the local list is looked up by, and what gets persisted.
+ */
+function forDisplay(text: string): string {
+	return replaceTabs(sanitizeText(text));
+}
+
+/**
+ * Display-only phase header: `I. Foundation`. State and prompts never see this.
+ *
+ * Sanitized for the same reason task labels are: this is a render boundary and
+ * the name may carry provider or session text holding control sequences. The
+ * raw `phase.name` stays the lookup key everywhere else.
+ */
 export function formatPhaseDisplayName(name: string, oneBasedIndex: number): string {
-	return `${phaseRomanNumeral(oneBasedIndex)}. ${name}`;
+	return `${phaseRomanNumeral(oneBasedIndex)}. ${forDisplay(name)}`;
 }
 
 export const TODO_STRIKE_HOLD_FRAMES = 2;
@@ -970,27 +1022,31 @@ function formatTodoLine(
 	matched = false,
 ): string {
 	const checkbox = uiTheme.checkbox;
+	// Sanitize only for display. A mirrored Cursor snapshot carries provider text
+	// verbatim, and a label holding ANSI/C0 sequences would otherwise rewrite the
+	// terminal every time the list renders or replays. `item.content` stays raw
+	// everywhere else: it is the identity key the local list is looked up by
+	// (`findTaskByContent`) and what gets persisted.
+	const label = forDisplay(item.content);
 	switch (item.status) {
 		case "completed": {
-			const revealCount = completionKeys.has(item.content) ? strikeRevealCount(item.content, frame) : undefined;
+			const revealCount = completionKeys.has(item.content) ? strikeRevealCount(label, frame) : undefined;
 			const content =
-				revealCount === undefined
-					? strikethroughText(item.content)
-					: partialStrikethrough(item.content, revealCount);
+				revealCount === undefined ? strikethroughText(label) : partialStrikethrough(label, revealCount);
 			return uiTheme.fg("success", `${prefix}${checkbox.checked} ${content}`);
 		}
 		case "in_progress":
-			return uiTheme.fg("accent", `${prefix}${checkbox.unchecked} ${item.content}`);
+			return uiTheme.fg("accent", `${prefix}${checkbox.unchecked} ${label}`);
 		case "abandoned":
-			return uiTheme.fg("error", `${prefix}${checkbox.unchecked} ${strikethroughText(item.content)}`);
+			return uiTheme.fg("error", `${prefix}${checkbox.unchecked} ${strikethroughText(label)}`);
 		case "blocked": {
-			const note = item.blocker ? `blocked: ${item.blocker}` : "blocked";
-			return uiTheme.fg("warning", `${prefix}${checkbox.unchecked} ${item.content} (${note})`);
+			const note = item.blocker ? `blocked: ${forDisplay(item.blocker)}` : "blocked";
+			return uiTheme.fg("warning", `${prefix}${checkbox.unchecked} ${label} (${note})`);
 		}
 		default:
 			// A pending todo lit by a live subagent match renders accent, matching
 			// the sticky HUD's convention (#5873).
-			return uiTheme.fg(matched ? "accent" : "dim", `${prefix}${checkbox.unchecked} ${item.content}`);
+			return uiTheme.fg(matched ? "accent" : "dim", `${prefix}${checkbox.unchecked} ${label}`);
 	}
 }
 
@@ -1033,12 +1089,20 @@ function computeTouchedPhases(
 	return touched.size > 0 ? touched : null;
 }
 
+/**
+ * Dim `closed/total` suffix for a phase header. Counts closed tasks, not just
+ * completed ones: the collapsed viewport hides both, so an abandoned task has to
+ * move the counter or its phase reads as permanently stuck.
+ */
+function formatPhaseProgress(phase: TodoPhase, uiTheme: Theme): string {
+	const done = phase.tasks.filter(isClosedTodo).length;
+	return uiTheme.fg("dim", `  ${done}/${phase.tasks.length}`);
+}
+
 /** One-line summary for a collapsed (untouched) phase: dim header + progress. */
 function formatPhaseSummary(phase: TodoPhase, oneBasedIndex: number, uiTheme: Theme): string {
-	const total = phase.tasks.length;
-	const done = phase.tasks.filter(task => task.status === "completed").length;
 	const name = uiTheme.fg("dim", chalk.bold(formatPhaseDisplayName(phase.name, oneBasedIndex)));
-	return `${name}${uiTheme.fg("dim", `  ${done}/${total}`)}`;
+	return `${name}${formatPhaseProgress(phase, uiTheme)}`;
 }
 
 /**
@@ -1065,13 +1129,15 @@ export const todoToolRenderer = {
 		// both the new single-op and legacy batch shapes so a malformed delta
 		// never breaks the TUI render loop (#2005).
 		const opsList = normalizeTodoArg(args);
+		// Model-authored, partially-streamed strings going straight into a header:
+		// `renderStatusLine` only flattens CR/LF and leaves the rest to the caller.
 		const ops =
 			opsList.length === 0
 				? ["update"]
 				: opsList.map(e => {
-						const parts = [e.op ?? "update"];
-						if (e.task) parts.push(e.task);
-						if (e.phase) parts.push(e.phase);
+						const parts = [forDisplay(e.op ?? "update")];
+						if (e.task) parts.push(forDisplay(e.task));
+						if (e.phase) parts.push(forDisplay(e.phase));
 						if (Array.isArray(e.items) && e.items.length) {
 							parts.push(`${e.items.length} item${e.items.length === 1 ? "" : "s"}`);
 						}
@@ -1125,7 +1191,10 @@ export const todoToolRenderer = {
 			uiTheme,
 		);
 		if (allTasks.length === 0) {
-			const fallback = result.content?.find(content => content.type === "text")?.text ?? "No todos";
+			// Provider text on the Cursor path (the todo summary or a refusal note),
+			// so sanitize like every other label. The error branch above already
+			// goes through `formatErrorDetail`.
+			const fallback = forDisplay(result.content?.find(content => content.type === "text")?.text ?? "No todos");
 			return new Text(`${header}\n  ${uiTheme.fg("dim", fallback)}`, 0, 0);
 		}
 
@@ -1151,12 +1220,17 @@ export const todoToolRenderer = {
 					continue;
 				}
 				if (multiPhase) {
-					bodyLines.push(uiTheme.fg("accent", chalk.bold(formatPhaseDisplayName(phase.name, p + 1))));
+					// Progress belongs on the expanded header too: the collapsed
+					// viewport below hides closed rows, so without it the phase the
+					// agent is actually working in is the one phase with no visible
+					// completion signal at all.
+					const name = uiTheme.fg("accent", chalk.bold(formatPhaseDisplayName(phase.name, p + 1)));
+					bodyLines.push(`${name}${formatPhaseProgress(phase, uiTheme)}`);
 				}
 				const completionKeys = completionKeysByPhase.get(phase.name) ?? EMPTY_COMPLETION_KEYS;
-				// Collapsed: walking viewport — completed/abandoned omitted, active
-				// work (in-progress / subagent-matched) pulled to the head, then
-				// following pending tasks (#5873). Expanded: every task in order.
+				// Collapsed: walking viewport — the last closed task leads, then
+				// active work (in-progress / subagent-matched), then following
+				// pending tasks (#5873). Expanded: every task in order.
 				const treeLines = expanded
 					? renderTreeList(
 							{
