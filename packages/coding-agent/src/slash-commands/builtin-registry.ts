@@ -1,4 +1,5 @@
 import type { AutocompleteItem } from "@oh-my-pi/pi-tui";
+import { t } from "@oh-my-pi/pi-utils/i18n";
 import { COLLAB_GUEST_ALLOWED_COMMANDS } from "../collab/guest";
 import { BUILTIN_COLLABORATION_SLASH_COMMANDS } from "./builtin-collaboration";
 import {
@@ -54,15 +55,25 @@ for (const command of BUILTIN_SLASH_COMMAND_REGISTRY) {
 
 export const BUILTIN_SLASH_COMMAND_RESERVED_NAMES: ReadonlySet<string> = new Set(BUILTIN_SLASH_COMMAND_LOOKUP.keys());
 
+/**
+ * afu-cli forku: alt komut açıklamalarını etkin dile çevirir. Adlar ve
+ * kullanım şablonları (`usage`) dokunulmadan kalır — kullanıcı onları yazar.
+ */
+function localizeSubcommands(subcommands: SlashCommandSpec["subcommands"]): SlashCommandSpec["subcommands"] {
+	if (!subcommands) return subcommands;
+	return subcommands.map(sub => (sub.description ? { ...sub, description: t(sub.description) } : sub));
+}
+
 /** Builtin command metadata used for slash-command autocomplete and help text. */
 export const BUILTIN_SLASH_COMMAND_DEFS: ReadonlyArray<BuiltinSlashCommand> = BUILTIN_SLASH_COMMAND_REGISTRY.map(
 	command => ({
 		name: command.name,
 		aliases: command.aliases,
 		allowArgs: command.allowArgs === true,
-		description: command.description,
+		// afu-cli forku: adlar İngilizce kalır, yalnızca açıklamalar çevrilir.
+		description: t(command.description),
 		icon: command.icon,
-		subcommands: command.subcommands,
+		subcommands: localizeSubcommands(command.subcommands),
 		inlineHint: command.inlineHint,
 		getTuiAutocompleteDescription: command.getTuiAutocompleteDescription,
 	}),
@@ -72,7 +83,13 @@ function materializeTuiBuiltinSlashCommand(
 	cmd: BuiltinSlashCommand,
 	runtime?: TuiSlashCommandRuntime,
 ): TuiBuiltinSlashCommand {
-	const materialized: TuiBuiltinSlashCommand = { ...cmd };
+	const materialized: TuiBuiltinSlashCommand = {
+		...cmd,
+		// Dil `/lang` ile değiştiğinde bu yol yeniden çalışır; `t` zaten
+		// çevrilmiş metni değiştirmediği için iki kez uygulanması zararsız.
+		description: t(cmd.description),
+		subcommands: localizeSubcommands(cmd.subcommands),
+	};
 	if (cmd.subcommands) {
 		materialized.getArgumentCompletions =
 			cmd.name === "mcp" && runtime

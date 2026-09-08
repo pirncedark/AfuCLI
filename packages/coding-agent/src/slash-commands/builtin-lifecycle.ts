@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { CompactionCancelledError } from "@oh-my-pi/pi-agent-core/compaction";
 import { APP_NAME, logger, setProjectDir } from "@oh-my-pi/pi-utils";
+import { getUiLanguage, missingTranslations, setUiLanguage, translationCount } from "@oh-my-pi/pi-utils/i18n";
 import { reset as resetCapabilities } from "../capability";
 import { applyProviderGlobalsFromSettings } from "../config/provider-globals";
 import { clearClaudePluginRootsCache } from "../discovery/helpers";
@@ -803,6 +804,29 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		},
 	},
 	{
+		name: "lang",
+		description: "Switch the language of interface descriptions (Turkish / English)",
+		inlineHint: "[tr|en|status|missing]",
+		allowArgs: true,
+		subcommands: [
+			{ name: "tr", description: "Show descriptions in Turkish" },
+			{ name: "en", description: "Show descriptions in English (upstream wording)" },
+			{ name: "status", description: "Show the active language and translation count" },
+			{ name: "missing", description: "List descriptions that have no translation yet" },
+		],
+		handle: async (command, runtime) => {
+			await runtime.output(await applyLanguageCommand(command.args));
+			await runtime.refreshCommands();
+			return commandConsumed();
+		},
+		handleTui: async (command, runtime) => {
+			runtime.ctx.editor.setText("");
+			const message = await applyLanguageCommand(command.args);
+			runtime.ctx.showStatus(message);
+			await runtime.ctx.refreshSlashCommandState();
+		},
+	},
+	{
 		name: "update",
 		description: `Check for and install ${APP_NAME} updates`,
 		inlineHint: "[--force] [--check]",
@@ -838,6 +862,63 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		},
 	},
 ];
+/**
+ * afu-cli forku: `/lang` işleyicisi. Argümansız çağrı Türkçe ile İngilizce
+ * arasında geçiş yapar; `status` etkin dili, `missing` ise sözlükte karşılığı
+ * olmayan (yani upstream'de yeni eklenmiş ya da değişmiş) açıklamaları gösterir.
+ */
+async function applyLanguageCommand(args: string): Promise<string> {
+	const arg = args.trim().toLowerCase();
+	if (arg === "status") {
+		return getUiLanguage() === "tr"
+			? `Arayüz dili: Türkçe — sözlükte ${translationCount()} çeviri var.`
+			: `Interface language: English — ${translationCount()} translations available.`;
+	}
+	if (arg === "missing") {
+		const missing = missingTranslations(await collectDescriptionSources());
+		if (missing.length === 0) return "Taranan açıklamaların tümünün çevirisi var.";
+		return `Çevirisi olmayan ${missing.length} açıklama:\n- ${missing.join("\n- ")}`;
+	}
+	if (arg !== "" && arg !== "tr" && arg !== "en") {
+		return "Kullanım: /lang [tr|en|status|missing]";
+	}
+	const next = arg === "tr" || arg === "en" ? arg : getUiLanguage() === "tr" ? "en" : "tr";
+	setUiLanguage(next);
+	return next === "tr"
+		? "Açıklamalar artık Türkçe. (Komut ve bayrak adları İngilizce kalır.)"
+		: "Descriptions are now in English.";
+}
+
+/**
+ * `/lang missing` için taranan İngilizce açıklamalar: slash komutları (ve alt
+ * komutları), `afu --help` bayrak/argüman açıklamaları ve alt komut tanımları.
+ * Dinamik `import` kullanılır — bu modül kayıt defterinin kendisi tarafından
+ * içe aktarıldığı için üst seviyede döngüsel bağımlılık olurdu.
+ */
+async function collectDescriptionSources(): Promise<string[]> {
+	const sources: string[] = [];
+	const { BUILTIN_SLASH_COMMANDS_INTERNAL } = await import("./builtin-registry");
+	for (const spec of BUILTIN_SLASH_COMMANDS_INTERNAL) {
+		if (spec.description) sources.push(spec.description);
+		for (const sub of spec.subcommands ?? []) if (sub.description) sources.push(sub.description);
+	}
+	const commandHelp = await import("../cli/command-help");
+	for (const help of Object.values(commandHelp)) {
+		if (help && typeof help === "object" && "description" in help && typeof help.description === "string") {
+			sources.push(help.description);
+		}
+	}
+	const { launchHelp } = await import("../commands/launch-help");
+	if (launchHelp.description) sources.push(launchHelp.description);
+	for (const def of Object.values(launchHelp.args ?? {})) {
+		if (def.description) sources.push(def.description);
+	}
+	for (const def of Object.values(launchHelp.flags ?? {})) {
+		if (def.description) sources.push(def.description);
+	}
+	return [...new Set(sources)];
+}
+
 async function rescopeHeadlessToCwd(runtime: SlashCommandRuntime, cwd: string): Promise<void> {
 	setProjectDir(cwd);
 	await runtime.settings.reloadForCwd(cwd);

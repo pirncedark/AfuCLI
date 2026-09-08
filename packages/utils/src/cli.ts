@@ -11,6 +11,7 @@
  */
 import * as fs from "node:fs";
 import { parseArgs as nodeParseArgs } from "node:util";
+import { t } from "./i18n";
 
 /**
  * Streaming startup marker, enabled by `PI_DEBUG_STARTUP`. Local copy of
@@ -313,7 +314,7 @@ export function renderRootHelp(config: CliConfig<CommandMetadata>): void {
 		lines.push("COMMANDS");
 		const maxLen = Math.max(...visible.map(([n]) => n.length));
 		for (const [name, command] of visible.sort((a, b) => a[0].localeCompare(b[0]))) {
-			lines.push(`  ${name.padEnd(maxLen + 2)}${command.description ?? ""}`);
+			lines.push(`  ${name.padEnd(maxLen + 2)}${t(command.description) ?? ""}`);
 		}
 		lines.push("");
 	}
@@ -346,7 +347,7 @@ export function commandUsageLine(bin: string, id: string, Cmd: CommandCtor): str
 /** Render help for a single command. */
 export function renderCommandHelp(bin: string, id: string, Cmd: CommandCtor): void {
 	const lines: string[] = [];
-	if (Cmd.description) lines.push(`${Cmd.description}\n`);
+	if (Cmd.description) lines.push(`${t(Cmd.description)}\n`);
 	lines.push("USAGE");
 	lines.push(`  ${commandUsageLine(bin, id, Cmd)}\n`);
 	renderCommandBody(lines, Cmd);
@@ -364,7 +365,7 @@ function renderCommandBody(lines: string[], command: CommandMetadata): void {
 		const maxLen = Math.max(...argEntries.map(([n]) => n.length));
 		for (const [name, desc] of argEntries) {
 			const parts = [name.toUpperCase().padEnd(maxLen + 2)];
-			if (desc.description) parts.push(desc.description);
+			if (desc.description) parts.push(t(desc.description));
 			if (desc.options) parts.push(`(${[...desc.options].join("|")})`);
 			lines.push(`  ${parts.join(" ")}`);
 		}
@@ -380,7 +381,7 @@ function renderCommandBody(lines: string[], command: CommandMetadata): void {
 			const charPart = desc.char ? `-${desc.char}, ` : "    ";
 			const namePart = `--${name}`;
 			const typePart = desc.kind === "boolean" ? "" : desc.kind === "integer" ? "=<int>" : "=<value>";
-			formatted.push([`  ${charPart}${namePart}${typePart}`, desc.description ?? ""]);
+			formatted.push([`  ${charPart}${namePart}${typePart}`, t(desc.description) ?? ""]);
 		}
 		const maxLeft = Math.max(...formatted.map(([l]) => l.length));
 		for (const [left, right] of formatted) {
