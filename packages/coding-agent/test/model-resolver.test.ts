@@ -1127,6 +1127,40 @@ describe("resolveAgentModelPatterns", () => {
 		expect(resolveAgentModelPatterns({ agentModel: "@slow", settings })).toEqual(["local/llama"]);
 	});
 
+	test("uses configured smol for unconfigured tiny before priority defaults", () => {
+		const settings = Settings.isolated({
+			modelRoles: {
+				default: "local/default",
+				smol: "baseten/custom-smol:max",
+			},
+		});
+
+		expect(resolveAgentModelPatterns({ agentModel: "@tiny", settings })).toEqual(["baseten/custom-smol:max"]);
+	});
+
+	test("breaks the tiny/smol fallback cycle via a default alias", () => {
+		const settings = Settings.isolated({ modelRoles: { default: "@tiny" } });
+		const baseline = resolveAgentModelPatterns({ agentModel: "@smol", settings: Settings.isolated() });
+
+		const tiny = resolveAgentModelPatterns({ agentModel: "@tiny", settings });
+		const smol = resolveAgentModelPatterns({ agentModel: "@smol", settings });
+
+		expect(baseline.length).toBeGreaterThan(0);
+		expect(tiny).not.toContain("@tiny");
+		expect(smol).not.toContain("@tiny");
+		expect(tiny).toEqual(baseline);
+		expect(smol).toEqual(tiny);
+	});
+
+	test("preserves thinking suffix when breaking the smol fallback cycle", () => {
+		const settings = Settings.isolated({ modelRoles: { smol: "@tiny:high" } });
+		const baseline = resolveAgentModelPatterns({ agentModel: "@smol", settings: Settings.isolated() });
+
+		const tiny = resolveAgentModelPatterns({ agentModel: "@tiny", settings });
+
+		expect(tiny).toEqual(baseline.map(pattern => `${pattern}:high`));
+	});
+
 	test("expands cross-role default aliases when inheriting for an unset role", () => {
 		const settings = Settings.isolated({
 			modelRoles: { default: "@slow", slow: "anthropic/claude-sonnet-4-5" },
@@ -2036,6 +2070,13 @@ describe("provider routing selector (@upstream)", () => {
 		expect(openRouterOnly(result.model)).toEqual(["cerebras"]);
 	});
 
+	test("pins a tiered upstream slug with a path segment", () => {
+		const result = parseModelPattern("openrouter/z-ai/glm-4.7@google-ai-studio/priority:high", allModels);
+		expect(result.model?.id).toBe("z-ai/glm-4.7");
+		expect(result.thinkingLevel).toBe(Effort.High);
+		expect(openRouterOnly(result.model)).toEqual(["google-ai-studio/priority"]);
+	});
+
 	test("combines @slug with a trailing thinking level", () => {
 		const result = parseModelPattern("openrouter/z-ai/glm-4.7@cerebras:high", allModels);
 		expect(result.model?.id).toBe("z-ai/glm-4.7");
@@ -2127,6 +2168,36 @@ describe("provider routing selector (@upstream)", () => {
 		expect(result.model?.id).toBe("z-ai/glm-4.7");
 		expect(result.selector).toBe("openrouter/z-ai/glm-4.7@cerebras");
 		expect(openRouterOnly(result.model)).toEqual(["cerebras"]);
+	});
+
+	test("resolveCliModel routes an aggregator id the first-party provider also bundles", () => {
+		// `google/gemini-2.5-pro` is provider-locked to the bundled `google` provider when
+		// matched as a raw id; the explicit `openrouter/` prefix must unlock it so the
+		// tiered upstream selector reaches OpenRouter's copy.
+		const mirrored = buildModel({
+			id: "google/gemini-2.5-pro",
+			name: "Gemini 2.5 Pro",
+			api: "openai-completions",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 1 },
+			contextWindow: 128000,
+			maxTokens: 8192,
+		});
+		const models = [...allModels, mirrored];
+		const registry = { getAll: () => models, getAvailable: () => models } as unknown as Parameters<
+			typeof resolveCliModel
+		>[0]["modelRegistry"];
+		const result = resolveCliModel({
+			cliModel: "openrouter/google/gemini-2.5-pro@google-ai-studio/priority",
+			modelRegistry: registry,
+		});
+		expect(result.error).toBeUndefined();
+		expect(result.model?.provider).toBe("openrouter");
+		expect(result.selector).toBe("openrouter/google/gemini-2.5-pro@google-ai-studio/priority");
+		expect(openRouterOnly(result.model)).toEqual(["google-ai-studio/priority"]);
 	});
 });
 

@@ -373,13 +373,15 @@ function resolveBedrockInferenceProfileReference(
 	return resolveBedrockInferenceProfileModelId(modelId, availableModels);
 }
 
-const UPSTREAM_ROUTING_SLUG = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i;
+/** Bare slug (`cerebras`) or tiered/regional slug (`google-ai-studio/priority`, `google-vertex/global/flex`). */
+const UPSTREAM_ROUTING_SLUG = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\/[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$/i;
 
 /**
  * Split a trailing `@<upstream>` provider-routing selector off a model pattern.
  *
  * `openrouter/z-ai/glm-4.7@cerebras` -> base `openrouter/z-ai/glm-4.7`, upstream
- * `cerebras`. A `:thinking` suffix after the slug is kept on the base
+ * `cerebras`. Tiered upstreams keep their path (`...@google-ai-studio/priority`).
+ * A `:thinking` suffix after the slug is kept on the base
  * (`...@cerebras:high` -> base `...:high`). Returns undefined when there is no
  * `@` or the suffix is not a bare provider slug, so model ids that legitimately
  * contain `@` (`claude-opus-4-8@default`, `workers-ai/@cf/...`) are never split.
@@ -1151,6 +1153,10 @@ const ROLE_PRIORITY_ALIAS: Partial<Record<ModelRole, keyof typeof MODEL_PRIO>> =
 	tiny: "smol",
 };
 
+const ROLE_CONFIGURED_FALLBACK: Partial<Record<ModelRole, ModelRole>> = {
+	tiny: "smol",
+};
+
 /** Built-in priority patterns for a role, following {@link ROLE_PRIORITY_ALIAS}. */
 function rolePriorityDefaults(role: ModelRole): string[] {
 	const key = ROLE_PRIORITY_ALIAS[role] ?? (role as keyof typeof MODEL_PRIO);
@@ -1174,8 +1180,10 @@ function resolveDefaultInheritedPatterns(
 			MAX_THINKING_SUFFIX_OPTIONS,
 		);
 		const aliasRole = getModelRoleAlias(aliasCandidate, settings);
-		if (aliasRole === role) {
-			// Self-alias (e.g. modelRoles.default = "@smol") would loop back to the
+		if (aliasRole && visited.has(aliasRole)) {
+			// Cycle (self-alias like modelRoles.default = "@smol", or tiny → smol
+			// → default = "@tiny") would loop back to a visited role: fall back
+			// to the built-in chain instead of leaking the unresolved alias.
 			resolved.push(
 				...(thinkingLevel
 					? roleDefaults.map(defaultPattern => `${defaultPattern}:${thinkingLevel}`)
@@ -1183,7 +1191,7 @@ function resolveDefaultInheritedPatterns(
 			);
 			continue;
 		}
-		if (aliasRole && !visited.has(aliasRole)) {
+		if (aliasRole) {
 			// Cross-role alias (e.g. modelRoles.default = "@slow"): resolve the
 			// concrete model patterns instead of another role alias.
 			const recursed = resolveConfiguredRolePattern(pattern, settings, new Set(visited));
@@ -1218,11 +1226,32 @@ function resolveConfiguredRolePattern(
 	const configured = settings?.getModelRole(role)?.trim();
 	const configuredDefault = settings?.getModelRole(DEFAULT_MODEL_ROLE)?.trim();
 	const roleDefaults = isModelRole(role) ? rolePriorityDefaults(role) : [];
+	const configuredFallback = isModelRole(role) ? ROLE_CONFIGURED_FALLBACK[role] : undefined;
+	const fallbackPatterns =
+		configured || !configuredFallback
+			? undefined
+			: (
+					resolveConfiguredRolePattern(formatModelRoleAlias(configuredFallback), settings, new Set(visited)) ?? []
+				).flatMap(pattern => {
+					const { base, level } = splitThinkingSuffix(
+						pattern,
+						modelRoleAliasPrefixLength(pattern) ?? LEGACY_MODEL_ROLE_ALIAS_PREFIX.length,
+						MAX_THINKING_SUFFIX_OPTIONS,
+					);
+					const patternRole = getModelRoleAlias(base, settings);
+					if (!patternRole || !visited.has(patternRole)) return [pattern];
+					// Cyclic fallback alias (e.g. smol = "@tiny:high" while resolving
+					// @tiny): expand to the built-in chain, preserving the requested
+					// thinking level instead of dropping the suffix.
+					return level ? roleDefaults.map(defaultPattern => `${defaultPattern}:${level}`) : [];
+				});
 	const resolved = configured
 		? normalizeModelPatternList(configured)
-		: isModelRole(role)
-			? resolveDefaultInheritedPatterns(role, configuredDefault, roleDefaults, settings, visited)
-			: roleDefaults;
+		: fallbackPatterns
+			? fallbackPatterns
+			: isModelRole(role)
+				? resolveDefaultInheritedPatterns(role, configuredDefault, roleDefaults, settings, visited)
+				: roleDefaults;
 	if (resolved.length === 0) {
 		resolved.push(...roleDefaults);
 	}
@@ -2080,7 +2109,10 @@ export function resolveCliModel(options: {
 	}
 
 	const candidates = provider ? allModels.filter(model => model.provider === provider) : availableModels;
-	let parsed = parseModelPattern(pattern, candidates, preferences, {
+	// Keep the explicit provider on the pattern: the raw-id phase provider-locks
+	// `google/gemini-x` to the bundled `google` provider unless the selector
+	// names the aggregator carrying it (`openrouter/google/gemini-x@upstream`).
+	let parsed = parseModelPattern(provider ? `${provider}/${pattern}` : pattern, candidates, preferences, {
 		allowInvalidThinkingSelectorFallback: false,
 	});
 	if (!parsed.model && !provider) {

@@ -523,8 +523,8 @@ describe("model thinking derivation", () => {
 		expect(mapEffortToGoogleThinkingLevel(Effort.Minimal)).toBe("MINIMAL");
 	});
 
-	it("drops minimal from Gemini 3.7 Flash only on the direct google-level transports (#10543)", () => {
-		// Google's thinkingLevel table marks `minimal` unsupported for 3.7 Flash
+	it("drops minimal from Gemini 3.7+ Flash only on the direct google-level transports (#10543)", () => {
+		// Google's thinkingLevel table marks `minimal` unsupported for 3.7+ Flash
 		// (400 THINKING_LEVEL_MINIMAL). Only the direct google-level transports emit
 		// `thinkingLevel` on the wire, so the tier is dropped there; budget and
 		// reasoning-effort resellers never send the rejected value and keep it. These
@@ -537,7 +537,15 @@ describe("model thinking derivation", () => {
 		expect(getSupportedEfforts(vertexFlash37)).toEqual([Effort.Low, Effort.Medium, Effort.High]);
 		expect(() => requireSupportedEffort(vertexFlash37, Effort.Minimal)).toThrow(/not supported/);
 
-		// Every other Flash revision on the same transport keeps the four-tier scale.
+		// The drop is open-ended: 3.8 Flash rejects MINIMAL the same way.
+		const googleFlash38 = createModel({
+			id: "gemini-3.8-flash",
+			api: "google-generative-ai",
+			provider: "google",
+		});
+		expect(getSupportedEfforts(googleFlash38)).toEqual([Effort.Low, Effort.Medium, Effort.High]);
+
+		// Earlier Flash revisions on the same transport keep the four-tier scale.
 		const vertexFlash36 = createModel({
 			id: "gemini-3.6-flash",
 			api: "google-vertex",
@@ -793,6 +801,35 @@ describe("model thinking derivation", () => {
 
 		expect(sonnet5.compat.supportsMidConversationSystem).toBe(false);
 		expect(opus48.compat.supportsMidConversationSystem).toBe(true);
+	});
+
+	it("bakes server-side compaction support for the adaptive-thinking lineage only, on any host", () => {
+		const supported = [
+			"claude-opus-4-6",
+			"claude-opus-4-8",
+			"claude-sonnet-4-6",
+			"claude-sonnet-5",
+			"claude-fable-5",
+			"claude-mythos-5",
+		];
+		const unsupported = ["claude-haiku-4-5", "claude-sonnet-4-5", "claude-opus-4-5", "claude-opus-4-1"];
+		for (const id of supported) {
+			expect(
+				createModel({ id, api: "anthropic-messages", provider: "anthropic" }).compat.supportsServerCompaction,
+			).toBe(true);
+		}
+		for (const id of unsupported) {
+			expect(
+				createModel({ id, api: "anthropic-messages", provider: "anthropic" }).compat.supportsServerCompaction,
+			).toBe(false);
+		}
+		// A lineage truth, not a deployment contract: the same model line carries
+		// it on a gateway; whether the gateway delivers the beta is decided at
+		// request time from the effective endpoint.
+		expect(
+			createModel({ id: "claude-sonnet-4-6", api: "anthropic-messages", provider: "opencode-zen" }).compat
+				.supportsServerCompaction,
+		).toBe(true);
 	});
 
 	it("classifies OpenAI-schema Bedrock models as effort, leaving gpt-oss on budget", () => {
