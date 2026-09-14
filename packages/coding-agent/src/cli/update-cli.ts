@@ -2005,13 +2005,30 @@ async function updateViaSource(wrapperPath: string): Promise<void> {
 	}
 	console.log(chalk.dim(`Source checkout detected at ${repoDir}; updating...`));
 	try {
-		const remotes = (await $`git remote`.cwd(repoDir).quiet()).stdout.toString();
-		const hasUpstream = remotes.split(/\r?\n/).includes("upstream");
+		const remotes = (await $`git remote`.cwd(repoDir).quiet()).stdout.toString().split(/\r?\n/);
+		const hasUpstream = remotes.includes("upstream");
+		// Fork dali upstream'den ayrisik oldugu icin pull'a birlestirme yontemi acikca verilir;
+		// aksi halde git "divergent branches" deyip durur.
 		const pullResult = hasUpstream
-			? await $`git pull --no-edit upstream main`.cwd(repoDir).nothrow().quiet()
-			: await $`git pull --no-edit`.cwd(repoDir).nothrow().quiet();
+			? await $`git pull --no-rebase --no-edit --autostash upstream main`.cwd(repoDir).nothrow().quiet()
+			: await $`git pull --no-rebase --no-edit --autostash`.cwd(repoDir).nothrow().quiet();
 		if (pullResult.exitCode !== 0) {
+			const merging = await $`git rev-parse -q --verify MERGE_HEAD`.cwd(repoDir).nothrow().quiet();
+			if (merging.exitCode === 0) {
+				await $`git merge --abort`.cwd(repoDir).nothrow().quiet();
+				throw new Error(
+					`merge conflict while pulling upstream; merge aborted, resolve manually:\n${pullResult.stdout?.toString() || ""}`,
+				);
+			}
 			throw new Error(`git pull failed: ${pullResult.stderr?.toString() || ""}`);
+		}
+		// Birlestirilmis fork dalini GitHub'daki fork'a da gonder (best-effort).
+		if (hasUpstream && remotes.includes("origin")) {
+			console.log(chalk.dim("Pushing merged branch to origin..."));
+			const pushResult = await $`git push origin HEAD`.cwd(repoDir).nothrow().quiet();
+			if (pushResult.exitCode !== 0) {
+				console.log(chalk.yellow(`git push failed (update continues): ${pushResult.stderr?.toString() || ""}`));
+			}
 		}
 		console.log(chalk.dim("Installing dependencies..."));
 		const installResult = await $`bun install`.cwd(repoDir).nothrow().quiet();
