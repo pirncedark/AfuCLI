@@ -19,7 +19,7 @@
 PowerShell'e yapıştır:
 
 ```powershell
-irm https://raw.githubusercontent.com/pirncedark/oh-my-pi/afu-cli/scripts/afu-kur.ps1 | iex
+irm https://raw.githubusercontent.com/pirncedark/afu-cli/afu-cli/scripts/afu-kur.ps1 | iex
 ```
 
 Sonra yeni bir terminal aç, `afu` yaz, içeride `/login` ile **kendi** hesabınla giriş yap.

@@ -2,7 +2,7 @@
 #  AFU CLI kurulum (Windows x64) - Turkce aciklamali surum
 # ------------------------------------------------------------
 #  Kullanim (PowerShell):
-#    irm https://raw.githubusercontent.com/pirncedark/oh-my-pi/afu-cli/scripts/afu-kur.ps1 | iex
+#    irm https://raw.githubusercontent.com/pirncedark/afu-cli/afu-cli/scripts/afu-kur.ps1 | iex
 #
 #  Yaptiklari:
 #    1) Git ve Bun yoksa kurar
@@ -14,11 +14,11 @@
 # ============================================================
 $ErrorActionPreference = "Stop"
 
-$Repo       = "https://github.com/pirncedark/oh-my-pi.git"
+$Repo       = "https://github.com/pirncedark/afu-cli.git"
 $Branch     = "afu-cli"
 $NativeTag  = "afu-natives-18.1.14"
 $NativeName = "pi_natives.win32-x64-baseline.node"
-$NativeUrl  = "https://github.com/pirncedark/oh-my-pi/releases/download/$NativeTag/$NativeName"
+$NativeUrl  = "https://github.com/pirncedark/afu-cli/releases/download/$NativeTag/$NativeName"
 $Dir        = Join-Path $env:USERPROFILE "afu-cli"
 $BinDir     = Join-Path $env:LOCALAPPDATA "afu"
 

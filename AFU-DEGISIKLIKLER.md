@@ -71,7 +71,7 @@ Dosyalar: `cli/update-cli.ts`, `slash-commands/builtin-lifecycle.ts`, `slash-com
 `scripts/afu-kur.ps1`:
 
 ```powershell
-irm https://raw.githubusercontent.com/pirncedark/oh-my-pi/afu-cli/scripts/afu-kur.ps1 | iex
+irm https://raw.githubusercontent.com/pirncedark/afu-cli/afu-cli/scripts/afu-kur.ps1 | iex
 ```
 
 1. Git ve Bun yoksa kurar (winget / bun.sh).
