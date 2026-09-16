@@ -1,3 +1,46 @@
+<pre align="center">
+ █████╗ ███████╗██╗   ██╗
+██╔══██╗██╔════╝██║   ██║
+███████║█████╗  ██║   ██║
+██╔══██║██╔══╝  ██║   ██║
+██║  ██║██║     ╚██████╔╝
+╚═╝  ╚═╝╚═╝      ╚═════╝
+</pre>
+
+<h1 align="center">AFU CLI</h1>
+
+<p align="center">
+  <strong>Terminal için Türkçe arayüzlü AI kodlama ajanı.</strong><br>
+  <a href="https://github.com/can1357/oh-my-pi">oh-my-pi</a> (omp) tabanlı fork — Windows odaklı.
+</p>
+
+## Kurulum (Windows x64)
+
+PowerShell'e yapıştır:
+
+```powershell
+irm https://raw.githubusercontent.com/pirncedark/oh-my-pi/afu-cli/scripts/afu-kur.ps1 | iex
+```
+
+Sonra yeni bir terminal aç, `afu` yaz, içeride `/login` ile **kendi** hesabınla giriş yap.
+Git ve Bun yoksa script kendisi kurar; derlenmiş native modül hazır indirilir, Rust gerekmez.
+Güncellemek için aynı komutu tekrar çalıştır ya da `afu update` / `/update`.
+
+## omp'den farkı
+
+- **AFU markası** — `afu` komutu, AFU logosu, `ƒ` simgesi, bildirim ve sekme adları.
+- **Türkçe arayüz** — ~360 komut/bayrak açıklaması Türkçe; `/lang` ile Türkçe ↔ İngilizce.
+- **Sesli dikte** — Space'i ~2 sn basılı tutup bırak → Windows dikte (Win+H) açılır, konuştuğun metin kutuya yazılır.
+- **Kolay güncelleme** — `afu update` ve `/update`: upstream'i merge eder, `bun install` yapar.
+- **Tek komut kurulum** — `afu-kur.ps1`.
+- **Düzeltmeler** — Windows'ta `session-stats` çökmesi ve repo temizliği.
+
+Ayrıntılı liste: **[AFU-DEGISIKLIKLER.md](AFU-DEGISIKLIKLER.md)**
+
+Upstream omp düzenli olarak bu dala merge edilir. Aşağısı upstream'in orijinal README'sidir.
+
+---
+
 <p align="center">
   <img src="https://github.com/can1357/oh-my-pi/blob/main/assets/hero.png?raw=true" alt="omp">
 </p>
