@@ -1,11 +1,6 @@
-<pre align="center">
- █████╗ ███████╗██╗   ██╗
-██╔══██╗██╔════╝██║   ██║
-███████║█████╗  ██║   ██║
-██╔══██║██╔══╝  ██║   ██║
-██║  ██║██║     ╚██████╔╝
-╚═╝  ╚═╝╚═╝      ╚═════╝
-</pre>
+<p align="center">
+  <img src="assets/afu-hero.png" alt="AFU CLI">
+</p>
 
 <h1 align="center">AFU CLI</h1>
 

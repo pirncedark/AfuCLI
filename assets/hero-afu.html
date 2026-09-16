@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<title>AFU CLI Banner</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 1500px; height: 540px; overflow: hidden; background: #0b0a10; }
+  .wrap {
+    position: relative; width: 1500px; height: 540px; overflow: hidden;
+    background: radial-gradient(ellipse 520px 330px at 50% 36%, rgba(190, 60, 170, .30), transparent 70%), #0b0a10;
+  }
+  .grid {
+    position: absolute; inset: 0; opacity: .05;
+    background-image:
+      linear-gradient(rgba(255,255,255,.5) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,.5) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+  .corner { position: absolute; width: 34px; height: 34px; border: 0 solid rgba(160,150,220,.35); }
+  .tl { top: 28px; left: 28px; border-top-width: 2px; border-left-width: 2px; }
+  .tr { top: 28px; right: 28px; border-top-width: 2px; border-right-width: 2px; }
+  .bl { bottom: 28px; left: 28px; border-bottom-width: 2px; border-left-width: 2px; }
+  .br { bottom: 28px; right: 28px; border-bottom-width: 2px; border-right-width: 2px; }
+  .side { position: absolute; top: 50%; transform: translateY(-50%); }
+  .side.l { left: 44px; } .side.r { right: 44px; }
+  .content {
+    position: relative; z-index: 2; height: 100%;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+  }
+  .mark { width: 190px; height: 190px; margin-bottom: 4px; }
+  .word {
+    font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 84px;
+    color: #f4f0f7; letter-spacing: -.01em; line-height: 1; margin-bottom: 30px;
+  }
+  .tag {
+    font-family: 'JetBrains Mono', monospace; font-size: 17px; letter-spacing: .38em;
+    color: rgba(255,255,255,.45); margin-bottom: 18px;
+  }
+  .feat {
+    font-family: 'JetBrains Mono', monospace; font-size: 15px; letter-spacing: .14em;
+    color: rgba(255,255,255,.42); display: flex; align-items: center; gap: 14px;
+  }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #ec4ec8; box-shadow: 0 0 10px #ec4ec8; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="grid"></div>
+  <div class="corner tl"></div><div class="corner tr"></div>
+  <div class="corner bl"></div><div class="corner br"></div>
+
+  <svg class="side l" width="20" height="180" viewBox="0 0 20 180">
+    <path d="M10 0 V76 L3 83 L17 90 L3 97 L10 104 V180" stroke="#6b5fb0" stroke-width="2" fill="none"/>
+  </svg>
+  <svg class="side r" width="20" height="180" viewBox="0 0 20 180">
+    <path d="M10 0 V76 L17 83 L3 90 L17 97 L10 104 V180" stroke="#6b5fb0" stroke-width="2" fill="none"/>
+  </svg>
+
+  <div class="content">
+    <!-- AFU işareti: CLI'daki ƒ simgesinin blok/geometrik hali -->
+    <svg class="mark" viewBox="0 0 190 190">
+      <defs>
+        <linearGradient id="g" gradientUnits="userSpaceOnUse" x1="20" y1="10" x2="170" y2="180">
+          <stop offset="0" stop-color="#f048c6"/>
+          <stop offset=".55" stop-color="#b45cf0"/>
+          <stop offset="1" stop-color="#7aa6f5"/>
+        </linearGradient>
+      </defs>
+      <g fill="none" stroke="url(#g)" stroke-linecap="butt" stroke-linejoin="round">
+        <path stroke-width="30" d="M170 32 H128 Q102 32 100 58 L90 142 Q87 168 61 168 H20"/>
+        <path stroke-width="28" d="M44 92 H150"/>
+      </g>
+    </svg>
+    <div class="word">afu</div>
+    <div class="tag">[ AI KODLAMA AJANI ]</div>
+    <div class="feat"><span class="dot"></span>TÜRKÇE · SESLİ DİKTE · MCP · LSP · SUBAGENTS</div>
+  </div>
+</div>
+</body>
+</html>
