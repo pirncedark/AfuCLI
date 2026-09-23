@@ -14,6 +14,7 @@ import {
 	EXTENSION_HANDLER_TIMEOUT_MS,
 	testSetExtensionHandlerTimeoutMs,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import type { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import * as memoryBackendModule from "@oh-my-pi/pi-coding-agent/memory-backend";
 import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
@@ -27,6 +28,7 @@ import {
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { VIBE_TOOL_NAMES } from "@oh-my-pi/pi-coding-agent/tools/vibe";
+import { resetYieldTurnState } from "@oh-my-pi/pi-coding-agent/tools/yield";
 import { logger, removeSyncWithRetries, Snowflake, untilAborted } from "@oh-my-pi/pi-utils";
 
 const toolActivationExtension: ExtensionFactory = pi => {
@@ -265,10 +267,10 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			model: unsupported,
 		});
 		const authStorage = session.modelRegistry.authStorage;
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		authStorage.setRuntimeApiKey("openai", "test-key");
-		authStorage.setRuntimeApiKey("google", "test-key");
-		authStorage.setRuntimeApiKey("xai", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		authStorage.keys.setRuntime("openai", "test-key");
+		authStorage.keys.setRuntime("google", "test-key");
+		authStorage.keys.setRuntime("xai", "test-key");
 
 		try {
 			expect(session.getActiveToolNames()).not.toContain("think");
@@ -372,7 +374,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		const model = requireBundledModel("openai", "gpt-5");
 		// The prompt preflight validates the key through the registry (not the
 		// per-request `getApiKey` override), so seed it for keyless CI runners.
-		modelRegistry.authStorage.setRuntimeApiKey("openai", "test-key");
+		modelRegistry.authStorage.keys.setRuntime("openai", "test-key");
 		const { session } = await createAgentSession({
 			...baseOptions(tempDir),
 			settings,
@@ -1748,12 +1750,36 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		}
 	});
 
+	it("resets reused yield state through the SDK extension wrapper", async () => {
+		const tempDir = makeTempDir();
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			requireYieldTool: true,
+			toolNames: ["yield"],
+		});
+
+		try {
+			const yieldTool = session.getToolByName("yield");
+			if (!yieldTool) throw new Error("expected wrapped yield tool");
+			expect(yieldTool).toBeInstanceOf(ExtensionToolWrapper);
+
+			await yieldTool.execute("run1-section", { type: ["findings"], data: "one finding" });
+			const keptWithinRun = await yieldTool.execute("run1-finalize", { type: "result" });
+			expect(keptWithinRun.content).toEqual([{ type: "text", text: "Result submitted." }]);
+
+			resetYieldTurnState(yieldTool);
+			await expect(yieldTool.execute("run2-empty", { type: "result" })).rejects.toThrow(/no text \(thinking only\)/);
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	it("normalizes legacy builtin toolNames before selecting the active SDK tools", async () => {
 		const tempDir = makeTempDir();
 
 		const { session } = await createAgentSession({
 			...baseOptions(tempDir),
-			toolNames: ["read", "search", "find"],
+			toolNames: ["read", "search", "glob"],
 		});
 
 		try {
@@ -1763,7 +1789,6 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			expect(activeToolNames).toContain("grep");
 			expect(activeToolNames).toContain("glob");
 			expect(activeToolNames).not.toContain("search");
-			expect(activeToolNames).not.toContain("find");
 		} finally {
 			await session.dispose();
 		}
@@ -2015,7 +2040,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		const normalDir = makeTempDir();
 		const configuredSettings = () =>
 			Settings.isolated({
-				"providers.imageOrder": ["openai"],
+				modelRoles: { image: "openai/gpt-image-1" },
 				"generate_image.enabled": true,
 				"speechgen.enabled": true,
 				"memory.backend": "hindsight",
@@ -2221,11 +2246,11 @@ describe("createAgentSession defaultInactive tool activation", () => {
 	// env var — an env mutation would outlive this file — and removed after,
 	// since the storage is shared by every test here.
 	const withProviderAuth = async (providers: string[], run: () => Promise<void>): Promise<void> => {
-		for (const provider of providers) modelRegistry.authStorage.setRuntimeApiKey(provider, "test-key");
+		for (const provider of providers) modelRegistry.authStorage.keys.setRuntime(provider, "test-key");
 		try {
 			await run();
 		} finally {
-			for (const provider of providers) modelRegistry.authStorage.removeRuntimeApiKey(provider);
+			for (const provider of providers) modelRegistry.authStorage.keys.removeRuntime(provider);
 		}
 	};
 

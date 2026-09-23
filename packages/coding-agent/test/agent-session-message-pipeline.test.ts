@@ -226,7 +226,7 @@ describe("AgentSession message pipeline", () => {
 			maxTokens: 1024,
 		} as ModelSpec<Api>) as Model<Api>;
 		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
-		authStorage.setRuntimeApiKey(model.provider, "test-key");
+		authStorage.keys.setRuntime(model.provider, "test-key");
 		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
 		const { session } = await createAgentSession({
 			cwd: tempDir.path(),
@@ -306,7 +306,7 @@ describe("AgentSession message pipeline", () => {
 			maxTokens: 1024,
 		} as ModelSpec<Api>) as Model<Api>;
 		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
-		authStorage.setRuntimeApiKey(model.provider, "test-key");
+		authStorage.keys.setRuntime(model.provider, "test-key");
 		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
 		const { session } = await createAgentSession({
 			cwd: tempDir.path(),
@@ -945,8 +945,13 @@ describe("AgentSession message pipeline", () => {
 			async enqueue() {},
 			async beforeAgentStartPrompt() {
 				if (remembered) return undefined;
-				remembered = true;
-				return injected;
+				return {
+					context: injected,
+					commit: () => {
+						remembered = true;
+						return true;
+					},
+				};
 			},
 		};
 		vi.spyOn(memoryBackend, "resolveMemoryBackend").mockResolvedValue(fakeBackend);
@@ -1423,8 +1428,13 @@ describe("AgentSession message pipeline", () => {
 			async enqueue() {},
 			async beforeAgentStartPrompt() {
 				if (remembered || !recallAvailable) return undefined;
-				remembered = true;
-				return injected;
+				return {
+					context: injected,
+					commit: () => {
+						remembered = true;
+						return true;
+					},
+				};
 			},
 		};
 		vi.spyOn(memoryBackend, "resolveMemoryBackend").mockResolvedValue(fakeBackend);
@@ -1512,8 +1522,13 @@ describe("AgentSession message pipeline", () => {
 			async enqueue() {},
 			async beforeAgentStartPrompt() {
 				if (remembered || !recallAvailable) return undefined;
-				remembered = true;
-				return injected;
+				return {
+					context: injected,
+					commit: () => {
+						remembered = true;
+						return true;
+					},
+				};
 			},
 		};
 		vi.spyOn(memoryBackend, "resolveMemoryBackend").mockResolvedValue(fakeBackend);
@@ -1605,8 +1620,13 @@ describe("AgentSession message pipeline", () => {
 			async enqueue() {},
 			async beforeAgentStartPrompt() {
 				if (remembered) return undefined;
-				remembered = true;
-				return injected;
+				return {
+					context: injected,
+					commit: () => {
+						remembered = true;
+						return true;
+					},
+				};
 			},
 		};
 		vi.spyOn(memoryBackend, "resolveMemoryBackend").mockResolvedValue(fakeBackend);

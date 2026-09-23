@@ -43,7 +43,7 @@ describe("SelectorController prompt-affecting settings", () => {
 			configPath = path.join(agentDir, "config.yml");
 
 			authStorage = await AuthStorage.create(path.join(agentDir, "auth.db"));
-			authStorage.setRuntimeApiKey("anthropic", "test-key");
+			authStorage.keys.setRuntime("anthropic", "test-key");
 			const modelRegistry = new ModelRegistry(authStorage);
 
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5") as Model;
@@ -85,5 +85,19 @@ describe("SelectorController prompt-affecting settings", () => {
 			expect(onDisk).toContain("followUpMode: all");
 			expect(onDisk).toContain("interruptMode: wait");
 		});
+	});
+
+	it("persists the Auto-Compact toggle globally from the settings panel", () => {
+		const setAutoCompactionEnabled = vi.fn();
+		const ctx = {
+			session: { setAutoCompactionEnabled },
+			statusLine: { setAutoCompactEnabled: vi.fn() },
+		} as unknown as InteractiveModeContext;
+		const controller = new SelectorController(ctx);
+
+		controller.handleSettingChange("autoCompact", false);
+
+		// persist=true: panel edits are durable, unlike the session-scoped RPC path (#11431).
+		expect(setAutoCompactionEnabled).toHaveBeenCalledWith(false, true);
 	});
 });

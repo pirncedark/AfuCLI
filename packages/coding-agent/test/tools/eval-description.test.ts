@@ -10,14 +10,18 @@ function makeSession(opts: {
 	spawns?: string | null;
 	backends?: Record<string, boolean>;
 	preludes?: () => readonly EvalPreludeDefinition[];
+	taskDepth?: number;
+	maxRecursionDepth?: number;
 }): ToolSession {
 	const settings = Settings.isolated();
 	for (const [key, value] of Object.entries(opts.backends ?? {})) settings.set(key as never, value);
+	if (opts.maxRecursionDepth !== undefined) settings.set("task.maxRecursionDepth", opts.maxRecursionDepth);
 	return {
 		cwd: "/tmp/eval-test",
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => opts.spawns ?? "*",
+		taskDepth: opts.taskDepth,
 		...(opts.preludes ? { getEvalPreludes: opts.preludes } : {}),
 		settings,
 	} as unknown as ToolSession;
@@ -55,11 +59,13 @@ describe("eval tool description", () => {
 		expect(text).toContain("agent(prompt");
 	});
 
-	it("omits agent() when the session forbids spawning", () => {
+	it("omits spawning helpers but keeps wait() when the session forbids spawning", () => {
 		// Subagents with spawns: undefined (resolved to "") cannot launch tasks.
-		// The prelude doc must not promise a helper that always throws.
+		// wait() remains usable with completion() handles.
 		const text = getEvalToolDescription({ py: true, js: true, spawns: false });
 		expect(text).not.toContain("agent(prompt");
+		expect(text).not.toContain("workpool(");
+		expect(text).toContain("wait(handles");
 	});
 
 	it("EvalTool description reflects spawn policy from the session", () => {
@@ -67,6 +73,19 @@ describe("eval tool description", () => {
 		const denied = new EvalTool(makeSession({ spawns: "" })).description;
 		expect(wildcard).toContain("agent(prompt");
 		expect(denied).not.toContain("agent(prompt");
+	});
+
+	it("omits spawning helpers but keeps wait() when recursion depth is exhausted", () => {
+		const belowCap = new EvalTool(makeSession({ taskDepth: 1, maxRecursionDepth: 2 })).description;
+		const atCap = new EvalTool(makeSession({ taskDepth: 2, maxRecursionDepth: 2 })).description;
+		const spawningDisabled = new EvalTool(makeSession({ taskDepth: 0, maxRecursionDepth: 0 })).description;
+
+		expect(belowCap).toContain("agent(prompt");
+		for (const description of [atCap, spawningDisabled]) {
+			expect(description).not.toContain("agent(prompt");
+			expect(description).not.toContain("workpool(");
+			expect(description).toContain("wait(handles");
+		}
 	});
 
 	it("hides eval-defined tool guidance when eval.tools.enabled is off", () => {
@@ -118,15 +137,11 @@ describe("eval tool dynamic schema", () => {
 		}
 	});
 
-	it("advertises exactly py and js in the wire schema", () => {
-		const tool = new EvalTool(makeSession({}));
-		const fields = wireCellFields(tool);
-		expect(fields.languages).toEqual(["js", "py"]);
-		expect(fields.languageDescription).toBe('runtime: "py" for the IPython kernel, "js" for the persistent JS VM');
-		expect(fields.codeDescription).toBe("code to run in this eval call, verbatim. Use top-level await freely.");
-		expect(tool.summary).toBe("Execute Python or JavaScript code in an in-process eval backend");
-		expect(tool.description).not.toMatch(/ruby|julia/i);
-		const exampleLangs = tool.examples.map(ex => ("call" in ex ? ex.call.language : null));
-		expect(exampleLangs).toEqual(["py", "py", "py"]);
+	it("advertises enabled runtimes and excludes disabled runtime examples", () => {
+		const both = new EvalTool(makeSession({}));
+		expect(wireCellFields(both).languages).toEqual(["js", "py"]);
+		const jsOnly = new EvalTool(makeSession({ backends: { "eval.py": false, "eval.js": true } }));
+		expect(wireCellFields(jsOnly).languages).toEqual(["js"]);
+		expect(jsOnly.examples.every(example => "call" in example && example.call.language === "js")).toBe(true);
 	});
 });

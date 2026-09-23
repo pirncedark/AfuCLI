@@ -31,6 +31,18 @@ export type StreamFn = (
 	...args: Parameters<typeof streamSimple>
 ) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
 
+/** Staged queue preparation; commit synchronously only while the batch is still owned. */
+export interface QueuedMessagePreparation {
+	/** Append context after the originals; undefined stops this attempt, retaining originals unless explicitly removed. */
+	commit(): readonly AgentMessage[] | undefined;
+}
+
+/** Prepare an exclusively claimed batch. Undefined delivers unchanged; the signal also aborts when the claim is cancelled. */
+export type PrepareQueuedMessages = (
+	messages: readonly AgentMessage[],
+	signal: AbortSignal,
+) => QueuedMessagePreparation | undefined | Promise<QueuedMessagePreparation | undefined>;
+
 /** Called once an aside has been inserted into the agent's live context. */
 export const ASIDE_MESSAGE_COMMIT = Symbol("aside-message-commit");
 /** Symbol-keyed handoff for one finalized, tool-owned stream speculation session. */
@@ -281,6 +293,19 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * The host owns message injection at the next boundary.
 	 */
 	hasIrcInterrupts?: () => boolean | Promise<boolean>;
+	/**
+	 * Peeks whether a background completion (finished job, exited supervised
+	 * process) is queued for aside injection at the next boundary.
+	 *
+	 * Same rules as {@link hasIrcInterrupts}: non-consuming, only cuts
+	 * *interruptible* waits short, ignored when interruptMode is "wait". Without
+	 * it a completion notice sits behind an hour-long `hub wait` that the agent
+	 * would have abandoned had it seen the notice. Unlike a peer IRC it never
+	 * raises {@link ToolCallContext.steeringSignal}: a queued completion must
+	 * not push ordinary foreground work (auto-background bash/eval) into the
+	 * background.
+	 */
+	hasBackgroundCompletions?: () => boolean | Promise<boolean>;
 
 	/**
 	 * Returns follow-up messages to process after the agent would otherwise stop.
@@ -1000,8 +1025,9 @@ export interface AgentTool<
 	 * Called at `toolcall_start`, before any argument delta. Return `undefined` to opt out.
 	 */
 	openArgStream?: (init: AgentToolArgStreamInit) => AgentToolArgStream | undefined;
-	/** If true, tool is excluded unless explicitly listed in --tools or agent's tools field */
 	hidden?: boolean;
+	/** If true, the tool can read `skill://<name>` instruction content; prompt builders gate skill guidance on it. */
+	readsSkillUris?: boolean;
 	/** If true, tool can stage a pending action that requires explicit resolution via the resolve tool. */
 	deferrable?: boolean;
 	/** How an enabled tool is presented. See {@link ToolLoadMode}. Omitted is treated as `"essential"` for built-ins; custom-tool adapters normalize omission to `"discoverable"`. */

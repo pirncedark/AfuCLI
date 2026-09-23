@@ -7,41 +7,46 @@ import type {
 	ToolSpeculationPolicy,
 } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, ToolExample } from "@oh-my-pi/pi-ai";
-import { prompt } from "@oh-my-pi/pi-utils";
-import {
-	DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS,
-	formatBackgroundNotice,
-	raceJobSettlement,
-	resolveAutoBackgroundWaitMs,
-} from "../async";
+import { formatBackgroundNotice } from "@oh-my-pi/pi-tui/tools/bash";
+import { parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+import { isRecord, prompt } from "@oh-my-pi/pi-utils";
+import { DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS, raceJobSettlement, resolveAutoBackgroundWaitMs } from "../async";
 import { jsBackend, pythonBackend } from "../eval";
 import type { ExecutorBackend, ExecutorBackendResult } from "../eval/backend";
 import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP } from "../eval/bridge-timeout";
 import { IdleTimeout } from "../eval/idle-timeout";
 import { getEnabledEvalPreludes } from "../eval/preludes";
+import { prepareEvalSource } from "../eval/input";
 import type { BackendProbeOptions } from "../eval/probe";
 import { defaultEvalSessionId } from "../eval/session-id";
 import { EvalShadowCellSession } from "../eval/speculation/cell-session";
 import { runWithEvalShadowCell } from "../eval/speculation/runtime-context";
-import type { EvalCellResult, EvalDisplayOutput, EvalLanguage, EvalStatusEvent, EvalToolDetails } from "../eval/types";
+import type { EvalCellResult, EvalLanguage, EvalStatusEvent, EvalToolDetails } from "@oh-my-pi/pi-tui/tools/eval";
 import evalDescription from "../prompts/tools/eval.md" with { type: "text" };
 import evalCodeModeDescription from "../prompts/tools/eval-code-mode.md" with { type: "text" };
-import { DEFAULT_MAX_BYTES, OutputSink, type OutputSummary, TailBuffer } from "../session/streaming-output";
+import {
+	DEFAULT_MAX_BYTES,
+	OutputSink,
+	type OutputSummary,
+	TailBuffer,
+	truncateHeadBytes,
+} from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { sessionDelegationBias } from "../task/prompt-policy";
 import { resolveSpawnPolicy } from "../task/spawn-policy";
-import { webpExclusionForModel } from "../utils/image-loading";
+import { canSpawnAtDepth } from "../task/types";
+import { webpExclusionForModel } from "@oh-my-pi/pi-tui/chat/image-loading";
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import type { ToolSession } from ".";
 import { truncateForPrompt } from "./approval";
 import { type EvalBackendsAllowance, resolveEvalBackends } from "./eval-backends";
-import { generateCodeModeDeclarations } from "./eval-format/code-mode-declarations";
-import { upsertStatusEvent } from "./eval-render";
+import { generateCodeModeDeclarations } from "@oh-my-pi/pi-tui/tools/eval-format/code-mode-declarations";
+import { upsertStatusEvent } from "@oh-my-pi/pi-tui/tools/eval";
+import { formatOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "./output-meta";
-import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
+import { ToolAbortError, throwIfAborted } from "./tool-errors";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
-
-export { EVAL_DEFAULT_PREVIEW_LINES, evalToolRenderer } from "./eval-render";
 
 /** Language tokens the eval tool accepts, in stable display order. */
 export type EvalLanguageToken = "py" | "js";
@@ -66,15 +71,11 @@ function describeLanguageField(langs: readonly EvalLanguageToken[]): string {
 	return `runtime: ${langs.map(lang => EVAL_LANGUAGE_RUNTIME[lang]).join(", ")}`;
 }
 
-function describeCodeField(_langs: readonly EvalLanguageToken[]): string {
-	return "code to run in this eval call, verbatim. Use top-level await freely.";
-}
-
 /** One-line discovery summary listing the runtimes available this session. */
 function summarizeEvalLanguages(langs: readonly EvalLanguageToken[]): string {
 	const names = langs.map(lang => EVAL_LANGUAGE_NAME[lang]);
 	const list = names.length > 0 ? joinWithOr(names) : "Python or JavaScript";
-	return `Execute ${list} code in an in-process eval backend`;
+	return `Execute ${list} in persistent kernels; load scripts or install packages`;
 }
 
 /** Resolved-allowance → enabled language tokens, preserving display order. */
@@ -87,6 +88,7 @@ function enabledEvalLanguages(backends: EvalBackendsAllowance): EvalLanguageToke
 }
 
 const evalCellCommonFields = {
+	code: type("string").describe("code or a standalone % command to run in this eval call. Top-level await works."),
 	"title?": type("string").describe('short label shown in transcript (e.g. "imports", "load config")'),
 	"timeout?": type("number").describe("timeout for this eval call in seconds; 0 disables the cell timeout"),
 	"reset?": type("boolean").describe("wipe this language's kernel before running. Other languages are untouched."),
@@ -102,7 +104,6 @@ const evalCellCommonFields = {
 export const evalSchema = type({
 	language: type("'py' | 'js'").describe(describeLanguageField(EVAL_LANGUAGE_ORDER)),
 	...evalCellCommonFields,
-	code: type("string").describe(describeCodeField(EVAL_LANGUAGE_ORDER)),
 });
 export type EvalToolParams = typeof evalSchema.infer;
 export type EvalCellInput = EvalToolParams;
@@ -117,10 +118,9 @@ export type EvalCellInput = EvalToolParams;
 function buildEvalSchema(langs: readonly EvalLanguageToken[]): typeof evalSchema {
 	const schema = type({
 		language: type.enumerated(...langs).describe(describeLanguageField(langs)),
-		code: type("string").describe(describeCodeField(langs)),
 		...evalCellCommonFields,
 	});
-	return schema as unknown as typeof evalSchema;
+	return schema;
 }
 
 export type EvalToolResult = {
@@ -130,36 +130,58 @@ export type EvalToolResult = {
 
 export type EvalProxyExecutor = (params: EvalToolParams, signal?: AbortSignal) => Promise<EvalToolResult>;
 
-/** Cap per `display()` value sent back to the model. */
+/** Shared cap for each structured `display()` preview returned by eval. */
 const MAX_DISPLAY_TEXT_BYTES = 8000;
+const DISPLAY_ELISION_RESERVE_BYTES = 64;
+/** Minimum spacing between live eval updates; bursts coalesce to one trailing snapshot. */
+const LIVE_UPDATE_INTERVAL_MS = 50;
 
-function formatDisplayJsonForText(value: unknown): string {
-	let text: string;
-	try {
-		text = JSON.stringify(value, null, 2) ?? String(value);
-	} catch {
-		text = String(value);
-	}
-	if (text.length > MAX_DISPLAY_TEXT_BYTES) {
-		text = `${text.slice(0, MAX_DISPLAY_TEXT_BYTES)}\n[…${text.length - MAX_DISPLAY_TEXT_BYTES}ch elided…]`;
-	}
-	return text;
+interface FormattedDisplayJson {
+	fullText: string;
+	previewText: string;
+	detailsValue: unknown;
+	/** Full value must be mirrored to the output artifact; `detailsValue` holds only a preview. */
+	spillFullValue: boolean;
 }
 
 /**
- * Format display() JSON values into text the model can see. Images are surfaced
- * separately as ImageContent so the model can actually inspect them; this helper
- * intentionally does not touch images.
+ * Format one structured `display()` value for the model text and the tool
+ * `details`. The model-visible preview is always capped at
+ * {@link MAX_DISPLAY_TEXT_BYTES}. When the value exceeds that cap, the full
+ * value is retained in `details` only if `canSpill` is false (no persistence,
+ * so nothing to bloat); otherwise `details` keeps a bounded metadata object and
+ * the caller mirrors the full value to the session output artifact.
  */
-function formatDisplayOutputsForText(outputs: EvalDisplayOutput[]): string {
-	const chunks: string[] = [];
-	let displayIndex = 0;
-	for (const output of outputs) {
-		if (output.type !== "json") continue;
-		displayIndex++;
-		chunks.push(`display[${displayIndex}]:\n${formatDisplayJsonForText(output.data)}`);
+function formatDisplayJson(value: unknown, canSpill: boolean): FormattedDisplayJson {
+	let fullText: string;
+	try {
+		fullText = JSON.stringify(value, null, 2) ?? String(value);
+	} catch {
+		fullText = String(value);
 	}
-	return chunks.join("\n\n");
+	const totalBytes = Buffer.byteLength(fullText, "utf-8");
+	if (totalBytes <= MAX_DISPLAY_TEXT_BYTES) {
+		return { fullText, previewText: fullText, detailsValue: value, spillFullValue: false };
+	}
+
+	const head = truncateHeadBytes(fullText, MAX_DISPLAY_TEXT_BYTES - DISPLAY_ELISION_RESERVE_BYTES);
+	const previewText = `${head.text}\n[…${fullText.length - head.text.length}ch elided…]`;
+	// Without an artifact to mirror into, keep the full value in details: there
+	// is no session JSONL to bloat, and discarding it would strand large
+	// displays from SDK consumers that read `details.jsonOutputs`.
+	if (!canSpill) {
+		return { fullText, previewText, detailsValue: value, spillFullValue: false };
+	}
+	return {
+		fullText,
+		previewText,
+		detailsValue: {
+			preview: previewText,
+			truncated: true,
+			totalBytes,
+		},
+		spillFullValue: true,
+	};
 }
 
 export interface EvalToolDescriptionOptions {
@@ -178,6 +200,8 @@ export interface EvalToolDescriptionOptions {
 	eagerDelegation?: boolean;
 	/** Enabled capability documentation appended to the eval-only prompt. */
 	preludeDocumentation?: string;
+	/** Whether missing runtimes and environments may be provisioned automatically. */
+	autoProvision?: boolean;
 }
 
 export function getEvalToolDescription(options: EvalToolDescriptionOptions = {}): string {
@@ -194,6 +218,7 @@ export function getEvalToolDescription(options: EvalToolDescriptionOptions = {})
 		spawnDefaultAgent: spawnPolicy.defaultAgent,
 		spawnAllowedAgentsText: spawnPolicy.allowedPromptText,
 		preludeDocumentation: options.preludeDocumentation,
+		autoProvision: options.autoProvision ?? true,
 	});
 }
 
@@ -210,6 +235,11 @@ interface ResolvedEvalCell {
 	index: number;
 	title?: string;
 	code: string;
+	displayCode: string;
+	environmentChange?: boolean;
+	filename?: string;
+	packages?: string[];
+	environment?: "managed" | "project";
 	timeoutMs: number;
 	reset: boolean;
 	resolved: ResolvedBackend;
@@ -266,7 +296,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 	readonly name = "eval";
 	readonly approval = "exec" as const;
 	readonly formatApprovalDetails = (args: unknown): string[] => {
-		const params = args as Partial<EvalToolParams>;
+		const params = isRecord(args) ? args : {};
 		const language =
 			typeof params.language === "string" ? formatEvalInputLanguage(params.language) : "javascript (default)";
 		const code = typeof params.code === "string" ? params.code : "";
@@ -288,6 +318,10 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		} else {
 			const backends = resolveEvalBackends(this.session);
 			const sessionSpawns = this.session.getSessionSpawns?.() ?? "*";
+			const depthAllowsSpawning = canSpawnAtDepth(
+				this.session.settings.get("task.maxRecursionDepth") ?? 2,
+				this.session.taskDepth ?? 0,
+			);
 			const preludeDocumentation = getEnabledEvalPreludes(this.session.getEvalPreludes?.() ?? [])
 				.map(definition => definition.documentation.trim())
 				.filter(Boolean)
@@ -295,11 +329,12 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			base = getEvalToolDescription({
 				py: backends.python,
 				js: backends.js,
-				spawns: sessionSpawns,
+				spawns: depthAllowsSpawning ? sessionSpawns : false,
 				autoBackgroundEnabled: this.session.settings.get("eval.autoBackground.enabled"),
 				evalTools: this.session.settings.get("eval.tools.enabled"),
 				eagerDelegation: sessionDelegationBias(this.session) === "eager",
 				preludeDocumentation,
+				autoProvision: this.session.settings.get("eval.autoProvision"),
 			});
 		}
 		return this.#codeModeDescription(base) ?? base;
@@ -330,7 +365,23 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		return prompt.render(evalCodeModeDescription, { baseDescription, declarations, preludeDeclarations });
 	}
 	/** All reuse-chain examples; the `examples` getter filters by enabled languages. */
-	private static readonly ALL_EXAMPLES: readonly ToolExample<typeof evalSchema.infer>[] = [
+	static readonly #examples: readonly ToolExample<typeof evalSchema.infer>[] = [
+		{
+			caption: "Install distributions without replaying a failed cell",
+			call: { language: "py", code: "%pip install pillow", title: "install image support" },
+		},
+		{
+			caption: "Load an existing script; reuse its definitions in later cells",
+			call: { language: "py", code: "%load ./analysis.py", title: "load analysis" },
+		},
+		{
+			caption: "Install a JavaScript dependency outside the project",
+			call: { language: "js", code: "%bun add csv-parse", title: "install CSV parser" },
+		},
+		{
+			caption: "Execute an existing TypeScript script in the retained kernel",
+			call: { language: "js", code: "%load ./analysis.ts", title: "load analysis" },
+		},
 		{
 			caption: "First call — set up once",
 			call: {
@@ -358,7 +409,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 	];
 	get examples(): readonly ToolExample<typeof evalSchema.infer>[] {
 		const langs = new Set(this.#enabledLanguages());
-		return EvalTool.ALL_EXAMPLES.filter(ex => "call" in ex && langs.has(ex.call.language as EvalLanguageToken));
+		return EvalTool.#examples.filter(ex => "call" in ex && langs.has(ex.call.language));
 	}
 	get parameters(): typeof evalSchema {
 		const langs = this.#enabledLanguages();
@@ -405,6 +456,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 	#paramsKey?: string;
 	#cachedParams?: typeof evalSchema;
 	readonly #shadowCells = new Map<string, EvalShadowCellSession>();
+	readonly #environmentModes: Partial<Record<EvalLanguage, "managed" | "project">> = {};
 
 	/**
 	 * Languages enabled for this session, in display order. Detached tools (no
@@ -449,11 +501,19 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				? 0
 				: clampTimeout("eval", params.timeout, session.settings.get("tools.maxTimeout")) * 1000;
 		const resolved = await resolveBackend(session, cellLanguage, { signal, timeoutMs: cellTimeoutMs });
+		const source = await prepareEvalSource(params, session, signal);
+		if (shadowCell && (source.filename || source.packages?.length || source.environment)) {
+			await shadowCell.discard("file-backed or environment-changing eval requires authoritative execution");
+		}
 		const cells: ResolvedEvalCell[] = [
 			{
 				index: 0,
 				title: params.title,
-				code: params.code,
+				...source,
+				displayCode: params.code,
+				environmentChange: source.environment !== undefined,
+				environment:
+					source.environment ?? (this.#environmentModes[cellLanguage] === "project" ? "project" : undefined),
 				timeoutMs: cellTimeoutMs,
 				reset: params.reset ?? false,
 				resolved,
@@ -545,7 +605,9 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						void reportProgress(text, { async: { state: "running", jobId, type: "eval" } });
 						if (forwardUpdates) emitToolUpdate?.(text, details);
 					});
-					const finalText = result.content.find(block => block.type === "text")?.text ?? "";
+					const finalText =
+						(result.content.find(block => block.type === "text")?.text ?? "") +
+						formatOutputNotice(result.details?.meta);
 					latestText = finalText;
 					latestDetails = result.details;
 					// Hand the full result (images included) to the foreground waiter
@@ -590,9 +652,11 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			ctx?.toolCall?.steeringSignal,
 		);
 		if (waitResult.kind === "completed") {
+			autoBgManager.consumeJobResultWhenSettled(jobId);
 			return waitResult.result;
 		}
 		if (waitResult.kind === "failed") {
+			autoBgManager.consumeJobResultWhenSettled(jobId);
 			throw waitResult.error;
 		}
 		if (waitResult.kind === "aborted") {
@@ -632,7 +696,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			cells: cells.map(cell => ({
 				index: cell.index,
 				title: cell.title,
-				code: cell.code,
+				code: cell.displayCode,
 				language: cell.resolved.backend.id,
 				output: previewText,
 				status: "running" as const,
@@ -671,6 +735,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		let outputSink: OutputSink | undefined;
 		let outputSummary: OutputSummary | undefined;
 		let outputDumped = false;
+		let updateTimer: NodeJS.Timeout | undefined;
 		const finalizeOutput = async (): Promise<OutputSummary | undefined> => {
 			if (outputDumped || !outputSink) return outputSummary;
 			outputSummary = await outputSink.dump();
@@ -687,11 +752,30 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			const jsonOutputs: unknown[] = [];
 			const images: ImageContent[] = [];
 			const statusEvents: EvalStatusEvent[] = [];
+			// Oversized displays land in `jsonOutputs` as bounded previews and stream
+			// their full value to the output artifact. Until the artifact write is
+			// confirmed (see `commitDisplaySpills`), the full value is kept here so a
+			// silently failed spill can restore it instead of stranding it.
+			const spilledDisplays: Array<{ index: number; fullValue: unknown }> = [];
+			const commitDisplaySpills = (summary: OutputSummary | undefined): void => {
+				if (spilledDisplays.length === 0) return;
+				// Artifact persistence confirmed: keep the bounded preview. Otherwise
+				// restore the full value so `details` never points at an artifact that
+				// was never (fully) written.
+				if (summary?.artifactId !== undefined) {
+					spilledDisplays.length = 0;
+					return;
+				}
+				for (const spill of spilledDisplays) {
+					jsonOutputs[spill.index] = spill.fullValue;
+				}
+				spilledDisplays.length = 0;
+			};
 
 			const cellResults: EvalCellResult[] = cells.map(cell => ({
 				index: cell.index,
 				title: cell.title,
-				code: cell.code,
+				code: cell.displayCode,
 				language: cell.resolved.backend.id,
 				output: "",
 				status: "pending",
@@ -733,8 +817,19 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				return details;
 			};
 
-			const pushUpdate = () => {
+			// Stdout chunks and status events can arrive hundreds of times per
+			// second; each emitted update rebuilds details and re-renders the card.
+			// Coalesce to one trailing update per interval — the snapshot is taken
+			// at flush time, so the newest state wins.
+			const flushUpdate = () => {
+				if (!updateTimer) return;
+				clearTimeout(updateTimer);
+				updateTimer = undefined;
 				emitUpdate?.(tailBuffer.text(), buildUpdateDetails());
+			};
+			const pushUpdate = () => {
+				if (!emitUpdate || updateTimer) return;
+				updateTimer = setTimeout(flushUpdate, LIVE_UPDATE_INTERVAL_MS);
 			};
 
 			const sessionFile = session.getSessionFile?.() ?? undefined;
@@ -802,6 +897,9 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						session,
 						idleTimeoutMs,
 						reset: cell.reset,
+						filename: cell.filename,
+						packages: cell.packages,
+						environment: cell.environment,
 						onChunk: chunk => {
 							outputSink!.push(chunk);
 						},
@@ -815,24 +913,40 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 								return;
 							}
 							cellResult.statusEvents ??= [];
-							upsertStatusEvent(cellResult.statusEvents, event);
+							upsertStatusEvent(cellResult.statusEvents, {
+								...event,
+								resolvedThinkingLevel: parseConfiguredThinkingLevel(
+									typeof event.resolvedThinkingLevel === "string" ? event.resolvedThinkingLevel : undefined,
+								),
+							});
 							pushUpdate();
 						},
 					});
 				} finally {
 					idle?.dispose();
+					// Publish the cell's last live state before its final output replaces it.
+					flushUpdate();
 					activeLiveCell = undefined;
 				}
 				const durationMs = Date.now() - startTime;
 
 				const cellStatusEvents: EvalStatusEvent[] = [];
-				const cellDisplayOutputs: EvalDisplayOutput[] = [];
+				const cellDisplayTexts: string[] = [];
 				const cellImageNotes: string[] = [];
 				let cellHasMarkdown = false;
 				for (const output of result.displayOutputs) {
 					if (output.type === "json") {
-						jsonOutputs.push(output.data);
-						cellDisplayOutputs.push(output);
+						const formatted = formatDisplayJson(output.data, artifactPath !== undefined);
+						const label = `display[${cellDisplayTexts.length + 1}]:\n`;
+						jsonOutputs.push(formatted.detailsValue);
+						cellDisplayTexts.push(`${label}${formatted.previewText}`);
+						if (formatted.spillFullValue) {
+							spilledDisplays.push({ index: jsonOutputs.length - 1, fullValue: output.data });
+							outputSink.push(`${label}${formatted.fullText}\n`, {
+								inline: `${label}${formatted.previewText}\n`,
+								emitInline: false,
+							});
+						}
 					}
 					if (output.type === "image") {
 						const resized = await resizeImage(
@@ -849,28 +963,35 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 							mimeType: resized.mimeType,
 						};
 						images.push(image);
-						cellDisplayOutputs.push({
-							type: "image",
-							data: image.data,
-							mimeType: image.mimeType,
-						});
 						const dimensionNote = formatDimensionNote(resized);
 						if (dimensionNote) {
 							cellImageNotes.push(`display image ${cellImageNotes.length + 1}: ${dimensionNote}`);
 						}
 					}
 					if (output.type === "status") {
-						upsertStatusEvent(statusEvents, output.event);
-						upsertStatusEvent(cellStatusEvents, output.event);
+						const event: EvalStatusEvent = {
+							...output.event,
+							resolvedThinkingLevel: parseConfiguredThinkingLevel(
+								typeof output.event.resolvedThinkingLevel === "string"
+									? output.event.resolvedThinkingLevel
+									: undefined,
+							),
+						};
+						upsertStatusEvent(statusEvents, event);
+						upsertStatusEvent(cellStatusEvents, event);
 					}
 					if (output.type === "markdown") {
 						cellHasMarkdown = true;
 					}
 				}
 
-				const stdoutTrimmed = result.output.trim();
+				const runtimeOutput = result.output.trim();
+				const stdoutTrimmed =
+					cell.environmentChange && result.exitCode === 0
+						? `${runtimeOutput ? `${runtimeOutput}\n` : ""}Eval environment: ${cell.environment}.`
+						: runtimeOutput;
 				const imageText = cellImageNotes.join("\n");
-				const displayText = formatDisplayOutputsForText(cellDisplayOutputs);
+				const displayText = cellDisplayTexts.join("\n\n");
 				const visibleDisplayText =
 					displayText && imageText ? `${displayText}\n\n${imageText}` : displayText || imageText;
 				const cellOutput =
@@ -896,6 +1017,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					const outputText = combinedOutput || errorMsg;
 
 					const summaryForMeta = await summarizeFinal(combinedOutput, finalizeOutput);
+					commitDisplaySpills(summaryForMeta);
 					const details: EvalToolDetails = {
 						language: languages[0],
 						languages,
@@ -922,6 +1044,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						: `Command exited with code ${result.exitCode}`;
 
 					const summaryForMeta = await summarizeFinal(combinedOutput, finalizeOutput);
+					commitDisplaySpills(summaryForMeta);
 					const details: EvalToolDetails = {
 						language: languages[0],
 						languages,
@@ -939,6 +1062,9 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						.done();
 				}
 
+				if (cell.environmentChange && cell.environment) {
+					this.#environmentModes[backend.id] = cell.environment;
+				}
 				cellResult.status = "complete";
 				pushUpdate();
 			}
@@ -951,6 +1077,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					? `(displayed ${images.length} image${images.length === 1 ? "" : "s"}; no text output)`
 					: "(no output)");
 			const summaryForMeta = await summarizeFinal(combinedOutput, finalizeOutput);
+			commitDisplaySpills(summaryForMeta);
 
 			const details: EvalToolDetails = {
 				language: languages[0],
@@ -966,6 +1093,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				.truncationFromSummary(summaryForMeta, { direction: "tail" })
 				.done();
 		} finally {
+			clearTimeout(updateTimer);
 			if (!outputDumped) {
 				try {
 					await finalizeOutput();
@@ -999,6 +1127,7 @@ async function summarizeFinal(
 		outputLines,
 		outputBytes,
 		artifactId: rawSummary.artifactId,
+		artifactError: rawSummary.artifactError,
 		columnDroppedBytes: rawSummary.columnDroppedBytes,
 		columnTruncatedLines: rawSummary.columnTruncatedLines,
 		columnMax: rawSummary.columnMax,

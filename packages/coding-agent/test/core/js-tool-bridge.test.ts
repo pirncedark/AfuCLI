@@ -4,7 +4,8 @@ import type { AgentTool, AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { callSessionTool } from "@oh-my-pi/pi-coding-agent/eval/js/tool-bridge";
 import type { EvalShadowCellSession } from "@oh-my-pi/pi-coding-agent/eval/speculation/cell-session";
-import { type TodoPhase, TodoTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { type TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
+import { TodoTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 
 function createTool(name: string, execute: AgentTool["execute"]): AgentTool {
@@ -744,6 +745,39 @@ describe("callSessionTool", () => {
 		await callSessionTool("todo", { op: "view" }, { session });
 		await callSessionTool("todo", { op: "done", task: "No such task" }, { session });
 		expect(persisted).toHaveLength(1);
+	});
+
+	it("keeps persisted nested Todo status bounded for large checklists", async () => {
+		let phases: TodoPhase[] = [
+			{
+				name: "Ship",
+				tasks: Array.from({ length: 100 }, (_, index) => ({
+					content: `Task ${index}`,
+					status: index === 0 ? ("in_progress" as const) : ("pending" as const),
+				})),
+			},
+		];
+		const statuses: Array<Record<string, unknown>> = [];
+		const session: ToolSession = {
+			...createSession([]),
+			getTodoPhases: () => phases,
+			setTodoPhases: next => {
+				phases = next;
+			},
+			getToolByName: name => (name === "todo" ? (todoTool as unknown as AgentTool) : undefined),
+		};
+		const todoTool = new TodoTool(session);
+
+		await callSessionTool(
+			"todo",
+			{ op: "done", task: "Task 0" },
+			{ session, emitStatus: event => statuses.push(event) },
+		);
+		await callSessionTool("todo", { op: "view" }, { session, emitStatus: event => statuses.push(event) });
+
+		expect(phases[0]?.tasks[0]?.status).toBe("completed");
+		expect(statuses.map(event => event.committed)).toEqual([true, false]);
+		expect(JSON.stringify(statuses).length).toBeLessThan(500);
 	});
 
 	it("returns structured tool results when details or images are present", async () => {

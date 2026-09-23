@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it } from "bun:test";
+import { beforeAll, describe, expect, it, spyOn } from "bun:test";
 import type { FetchImpl } from "@oh-my-pi/pi-utils";
 // Import from source, not the package specifier: the workspace `node_modules`
 // copy resolves to the primary checkout, not this worktree.
@@ -38,6 +38,8 @@ interface ConfigInit {
 	disabled?: boolean;
 	displayOption?: DisplayOption;
 	isModelRouter?: boolean;
+	/** `ModelInfo.harnessUids` — non-empty marks a harness-backed composite, not an AssignModel slot. */
+	harnessUids?: string[];
 	/** `ClientModelConfig.maxTokens` — the context window. */
 	contextWindow?: number;
 	maxOutputTokens?: number;
@@ -48,7 +50,7 @@ interface ConfigInit {
 		supportsImages?: boolean;
 	};
 	supportsImages?: boolean;
-	dimensions?: readonly { label: string; value: number; denominator?: string }[];
+	dimensions?: readonly { label: string; value: number; denominator?: string; kind?: ModelDimensionKind }[];
 	/** `modelFamilyMetadata.modelFamilyLabel`. */
 	family?: string;
 	/** `Reasoning Effort` entry name; omitted means the family has no effort axis. */
@@ -129,7 +131,7 @@ function config(init: ConfigInit): ClientModelConfig {
 				label: dimension.label,
 				value: dimension.value,
 				denominator: dimension.denominator ?? "1M tokens",
-				kind: ModelDimensionKind.COST,
+				kind: dimension.kind ?? ModelDimensionKind.COST,
 			}),
 		),
 		...(init.family !== undefined
@@ -148,6 +150,7 @@ function config(init: ConfigInit): ClientModelConfig {
 						displayOption: init.displayOption ?? DisplayOption.UNSPECIFIED,
 						maxOutputTokens: init.maxOutputTokens ?? 64_000,
 						isModelRouter: init.isModelRouter ?? false,
+						harnessUids: init.harnessUids ?? [],
 						...(init.features !== undefined ? { modelFeatures: create(ModelFeaturesSchema, init.features) } : {}),
 					}),
 				}),
@@ -279,6 +282,43 @@ const FIXTURE_CONFIGS: readonly ClientModelConfig[] = [
 		family: "Adaptive",
 		effort: "Medium",
 	}),
+	// Harness-backed composite: router-flagged but a valid chat uid itself, so
+	// `AssignModel` must not be used. Its `modelDimensions` flatten the composite
+	// rate card plus each dispatched component's card, separated by `Sidekick`
+	// markers — only the headline card is priced.
+	config({
+		uid: "fusion",
+		label: "Fusion",
+		displayOption: DisplayOption.MODEL_ROUTER,
+		isModelRouter: true,
+		harnessUids: ["fusion"],
+		dimensions: [
+			{ label: "Input", value: 10 },
+			{ label: "Cached input", value: 0.25 },
+			{ label: "Output", value: 50 },
+			{ label: "Sidekick", value: 0, kind: ModelDimensionKind.UNSPECIFIED },
+			{ label: "Input", value: 3 },
+			{ label: "Cached input", value: 0.3 },
+			{ label: "Output", value: 15 },
+		],
+	}),
+	// Sparse headline card: no `Cached input` of its own, so a repeated-label
+	// heuristic would consume the component's cache rate as the composite's.
+	config({
+		uid: "fusion-sparse",
+		label: "Fusion Sparse",
+		displayOption: DisplayOption.MODEL_ROUTER,
+		isModelRouter: true,
+		harnessUids: ["fusion"],
+		dimensions: [
+			{ label: "Input", value: 10 },
+			{ label: "Output", value: 50 },
+			{ label: "Sidekick", value: 0, kind: ModelDimensionKind.UNSPECIFIED },
+			{ label: "Cached input", value: 0.3 },
+			{ label: "Input", value: 3 },
+			{ label: "Output", value: 15 },
+		],
+	}),
 	// Internal display slots: requested so the server reveals them, never exposed.
 	config({ uid: "quick-review-internal", displayOption: DisplayOption.QUICK_REVIEW }),
 	config({ uid: "internal-default", displayOption: DISPLAY_OPTION_INTERNAL_DEFAULT }),
@@ -390,6 +430,42 @@ describe("devin native discovery request", () => {
 		expect(requestMetadata?.apiKey).toBe("devin-session-token$fixture-token");
 	});
 
+	it("falls back to the legacy Windsurf identity when native discovery returns only the seed", async () => {
+		const nativePayload = toBinary(
+			GetCliModelConfigsResponseSchema,
+			create(GetCliModelConfigsResponseSchema, {
+				clientModelConfigs: [config({ uid: "swe-1-6" }), config({ uid: "swe-1-6-fast" })],
+			}),
+		);
+		const legacyPayload = toBinary(
+			GetCliModelConfigsResponseSchema,
+			create(GetCliModelConfigsResponseSchema, {
+				clientModelConfigs: [
+					config({ uid: "swe-1-6" }),
+					config({ uid: "swe-1-6-fast" }),
+					config({ uid: "glm-5-2" }),
+				],
+			}),
+		);
+		const requests: Metadata[] = [];
+		const fetchImpl: FetchImpl = async (_input, init) => {
+			const metadata = fromBinary(
+				GetCliModelConfigsRequestSchema,
+				new Uint8Array(init?.body as Uint8Array),
+			).metadata;
+			if (metadata === undefined) throw new Error("expected discovery metadata");
+			requests.push(metadata);
+			const payload = metadata.ideName === "windsurf" ? legacyPayload : nativePayload;
+			return new Response(payload, { status: 200, headers: { "content-type": "application/proto" } });
+		};
+
+		const discovered = await fetchDevinModels({ apiKey: "legacy-key", fetch: fetchImpl });
+
+		expect(discovered?.map(entry => entry.id)).toEqual(["glm-5-2", "swe-1-6", "swe-1-6-fast"]);
+		expect(requests.map(metadata => metadata.ideName)).toEqual(["chisel", "windsurf"]);
+		expect(requests[1]?.apiKey).toBe("legacy-key");
+	});
+
 	it("treats an empty-but-200 catalog as failed discovery so the seed survives", async () => {
 		const emptyPayload = toBinary(
 			GetCliModelConfigsResponseSchema,
@@ -431,6 +507,19 @@ describe("devin native display filtering", () => {
 		expect(adaptive.contextWindow).toBe(200_000);
 		expect(adaptive.maxTokens).toBe(64_000);
 		expect(adaptive.baseUrl).toBe("https://server.codeium.com");
+	});
+
+	it("surfaces a harness-backed composite as a direct-chat model, not an AssignModel router", () => {
+		const fusion = model("fusion");
+		expect(fusion.compat?.modelRouter).toBeUndefined();
+		// Composite dims flatten the composite card plus each component's card;
+		// only the headline card is the model's own rate.
+		expect(fusion.cost).toEqual({ input: 10, output: 50, cacheRead: 0.25, cacheWrite: 0 });
+	});
+
+	it("stops composite pricing at the Sidekick marker even with a sparse headline card", () => {
+		const fusion = model("fusion-sparse");
+		expect(fusion.cost).toEqual({ input: 10, output: 50, cacheRead: 0, cacheWrite: 0 });
 	});
 });
 
@@ -614,5 +703,48 @@ describe("devin catalog seed", () => {
 			"https://cascade.internal",
 			"https://cascade.internal",
 		]);
+	});
+});
+
+describe("devin cost-fallback", () => {
+	const zero = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+
+	function spec(id: string, cost = zero): ModelSpec<"devin-agent"> {
+		return {
+			id,
+			name: id,
+			api: "devin-agent",
+			provider: "devin",
+			baseUrl: "https://server.codeium.com",
+			reasoning: true,
+			input: ["text"],
+			supportsTools: true,
+			cost,
+			contextWindow: 200_000,
+			maxTokens: 128_000,
+		};
+	}
+
+	it("prices plan-included SWE-2 at the promo fallback without a recurring tariff", () => {
+		const model = buildModel(spec("swe-2"));
+		expect(model.cost).toMatchObject({ input: 0.75, output: 3.75, cacheRead: 0.075, cacheWrite: 0.75 });
+		expect(model.cost.timeBased).toBeUndefined();
+	});
+
+	it("switches the SWE-2 fallback to list after the promo ends", () => {
+		const clock = spyOn(Date, "now").mockReturnValue(Date.parse("2027-01-01T00:00:00Z"));
+		try {
+			const model = buildModel(spec("swe-2"));
+			expect(model.cost).toMatchObject({ input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3 });
+			expect(model.cost.timeBased).toBeUndefined();
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
+	it("does not overwrite a discovery row that already has token prices", () => {
+		const model = buildModel(spec("swe-2", { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3 }));
+		expect(model.cost).toMatchObject({ input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3 });
+		expect(model.cost.timeBased).toBeUndefined();
 	});
 });
