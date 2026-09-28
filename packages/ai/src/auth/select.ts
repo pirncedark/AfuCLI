@@ -6,7 +6,13 @@ import type { Provider } from "../types";
 import type { CredentialRankingContext, CredentialRankingStrategy, PlanGate, UsageReport } from "../usage";
 import type { RankingStrategyResolver } from "../usage/registry";
 import type { SessionAffinity } from "./affinity";
-import { credentialBlockScopesForRequest, DEFAULT_BLOCK_MS, providerTypeKey, type CredentialBlocks } from "./blocks";
+import {
+	AUTH_BLOCK_SCOPE,
+	credentialBlockScopesForRequest,
+	DEFAULT_BLOCK_MS,
+	providerTypeKey,
+	type CredentialBlocks,
+} from "./blocks";
 import type { AccountPolicies } from "./policy";
 import { authCredentialEquals, type CredentialPool } from "./pool";
 import {
@@ -525,6 +531,12 @@ export class CredentialSelector {
 		const blockScopes = credentialBlockScopesForRequest(provider, strategy, rankingContext, blockScope);
 		const planGate = strategy?.planGate?.(rankingContext);
 		const hasPlanRequirement = planGate !== undefined;
+		const accountIds = options?.accountIds?.length ? new Set(options.accountIds) : undefined;
+		const enforceAccounts =
+			accountIds !== undefined &&
+			credentials.some(
+				({ credential }) => credential.accountId !== undefined && accountIds.has(credential.accountId),
+			);
 		const hasAccountPolicy = credentials.some(
 			({ credential }) => this.#deps.policies.forCredential(provider, credential) !== undefined,
 		);
@@ -685,8 +697,18 @@ export class CredentialSelector {
 						refreshTarget,
 						credentialId,
 						options?.signal,
+						force ? options?.refreshReason : undefined,
 					);
-					const updated = mergeRefreshedCredential(candidate.selection.credential, refreshedCredentials);
+					const beforeRefresh = candidate.selection.credential;
+					const updated = mergeRefreshedCredential(beforeRefresh, refreshedCredentials);
+					if (credentialId !== undefined && authCredentialEquals(beforeRefresh, updated)) {
+						// The await may have allowed a peer to replace/remove this row or
+						// compact its index. Rebind by id without writing the cached result.
+						if (!this.#syncOAuthSelectionFromStore(provider, candidate.selection, credentialId)) {
+							preflightFailures.add(candidate);
+						}
+						return;
+					}
 					candidate.selection.credential = updated;
 					if (credentialId !== undefined) {
 						const idx = this.#deps.pool.replaceById(provider, credentialId, updated);
@@ -743,7 +765,7 @@ export class CredentialSelector {
 								providerKey,
 								latestIndex,
 								Date.now() + OAUTH_REFRESH_FAILURE_BACKOFF_MS,
-								blockScope,
+								AUTH_BLOCK_SCOPE,
 							);
 						}
 					}
@@ -793,15 +815,20 @@ export class CredentialSelector {
 		const passes: Array<{
 			allowBlocked: boolean;
 			enforcePlanRequirement: boolean;
+			enforceAccounts: boolean;
 		}> = [
-			{ allowBlocked: false, enforcePlanRequirement },
-			{ allowBlocked: true, enforcePlanRequirement },
+			{ allowBlocked: false, enforcePlanRequirement, enforceAccounts },
+			{ allowBlocked: true, enforcePlanRequirement, enforceAccounts },
 		];
-		if (enforcePlanRequirement) passes.push({ allowBlocked: true, enforcePlanRequirement: false });
+		if (enforcePlanRequirement) passes.push({ allowBlocked: true, enforcePlanRequirement: false, enforceAccounts });
+		if (enforceAccounts) passes.push({ allowBlocked: true, enforcePlanRequirement: false, enforceAccounts: false });
 
 		for (const pass of passes) {
 			for (const candidate of candidates) {
 				if (preflightFailures.has(candidate)) continue;
+				const candidateAccountId = candidate.selection.credential.accountId;
+				if (pass.enforceAccounts && (candidateAccountId === undefined || !accountIds?.has(candidateAccountId)))
+					continue;
 				const resolved = await this.tryOAuth(provider, candidate.selection, providerKey, sessionId, options, {
 					checkUsage,
 					allowBlocked: pass.allowBlocked,
@@ -1038,6 +1065,7 @@ export class CredentialSelector {
 					providerKey,
 					selection.index,
 					Date.now() + OAUTH_REFRESH_FAILURE_BACKOFF_MS,
+					AUTH_BLOCK_SCOPE,
 				);
 			}
 		}

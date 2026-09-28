@@ -38,6 +38,8 @@ import {
 	matchesSelectUp,
 } from "../keybinding-matchers";
 import { OverlayPanel, PanelDivider, PanelRows } from "../chrome/overlay-box";
+import { formatKeyHint } from "../app-keybindings";
+import { editorKey, editorKeys } from "../chrome/keybinding-hints";
 
 /** Local calendar-day activity consumed by the usage heatmap. */
 export interface DailyActivityPoint {
@@ -65,12 +67,19 @@ export interface CardWindowRow {
 	usedText?: string;
 }
 
+/** A connected account whose usage lookup produced no attributable report. */
+export interface UnavailableUsageAccount {
+	provider: string;
+	label: string;
+}
+
 /** Compact per-provider summary backing one card in the subscriptions grid. */
 export interface ProviderCard {
 	provider: string;
 	name: string;
-	/** Number of accounts reporting for this provider. */
+	/** Number of represented accounts, including unavailable usage lookups. */
 	accounts: number;
+	unavailableAccounts: string[];
 	/** Window rows sorted most-pressing first. */
 	windows: CardWindowRow[];
 	/** True when every account reports no limits (e.g. enterprise plans). */
@@ -83,6 +92,8 @@ export interface ProviderCard {
 		soonestExpiryMs?: number;
 		unavailableReasons: string[];
 	};
+	/** Labels of accounts with verified Daybreak access. */
+	daybreakAccounts?: string[];
 }
 
 /**
@@ -98,6 +109,15 @@ function aggregateStatus(limits: readonly { status?: UsageLimit["status"] }[]): 
 	if (hasWarning) return "warning";
 	if (hasExhausted) return "exhausted";
 	return "unknown";
+}
+
+/**
+ * Card status when some connected accounts reported no usage: the missing
+ * report raises the card to a warning but never hides an exhausted quota.
+ */
+function statusWithUnavailableAccounts(windows: readonly { status?: UsageLimit["status"] }[]): UsageLimit["status"] {
+	if (windows.length === 0) return "unknown";
+	return aggregateStatus(windows) === "exhausted" ? "exhausted" : "warning";
 }
 
 /** Fraction below which a window counts as untouched (renders as 100% free). */
@@ -125,7 +145,11 @@ function compactWindowTag(window: NonNullable<UsageLimit["window"]>): string {
  * most-used account's reset countdown. Cards sort most-pressing first so
  * what's burning is on top-left; fully idle providers collapse into a tick.
  */
-export function buildProviderCards(reports: UsageReport[], nowMs: number): ProviderCard[] {
+export function buildProviderCards(
+	reports: UsageReport[],
+	nowMs: number,
+	unavailableAccounts: readonly UnavailableUsageAccount[] = [],
+): ProviderCard[] {
 	const displayReports = collapseSharedUsageReports(reports);
 	const grouped = new Map<string, UsageReport[]>();
 	for (const report of displayReports) {
@@ -133,9 +157,15 @@ export function buildProviderCards(reports: UsageReport[], nowMs: number): Provi
 		list.push(report);
 		grouped.set(report.provider, list);
 	}
+	for (const account of unavailableAccounts) {
+		if (!grouped.has(account.provider)) grouped.set(account.provider, []);
+	}
 
 	const cards: ProviderCard[] = [];
 	for (const [provider, providerReports] of grouped) {
+		const unavailable = unavailableAccounts
+			.filter(account => account.provider === provider)
+			.map(account => account.label);
 		const buckets = new Map<string, { label: string; limits: UsageLimit[] }>();
 		for (const report of providerReports) {
 			for (const limit of report.limits) {
@@ -202,15 +232,31 @@ export function buildProviderCards(reports: UsageReport[], nowMs: number): Provi
 						unavailableReasons,
 					}
 				: undefined;
+		const daybreakAccounts = providerReports.flatMap((report, index) =>
+			report.metadata?.daybreak === true
+				? [
+						typeof report.metadata.email === "string" && report.metadata.email
+							? report.metadata.email
+							: typeof report.metadata.accountId === "string" && report.metadata.accountId
+								? report.metadata.accountId
+								: `account ${index + 1}`,
+					]
+				: [],
+		);
 		cards.push({
 			provider,
 			name: formatProviderName(provider),
-			accounts: providerReports.length,
+			accounts: providerReports.length + unavailable.length,
+			unavailableAccounts: unavailable,
 			windows,
-			unlimited: windows.length === 0,
+			unlimited: windows.length === 0 && unavailable.length === 0,
 			idle:
-				!resetCredits && windows.every(window => window.fraction !== undefined && window.fraction < IDLE_FRACTION),
+				unavailable.length === 0 &&
+				!resetCredits &&
+				daybreakAccounts.length === 0 &&
+				windows.every(window => window.fraction !== undefined && window.fraction < IDLE_FRACTION),
 			resetCredits,
+			...(daybreakAccounts.length > 0 ? { daybreakAccounts } : {}),
 		});
 	}
 
@@ -310,6 +356,7 @@ export function buildHeatmapLayout(points: DailyActivityPoint[], weeks: number, 
 /** Callbacks and data sources for {@link UsageDashboardComponent}. */
 export interface UsageDashboardOptions {
 	reports: UsageReport[];
+	unavailableAccounts?: readonly UnavailableUsageAccount[];
 	/**
 	 * Full classic `/usage` report for the expanded detail view; re-invoked per
 	 * terminal width.
@@ -377,7 +424,7 @@ export class UsageDashboardComponent implements Component {
 		ensureThemeSync();
 		this.#options = options;
 		this.#nowMs = Date.now();
-		this.#cards = buildProviderCards(options.reports, this.#nowMs);
+		this.#cards = buildProviderCards(options.reports, this.#nowMs, options.unavailableAccounts);
 		this.#panel = new OverlayPanel("Usage");
 		this.#header = new PanelRows();
 		this.#header.setHeight(1);
@@ -446,12 +493,22 @@ export class UsageDashboardComponent implements Component {
 
 	#renderCardLines(card: ProviderCard, width: number, labels: string[][], layout: CardRowLayout): string[] {
 		const lines: string[] = [];
-		const cardStatus = card.unlimited ? "ok" : aggregateStatus(card.windows);
+		const cardStatus =
+			card.unavailableAccounts.length > 0
+				? statusWithUnavailableAccounts(card.windows)
+				: card.unlimited
+					? "ok"
+					: aggregateStatus(card.windows);
 		const accountsText = card.accounts > 1 ? theme.fg("dim", `${card.accounts} accts`) : "";
 		const titleBudget = width - 2 - visibleWidth(accountsText) - (accountsText ? 1 : 0);
 		const title = theme.bold(truncateToWidth(card.name, Math.max(4, titleBudget)));
 		const titlePad = Math.max(0, width - 2 - visibleWidth(title) - visibleWidth(accountsText));
 		lines.push(`${this.#statusIcon(cardStatus)} ${title}${" ".repeat(titlePad)}${accountsText}`);
+
+		for (const account of card.daybreakAccounts ?? []) {
+			const label = sanitizeText(account.replace(/[\r\n\t]+/g, " "));
+			lines.push(`  ${theme.fg("success", truncateToWidth(`daybreak · ${label}`, width - 2))}`);
+		}
 
 		if (card.resetCredits) {
 			const resets = card.resetCredits;
@@ -469,6 +526,13 @@ export class UsageDashboardComponent implements Component {
 			if (resets.redeemableCount === 0 && resets.unavailableReasons.length > 0) {
 				const reason = sanitizeText(resets.unavailableReasons.join(" • ").replace(/[\r\n\t]+/g, " "));
 				lines.push(`  ${theme.fg("dim", truncateToWidth(`unavailable: ${reason}`, width - 2))}`);
+			}
+		}
+
+		for (const account of card.unavailableAccounts) {
+			const text = sanitizeDisplayLine(`${account} — usage unavailable`);
+			for (const line of wrapTextWithAnsi(text, Math.max(1, width - 2))) {
+				lines.push(`  ${theme.fg("dim", line)}`);
 			}
 		}
 
@@ -704,8 +768,12 @@ export class UsageDashboardComponent implements Component {
 		const checkedText = latestFetchedAt ? `checked ${formatDuration(this.#nowMs - latestFetchedAt)} ago` : "";
 		const title = this.#view === "detail" ? "Usage · Details" : "Usage";
 
-		const scrollHint = maxScroll > 0 ? "↑/↓ scroll · " : "";
-		const hint = this.#view === "detail" ? `${scrollHint}Esc back` : `${scrollHint}↵ details · Esc close`;
+		const scrollHint = maxScroll > 0 ? `${editorKeys("tui.select.up", "tui.select.down")} scroll · ` : "";
+		const cancel = editorKey("tui.select.cancel");
+		const hint =
+			this.#view === "detail"
+				? `${scrollHint}${cancel} back`
+				: `${scrollHint}${formatKeyHint("enter")} details · ${cancel} close`;
 		this.#panel.title = title;
 		this.#header.setLines([checkedText ? theme.fg("dim", checkedText) : ""]);
 		this.#body.setLines(contentSource.slice(this.#scroll, this.#scroll + contentRows));

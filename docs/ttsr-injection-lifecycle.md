@@ -22,8 +22,9 @@ This document covers the current Time Traveling Stream Rules (TTSR) runtime path
 At session creation, `createAgentSession()` loads discovered rules, constructs a `TtsrManager`, and buckets rules through `bucketRules(...)`:
 
 ```ts
-const ttsrSettings = settings.getGroup("ttsr");
-const ttsrManager = new TtsrManager(ttsrSettings);
+const ttsrSettings = cfgTtsr.get(settings);
+// Live source: enable/repeat/interrupt/context changes apply on the next check.
+const ttsrManager = new TtsrManager(() => cfgTtsr.get(settings));
 const rulesResult = await loadCapability<Rule>(ruleCapability.id, { cwd });
 const { rulebookRules, alwaysApplyRules } = bucketRules(
   rulesResult.items,
@@ -98,7 +99,8 @@ When assistant updates arrive and rules exist:
 - for tools exposing `matcherEntries(args)`, the streamed payload is projected per touched file into `{ path, digest }` entries (added lines only, same-path sections/hunks merged); each entry is checked in isolation via `checkSnapshot(entry.digest, perFileContext)` under its own file path and stream key (`<toolcall>#<path>`), so a path-scoped rule like `tool:edit(*.ts)` never fires on text belonging to a sibling Markdown hunk in a multi-file payload
 - otherwise, for tools exposing a combined `matcherDigest` (edit/write), replace the scoped buffer with the reconstructed source snapshot and call `checkSnapshot(snapshot, matchContext)`; otherwise append the delta into the scoped manager buffer and call `checkDelta(delta, matchContext)` (synchronous regex matching either way)
 - `checkDelta` skips buffering entirely for text/thinking sources when no registered rule allows that source (`canMatchText`/`canMatchThinking`), so unmatched prose/thinking deltas pay no buffering cost
-- when AST rules exist, `checkAstSnapshot` runs (awaited) on the same reconstructed per-file or single snapshot; identical consecutive snapshots for a stream key are skipped
+
+AST matching does not run in the streaming listener. The awaited `beforeToolCall` hook checks the finalized, validated execution arguments using the same per-file or combined source snapshot. An interrupt blocks the tool before its side effects, marks the assistant turn aborted, and follows the existing TTSR injection/retry path; `never` mode allows execution and attaches its reminder to the result. Streaming regex matching remains synchronous.
 
 `checkDelta()`/`checkSnapshot()` iterate registered rules and return all matching rules that pass scope, global path-glob, regex condition, and repeat policy checks. `checkAstSnapshot()` applies the same scope/path/repeat gates, infers language from the candidate file path, then tests each candidate rule's AST patterns. Regex and AST match arrays feed the same trigger-decision handler.
 
@@ -162,6 +164,8 @@ Non-interrupting matches split by `matchContext.source`:
   {{content}}
   </system-reminder>
   ```
+
+- **Eval-bridged AgentTool calls.** Finalized inner calls are checked at the `ExtensionToolWrapper` boundary; prelude host calls (`browser.*`, `computer.*`, `tab.run`) are not AgentTool dispatches and stay outside this path.
 
 - **`source === "text"` / `"thinking"` (prose-source match).** The rule is queued in the pending injections. After a successful non-error, non-aborted assistant message, `TtsrCoordinator` queues the hidden `ttsr-injection` custom message with `agent.followUp()` and schedules continuation after 1ms. These deferred non-interrupting prose matches do not emit `ttsr_triggered`; that event is emitted for actual interrupt paths and for non-interrupting per-tool reminders.
 
@@ -278,7 +282,7 @@ A rule with `question` is judged: its natural-language question goes to the `jud
 - `ttsr.judge`: `auto` (default) judges only when the judge role resolves to a native System One model (TypeSafe jev); `on` judges with whatever the role resolves to, including the session's chat model; `off` never judges. Question rules still register either way.
 - On `message_end` of an assistant message whose `stopReason` is neither `aborted` nor `error`, `TtsrCoordinator` splits the message into outputs: all text blocks as one `text` output, all thinking blocks as one `thinking` output, and each tool call as a `tool` output. Tools exposing `matcherEntries` yield one output per file, with the `{ path, digest }` digest as content; otherwise the `matcherDigest` or the raw JSON arguments.
 - For each output, `TtsrManager.judgedCandidates()` selects question rules that pass scope, `globs`, the repeat policy, and — when the rule also declares `condition`/`astCondition` — that prefilter against the completed content. No candidates → no request.
-- One judge request per output carries every candidate's question as a `noul` question over a shared state `{ output, content }` (content capped at 60,000 characters). Jev bills the state once per request, so rules sharing an output share its cost. Usage is journaled as `model_usage` with purpose `ttsr`.
+- One judge request per output carries every candidate's question as a `noul` question over a shared state `{ output, content }` (content cut to its longest prefix within 32,000 Jev tokens, counted locally with `Encoding.Jev`, so each branch stays under Jev's ~33k-token limit). Jev bills the state once per request, so rules sharing an output share its cost. Usage is journaled as `model_usage` with purpose `ttsr`.
 
 ### Delivery
 

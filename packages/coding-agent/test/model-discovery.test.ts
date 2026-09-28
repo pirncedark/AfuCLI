@@ -10,8 +10,12 @@ import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { resolveModelCacheProviderId, resolveOllamaModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-models";
-import type { ModelSpec, OpenAICompat } from "@oh-my-pi/pi-catalog/types";
-import { discoverOllamaModels, discoveryProbeTimeoutMs } from "@oh-my-pi/pi-coding-agent/config/model-discovery";
+import type { ModelKind, ModelSpec, OpenAICompat } from "@oh-my-pi/pi-catalog/types";
+import {
+	discoverOllamaModels,
+	discoverOpenAIModelsList,
+	discoveryProbeTimeoutMs,
+} from "@oh-my-pi/pi-coding-agent/config/model-discovery";
 import { RUNTIME_DYNAMIC_MODEL_FETCH_TIMEOUT_MS } from "@oh-my-pi/pi-coding-agent/config/model-provider-discovery";
 import { kNoAuth, ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { ProviderDiscoverySchema } from "@oh-my-pi/pi-coding-agent/config/models-config-schema";
@@ -1407,47 +1411,65 @@ describe("ModelRegistry runtime discovery", () => {
 		}
 	});
 
-	test("configured provider discovery accepts timeoutMs and passes it to probes", async () => {
-		const customConfigPath = path.join(tempDir, "models.yml");
-		fs.writeFileSync(
-			customConfigPath,
-			`
-providers:
-  custom-remote:
-    baseUrl: "http://127.0.0.1:8080"
-    api: "openai-completions"
-    auth: "none"
-    discovery:
-      type: "llama.cpp"
-      timeoutMs: 45000
-`,
-			"utf-8",
-		);
-
-		const fetchMock: FetchImpl = async input => {
-			const url = String(input);
-			if (url === "http://127.0.0.1:8080/models") {
-				return new Response(JSON.stringify({ data: [{ id: "remote-model-1" }] }), {
-					status: 200,
-					headers: { "Content-Type": "application/json" },
-				});
+	test("lm-studio discovery bounds a loopback probe without shrinking a remote host's budget", async () => {
+		// Regression (#12945): the lm-studio/openai-models-list probe used the flat
+		// remote budget, so every launch with no LM Studio listening on
+		// 127.0.0.1:1234 waited out the full connect timeout instead of the
+		// loopback cap the other implicit local engines honor.
+		vi.useFakeTimers();
+		try {
+			const hang = Promise.withResolvers<Response>();
+			const ctx = {
+				fetch: () => hang.promise,
+				getBearerApiKeyResolver: async () => undefined,
+			};
+			const loopback = discoverOpenAIModelsList(
+				{
+					provider: "lm-studio",
+					api: "openai-completions",
+					baseUrl: "http://127.0.0.1:1234/v1",
+					discovery: { type: "lm-studio" },
+					optional: true,
+				},
+				ctx,
+			);
+			const remote = discoverOpenAIModelsList(
+				{
+					provider: "lm-studio-remote",
+					api: "openai-completions",
+					baseUrl: "http://lm-studio.example:1234/v1",
+					discovery: { type: "lm-studio" },
+					optional: true,
+				},
+				ctx,
+			);
+			const outcomes = new Map<string, string>();
+			for (const [host, probe] of [
+				["loopback", loopback],
+				["remote", remote],
+			] as const) {
+				void probe.then(
+					() => outcomes.set(host, "resolved"),
+					error => outcomes.set(host, error instanceof DOMException ? error.name : String(error)),
+				);
 			}
-			if (url === "http://127.0.0.1:8080/props") {
-				return new Response(JSON.stringify({ default_generation_settings: { n_ctx: 32768 } }), {
-					status: 200,
-					headers: { "Content-Type": "application/json" },
-				});
-			}
-			throw new Error(`Unexpected URL: ${url}`);
-		};
 
-		const registry = new ModelRegistry(authStorage, customConfigPath, { fetch: fetchMock });
-		await registry.refresh();
-		const state = registry.getProviderDiscoveryState("custom-remote");
-		expect(state?.status).toBe("ok");
-		const models = getModelsForProvider(registry, "custom-remote");
-		expect(models.map(m => m.id)).toEqual(["remote-model-1"]);
+			// Both probes resolve their credential lookup before arming a deadline,
+			// so drain those microtasks before moving the clock. The drains are
+			// generous on purpose: asserting recorded outcomes (rather than awaiting
+			// a promise that a regression leaves pending) keeps a broken cap a
+			// failure instead of a hang.
+			for (let flush = 0; flush < 50; flush++) await Promise.resolve();
+			vi.advanceTimersByTime(1_000);
+			for (let flush = 0; flush < 50; flush++) await Promise.resolve();
+
+			expect(outcomes.get("loopback")).toBe("TimeoutError");
+			expect(outcomes.get("remote")).toBeUndefined();
+		} finally {
+			vi.useRealTimers();
+		}
 	});
+
 	test("configured llama.cpp Qwen model keeps its /v1 runtime URL despite a native-root baseUrl override", async () => {
 		writeRawModelsJson({
 			"llama.cpp": {
@@ -2477,6 +2499,76 @@ providers:
 		expect(registry.find("openai-test", "low")?.input).toEqual(["text"]);
 		// Silent server → default text-only fallback.
 		expect(registry.find("openai-test", "medium")?.input).toEqual(["text"]);
+	});
+
+	test("openai-models-list discovery routes explicit non-chat output modalities to their runner kind", async () => {
+		writeRawModelsJson({
+			"openai-test": {
+				baseUrl: "http://127.0.0.1:9995",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "openai-models-list" },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:9995/v1/models") {
+				return new Response(
+					JSON.stringify({
+						data: [
+							{
+								id: "openrouter/openai/text-embedding-3-small",
+								architecture: { input_modalities: ["text"], output_modalities: ["embeddings"] },
+								context_length: 8192,
+							},
+							{ id: "bare-embedder", output_modalities: ["embedding"] },
+							{ id: "image-generator", output: ["image"] },
+							{
+								id: "vision-chat",
+								architecture: { input_modalities: ["text", "image"], output_modalities: ["text"] },
+							},
+							{ id: "multimodal-chat", architecture: { output_modalities: ["text", "image"] } },
+							{ id: "speech-or-music", architecture: { output_modalities: ["audio"] } },
+						],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		// Embedding rows answer through `{baseUrl}/embeddings`, never the chat API.
+		expect(registry.find("openai-test", "openrouter/openai/text-embedding-3-small")).toMatchObject({
+			kind: "embedding",
+			api: "openai-embeddings",
+			baseUrl: "http://127.0.0.1:9995/v1",
+			contextWindow: 8192,
+			maxTokens: null,
+			supportsTools: false,
+		});
+		expect(registry.find("openai-test", "bare-embedder")?.kind).toBe("embedding");
+		expect(registry.find("openai-test", "image-generator")).toMatchObject({
+			kind: "image",
+			api: "openai-images",
+		});
+		// Text output — including multimodal rows — stays on the provider's chat API,
+		// and an audio-only row carries too little metadata to pick a runner.
+		for (const id of ["vision-chat", "multimodal-chat", "speech-or-music"]) {
+			const model = registry.find("openai-test", id);
+			expect(model?.kind).toBeUndefined();
+			expect(model?.api).toBe("openai-completions");
+		}
+		// The chat roster no longer offers models the chat endpoint cannot serve.
+		const rosterFor = (kind: ModelKind) =>
+			registry
+				.getAll(kind)
+				.filter(model => model.provider === "openai-test")
+				.map(model => model.id)
+				.sort();
+		expect(rosterFor("chat")).toEqual(["multimodal-chat", "speech-or-music", "vision-chat"]);
+		expect(rosterFor("embedding")).toEqual(["bare-embedder", "openrouter/openai/text-embedding-3-small"]);
+		expect(rosterFor("image")).toEqual(["image-generator"]);
 	});
 
 	test("openai-models-list with injectV1: false hits {baseUrl}/models verbatim", async () => {

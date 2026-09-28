@@ -3,9 +3,7 @@ import * as path from "node:path";
 import { CompactionCancelledError } from "@oh-my-pi/pi-agent-core/compaction";
 import { APP_NAME, logger, setProjectDir } from "@oh-my-pi/pi-utils";
 import { getUiLanguage, missingTranslations, setUiLanguage, translationCount } from "@oh-my-pi/pi-utils/i18n";
-import { reset as resetCapabilities } from "../capability";
 import { clearClaudePluginRootsCache } from "../discovery/helpers";
-import { loadSlashCommands } from "../extensibility/slash-commands";
 import { rebindMemoryBackendForCwd } from "../hindsight/backend";
 import { memoryStatsUnavailableMessage, resolveMemoryBackend } from "../memory-backend";
 import type { AgentSession, FreshSessionResult, HandoffResult } from "../session/agent-session";
@@ -47,17 +45,12 @@ async function generateRenameTitle(session: AgentSession, signal?: AbortSignal):
 	const revision = sessionManager.reserveTitleRevision();
 	const sessionId = sessionManager.getSessionId();
 	const titleSignal = session.titleGenerationSignal;
-	const cleanupProgress = session.notifyTitleGenerationStart();
-	try {
-		const title = await session.generateTitle(context, undefined, signal);
-		return !titleSignal.aborted &&
-			sessionManager.getSessionId() === sessionId &&
-			sessionManager.titleRevision === revision
-			? title
-			: undefined;
-	} finally {
-		cleanupProgress?.();
-	}
+	const title = await session.generateTitle(context, undefined, signal);
+	return !titleSignal.aborted &&
+		sessionManager.getSessionId() === sessionId &&
+		sessionManager.titleRevision === revision
+		? title
+		: undefined;
 }
 
 export const shutdownHandlerTui = (
@@ -999,13 +992,7 @@ async function rescopeHeadlessToCwd(runtime: SlashCommandRuntime, cwd: string): 
 	const src = discoverTitleSystemPromptFile(cwd);
 	const p = await resolvePromptInput(src, "title system prompt");
 	runtime.session.setTitleSystemPrompt(p);
-	resetCapabilities();
-	await runtime.session.refreshSkills();
-	const cmds = await loadSlashCommands({
-		cwd,
-		extensionRoots: runtime.session.effectiveExtensionRoots,
-	});
-	runtime.session.setSlashCommands(cmds);
+	await runtime.session.refreshSkillsAndCommands();
 	await runtime.refreshCommands?.();
 	await runtime.reloadPlugins();
 }

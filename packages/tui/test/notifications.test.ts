@@ -304,7 +304,7 @@ describe("terminal notifications", () => {
 		TERMINAL.sendNotification({ title: "-x session", body: "Complete", type: "completion" });
 
 		const titles = spawn.mock.calls.map(call => (call[0] as unknown as { cmd: string[] }).cmd[3]);
-		expect(titles).toEqual(["Oh My Pi", "-x session"]);
+		expect(titles).toEqual(["omp", "-x session"]);
 	});
 
 	it("keeps the OSC fallback when the Herdr pane id is absent", () => {

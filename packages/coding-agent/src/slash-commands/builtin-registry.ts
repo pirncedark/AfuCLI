@@ -72,8 +72,10 @@ export const BUILTIN_SLASH_COMMAND_DEFS: ReadonlyArray<BuiltinSlashCommand> = BU
 		name: command.name,
 		aliases: command.aliases,
 		allowArgs: command.allowArgs === true,
-		// afu-cli forku: adlar İngilizce kalır, yalnızca açıklamalar çevrilir.
-		description: t(command.description),
+		// Getter: some descriptions name keys, formatted at read time (theme/preset may change).
+		get description() {
+			return t(command.description);
+		},
 		icon: command.icon,
 		subcommands: localizeSubcommands(command.subcommands),
 		inlineHint: command.inlineHint,

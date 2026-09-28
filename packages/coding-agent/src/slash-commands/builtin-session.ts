@@ -1,11 +1,13 @@
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
+import { journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
 import type { AgentSession } from "../session/agent-session";
 import type { SessionOAuthAccountList } from "../session/agent-session-types";
 import {
 	getChangelogPath,
 	parseChangelog,
-	RECENT_CHANGELOG_ENTRY_LIMIT,
+	parseChangelogView,
 	renderChangelogEntries,
+	selectChangelogEntries,
 } from "../utils/changelog";
 import { formatTokenCount, refreshStatusLine } from "./builtin-modes";
 import { buildContextReportText } from "./helpers/context-report";
@@ -319,7 +321,9 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			if (snapshot.recent.length > 0) {
 				lines.push("", "Recent Jobs");
 				for (const job of snapshot.recent) {
-					lines.push(`  [${job.id}] ${job.type} (${job.status}) — ${formatCoarseDuration(now - job.startTime)}`);
+					lines.push(
+						`  [${job.id}] ${job.type} (${job.status}) — ${formatCoarseDuration((job.endTime ?? now) - job.startTime)}`,
+					);
 					lines.push(`    ${job.label}`);
 				}
 			}
@@ -389,8 +393,19 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			if ("error" in parsed) return usage(parsed.error, runtime);
 
 			await runtime.output("Syncing session files...");
+			// The Frustration page judges through this session's settings and
+			// registry; its cost lands on this session's ledger.
+			const judge = resolveJudge({
+				settings: runtime.settings,
+				registry: runtime.session.modelRegistry,
+				sessionId: runtime.session.sessionId,
+				purpose: "stats_frustration",
+				onUsage: journalJudgmentUsage(runtime.sessionManager),
+				telemetry: runtime.session.agent.telemetry,
+				cache: sharedJudgmentCache(),
+			});
 			try {
-				const result = await launchStatsDashboard(parsed);
+				const result = await launchStatsDashboard(parsed, async () => judge);
 				await runtime.output(result.message);
 			} catch (error) {
 				await runtime.output(`Stats dashboard failed: ${errorMessage(error)}`);
@@ -403,14 +418,18 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		icon: "news",
 		description: "Show changelog entries",
 		acpDescription: "Show changelog",
-		acpInputHint: "[full]",
-		subcommands: [{ name: "full", description: "Show complete changelog" }],
+		acpInputHint: "[full|last [N]]",
+		subcommands: [
+			{ name: "full", description: "Show complete changelog" },
+			{ name: "last", description: "Show the last N releases (default 1)", usage: "[N]" },
+		],
 		allowArgs: true,
 		handle: async (command, runtime) => {
+			const view = parseChangelogView(command.args);
+			if ("error" in view) return usage(view.error, runtime);
 			const changelogPath = getChangelogPath();
 			const allEntries = await parseChangelog(changelogPath);
-			const showFull = command.args.trim().toLowerCase() === "full";
-			const entriesToShow = showFull ? allEntries : allEntries.slice(0, RECENT_CHANGELOG_ENTRY_LIMIT);
+			const entriesToShow = selectChangelogEntries(allEntries, view);
 			if (entriesToShow.length === 0) {
 				await runtime.output("No changelog entries found.");
 				return commandConsumed();
@@ -419,8 +438,7 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			return commandConsumed();
 		},
 		handleTui: async (command, runtime) => {
-			const showFull = command.args.split(/\s+/).filter(Boolean).includes("full");
-			await runtime.ctx.handleChangelogCommand(showFull);
+			await runtime.ctx.handleChangelogCommand(command.args);
 			runtime.ctx.editor.setText("");
 		},
 	},
