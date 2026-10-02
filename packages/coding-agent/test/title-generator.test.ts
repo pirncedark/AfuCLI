@@ -13,9 +13,11 @@ import {
 	setExtensionTerminalTitle,
 	setSessionTerminalTitle,
 	setTerminalTitle,
+	setTerminalTitlePullRequest,
 	setTerminalTitleSpinnerStyle,
 	setTerminalTitleState,
 } from "@oh-my-pi/pi-coding-agent/utils/title-generator";
+import { setNativeRendering } from "@oh-my-pi/pi-tui/native/state";
 import { isWsl, logger, setTerminalHeadless } from "@oh-my-pi/pi-utils";
 import { mockWindowsConsoleTitle, type WindowsConsoleTitleMock } from "./terminal-title-test-utils";
 
@@ -854,7 +856,7 @@ const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
 // renders instead of skipping the platform: the contract under test — the override was
 // released, so the run state drives the title again — holds identically on both.
 function expectWorkingSeparator(title: string | undefined, label: string): void {
-	if (isWsl()) expect(title).toBe(`π : ${label}`);
+	if (isWsl()) expect(title).toBe(`ƒ : ${label}`);
 	else expect(SPINNER_FRAMES.some(frame => title?.includes(frame))).toBe(true);
 }
 
@@ -1001,14 +1003,14 @@ describe("terminal title runtime", () => {
 			resetEmitted();
 
 			setTerminalTitleState("working");
-			expect(emittedTitles()).toEqual(["π ⠋ windows-project"]);
+			expect(emittedTitles()).toEqual(["ƒ ⠋ windows-project"]);
 
 			resetEmitted();
 			vi.advanceTimersByTime(160);
 			const titles = emittedTitles();
 			expect(titles.length).toBeGreaterThan(0);
 			expect(titles.every(title => SPINNER_FRAMES.some(frame => title.includes(frame)))).toBe(true);
-			expect(titles.some(title => title !== "π ⠋ windows-project")).toBe(true);
+			expect(titles.some(title => title !== "ƒ ⠋ windows-project")).toBe(true);
 		} finally {
 			Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
 		}
@@ -1024,7 +1026,7 @@ describe("terminal title runtime", () => {
 			resetEmitted();
 
 			setTerminalTitleState("working");
-			expect(emittedTitles()).toEqual(["π : wsl-project"]);
+			expect(emittedTitles()).toEqual(["ƒ : wsl-project"]);
 
 			resetEmitted();
 			vi.advanceTimersByTime(400);
@@ -1095,7 +1097,7 @@ describe("terminal title runtime", () => {
 			native.succeeds = false;
 			setSessionTerminalTitle("windows-project-2");
 
-			expect(emittedTitles().at(-1)).toBe("π : windows-project-2");
+			expect(emittedTitles().at(-1)).toBe("ƒ : windows-project-2");
 			expect(vi.getTimerCount()).toBe(0);
 			resetEmitted();
 			vi.advanceTimersByTime(400);
@@ -1156,5 +1158,29 @@ describe("terminal title runtime", () => {
 		expect(last).toBeDefined();
 		expect(last).toContain("my-session");
 		expectWorkingSeparator(last, "my-session");
+	});
+
+	it("titles the tab with the bare session name while a TSP terminal renders, and restores the run state after", () => {
+		setSessionTerminalTitle("Ack path refactor");
+		setTerminalTitleState("working");
+		try {
+			setNativeRendering(true);
+			resetEmitted();
+			// The terminal shows run state itself: no brand, no spinner ticks.
+			vi.advanceTimersByTime(400);
+			setTerminalTitlePullRequest(412);
+			expect(emittedTitles()).toEqual(["Ack path refactor · #412"]);
+
+			setSessionTerminalTitle("Renamed");
+			expect(emittedTitles().at(-1)).toBe("Renamed · #412");
+			setSessionTerminalTitle(undefined);
+			setTerminalTitlePullRequest(undefined);
+			expect(emittedTitles().at(-1)).toBe("afu");
+			setSessionTerminalTitle("Renamed");
+		} finally {
+			setNativeRendering(false);
+			setTerminalTitlePullRequest(undefined);
+		}
+		expectWorkingSeparator(emittedTitles().at(-1), "Renamed");
 	});
 });
