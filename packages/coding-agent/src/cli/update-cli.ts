@@ -32,6 +32,16 @@ import {
 import { cfgUpdateChannel } from "../modes/settings";
 
 const REPO = "can1357/oh-my-pi";
+const WINDOWS_REPO = "pirncedark/afu-cli";
+const WINDOWS_BINARY = "afu-windows-x64.exe";
+
+function binaryRepository(binaryName: string): string {
+	return binaryName === WINDOWS_BINARY ? WINDOWS_REPO : REPO;
+}
+
+function binaryTagPrefix(binaryName: string): string {
+	return binaryName === WINDOWS_BINARY ? "afu-v" : "v";
+}
 const PACKAGE = "@oh-my-pi/pi-coding-agent";
 const HOMEBREW_FORMULA = "can1357/tap/omp";
 const MISE_TOOL = "github:can1357/oh-my-pi";
@@ -274,13 +284,13 @@ export function resolveReleaseBinaryAsset(
 		throw new Error(`GitHub release asset ${binaryName} has an unsupported digest`);
 	}
 
-	const expectedUrl = `https://github.com/${REPO}/releases/download/${expectedTag}/${binaryName}`;
+	const expectedUrl = `https://github.com/${binaryRepository(binaryName)}/releases/download/${expectedTag}/${binaryName}`;
 	if (asset.browser_download_url !== expectedUrl) {
 		throw new Error(`GitHub release asset ${binaryName} has an unexpected download URL`);
 	}
 
 	return {
-		version: expectedTag.replace(/^v/, ""),
+		version: expectedTag.replace(/^(?:afu-)?v/, ""),
 		url: expectedUrl,
 		size: asset.size,
 		digest: `sha256:${digest.toLowerCase()}`,
@@ -310,14 +320,15 @@ export function selectFallbackBinaryAsset(
 ): ReleaseBinaryAsset | undefined {
 	if (!Array.isArray(releases)) return undefined;
 	const candidates: Array<{ tag: string; release: unknown }> = [];
+	const prefix = binaryTagPrefix(binaryName);
 	for (const release of releases) {
 		if (!isRecord(release)) continue;
 		const tag = release.tag_name;
-		if (typeof tag !== "string" || !/^v\d/.test(tag)) continue;
-		if (compareVersions(tag.slice(1), minVersion) <= 0) continue;
+		if (typeof tag !== "string" || !tag.startsWith(prefix) || !/^\d/.test(tag.slice(prefix.length))) continue;
+		if (compareVersions(tag.slice(prefix.length), minVersion) <= 0) continue;
 		candidates.push({ tag, release });
 	}
-	candidates.sort((a, b) => compareVersions(b.tag.slice(1), a.tag.slice(1)));
+	candidates.sort((a, b) => compareVersions(b.tag.slice(prefix.length), a.tag.slice(prefix.length)));
 	for (const { tag, release } of candidates) {
 		try {
 			return resolveReleaseBinaryAsset(release, tag, binaryName, options);
@@ -365,10 +376,11 @@ async function getReleaseBinaryAsset(
 	githubToken?: string,
 	allowPrerelease = false,
 ): Promise<ReleaseBinaryAsset> {
-	const tag = `v${expectedVersion}`;
+	const tag = `${binaryTagPrefix(binaryName)}${expectedVersion}`;
+	const repo = binaryRepository(binaryName);
 	const token = githubToken ?? (await resolveGitHubToken());
 	const response = await fetchReleaseMetadata(
-		`${GITHUB_API}/repos/${REPO}/releases/tags/${encodeURIComponent(tag)}`,
+		`${GITHUB_API}/repos/${repo}/releases/tags/${encodeURIComponent(tag)}`,
 		fetchImpl,
 		token,
 	);
@@ -380,7 +392,7 @@ async function getReleaseBinaryAsset(
 	}
 
 	const listing = await fetchReleaseMetadata(
-		`${GITHUB_API}/repos/${REPO}/releases?per_page=${RELEASE_LISTING_PAGE_SIZE}`,
+		`${GITHUB_API}/repos/${repo}/releases?per_page=${RELEASE_LISTING_PAGE_SIZE}`,
 		fetchImpl,
 		token,
 	);
@@ -1022,6 +1034,30 @@ async function fetchLatestManifest(
 	return { version: data.version, manifest: data };
 }
 
+/** Resolve standalone Windows updates solely from published AFU releases. */
+export async function getLatestWindowsRelease(
+	options: { channel?: UpdateChannel; githubToken?: string } = {},
+	fetchImpl: Fetch = fetch,
+): Promise<ReleaseInfo> {
+	const response = await fetchReleaseMetadata(
+		`${GITHUB_API}/repos/${WINDOWS_REPO}/releases?per_page=${RELEASE_LISTING_PAGE_SIZE}`,
+		fetchImpl,
+		options.githubToken ?? (await resolveGitHubToken()),
+	);
+	if (!response.ok) throw new Error("Güncelleme kontrol edilemedi; bağlantınızı kontrol edip tekrar deneyin.");
+	const asset = selectFallbackBinaryAsset(await response.json(), WINDOWS_BINARY, "0.0.0", {
+		allowPrerelease: options.channel === "canary",
+	});
+	if (!asset) throw new Error("AFU güncellemesi bulunamadı; daha sonra tekrar deneyin.");
+	return {
+		tag: `afu-v${asset.version}`,
+		version: asset.version,
+		dist: "binary",
+		packages: { ...CURRENT_PACKAGES },
+		registry: DEFAULT_NPM_REGISTRY,
+	};
+}
+
 /**
  * Get the latest release info from the npm registry, following `omp.rename`
  * pointers ({@link resolveReleaseRename}) when the package has moved to a new
@@ -1036,6 +1072,9 @@ async function fetchLatestManifest(
 export async function getLatestRelease(
 	options: { timeoutMs?: number; channel?: UpdateChannel; registries?: NpmRegistryResolver } = {},
 ): Promise<ReleaseInfo> {
+	if (process.platform === "win32" && process.arch === "x64" && process.env.PI_COMPILED === "true") {
+		return getLatestWindowsRelease(options);
+	}
 	const timeoutMs = options.timeoutMs ?? RELEASE_METADATA_TIMEOUT_MS;
 	const channel = options.channel ?? "stable";
 	const registries = options.registries ?? (await loadNpmRegistryResolver());
@@ -1328,6 +1367,7 @@ export function isMuslLinuxForTest(options: Required<MuslDetectionOptions>): boo
 function getBinaryName(): string {
 	const platform = process.platform;
 	const arch = process.arch;
+	if (platform === "win32" && arch === "x64") return WINDOWS_BINARY;
 
 	let os: string;
 	switch (platform) {
@@ -2247,7 +2287,7 @@ export async function updateViaShimTakeover(
  */
 function installerHint(): string {
 	return process.platform === "win32"
-		? "& ([scriptblock]::Create((irm https://omp.sh/install.ps1))) -Binary"
+		? "irm https://raw.githubusercontent.com/pirncedark/afu-cli/afu-cli/scripts/afu-kur.ps1 | iex"
 		: "curl -fsSL https://omp.sh/install | sh -s -- --binary";
 }
 

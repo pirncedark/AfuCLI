@@ -8,6 +8,16 @@ import { compileCodingAgent } from "../packages/coding-agent/scripts/compile-bin
 const repoRoot = path.join(import.meta.dir, "..");
 
 describe("Windows release binary target", () => {
+	it("builds the AFU asset with the baseline Bun runtime", async () => {
+		const result = await $`bun scripts/ci-release-build-binaries.ts --dry-run --targets win32-x64 --afu`
+			.cwd(repoRoot)
+			.quiet()
+			.nothrow();
+		expect(result.exitCode).toBe(0);
+		expect(result.text()).toContain(
+			"DRY RUN Bun.build target=bun-windows-x64-baseline outfile=packages/coding-agent/binaries/afu-windows-x64.exe",
+		);
+	});
 	it("builds both Windows architecture release assets with their native runtimes", async () => {
 		const result = await $`bun scripts/ci-release-build-binaries.ts --dry-run --targets win32-x64,win32-arm64`
 			.cwd(repoRoot)

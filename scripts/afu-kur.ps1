@@ -1,94 +1,88 @@
-# ============================================================
-#  AFU CLI kurulum (Windows x64) - Turkce aciklamali surum
-# ------------------------------------------------------------
-#  Kullanim (PowerShell):
-#    irm https://raw.githubusercontent.com/pirncedark/afu-cli/afu-cli/scripts/afu-kur.ps1 | iex
-#
-#  Yaptiklari:
-#    1) Git ve Bun yoksa kurar
-#    2) afu-cli dalini %USERPROFILE%\afu-cli klasorune klonlar (varsa gunceller)
-#    3) bun install
-#    4) Derlenmis native modulu (pi_natives .node) GitHub Release'ten indirir
-#    5) "afu" komutunu PATH'e ekler
-#  Login bilgisi TASIMAZ: herkes kendi hesabiyla /login yapar.
-# ============================================================
-$ErrorActionPreference = "Stop"
+﻿# irm https://raw.githubusercontent.com/pirncedark/afu-cli/afu-cli/scripts/afu-kur.ps1 | iex
+[CmdletBinding()]
+param(
+    [string]$KaynakExe,
+    [string]$Hedef = (Join-Path $env:LOCALAPPDATA 'Programs\AFU'),
+    [bool]$PathEkleme = $true
+)
 
-$Repo       = "https://github.com/pirncedark/afu-cli.git"
-$Branch     = "afu-cli"
-$NativeTag  = "afu-natives-18.1.14"
-$NativeName = "pi_natives.win32-x64-baseline.node"
-$NativeUrl  = "https://github.com/pirncedark/afu-cli/releases/download/$NativeTag/$NativeName"
-$Dir        = Join-Path $env:USERPROFILE "afu-cli"
-$BinDir     = Join-Path $env:LOCALAPPDATA "afu"
-
-function Adim($m) { Write-Host "`n>> $m" -ForegroundColor Cyan }
-# PowerShell 5.1'de exe hatalari script'i durdurmaz; cikis kodunu elle kontrol et
-function Kontrol($m) { if ($LASTEXITCODE -ne 0) { throw "$m basarisiz (cikis kodu $LASTEXITCODE)" } }
-function Yenile-Path {
-  $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
-              [Environment]::GetEnvironmentVariable("Path", "User") + ";" +
-              (Join-Path $env:USERPROFILE ".bun\bin")
+& {
+    $ErrorActionPreference = 'Stop'
+    $ProgressPreference = 'SilentlyContinue'
+    $GeciciExe = $null
+    $GeciciSha = $null
+    $Hata = 'AFU kurulamadı; pencereyi kapatıp kurulumu tekrar deneyin.'
+    try {
+        if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64' -and $env:PROCESSOR_ARCHITEW6432 -ne 'AMD64') {
+            $Hata = 'Bu cihaz desteklenmiyor; Windows x64 bir cihazda tekrar deneyin.'
+            throw $Hata
+        }
+        $Hedef = [IO.Path]::GetFullPath($Hedef)
+        New-Item -ItemType Directory -Force -Path $Hedef | Out-Null
+        $GeciciExe = Join-Path $Hedef (([guid]::NewGuid().ToString('N')) + '.exe')
+        $GeciciSha = $GeciciExe + '.sha256'
+        $KurulanExe = Join-Path $Hedef 'afu.exe'
+        if ($KaynakExe) {
+            $Hata = 'AFU dosyası okunamadı; kaynak dosyayı kontrol edip tekrar deneyin.'
+            Copy-Item -LiteralPath $KaynakExe -Destination $GeciciExe
+            $YanSha = $KaynakExe + '.sha256'
+            if (Test-Path -LiteralPath $YanSha) {
+                $ShaMetni = Get-Content -LiteralPath $YanSha -Raw
+            } else {
+                $ShaMetni = (Get-FileHash -LiteralPath $KaynakExe -Algorithm SHA256).Hash
+            }
+        } else {
+            $Hata = 'AFU indirilemedi; internet bağlantınızı kontrol edip kurulumu tekrar deneyin.'
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            $Url = 'https://github.com/pirncedark/afu-cli/releases/latest/download/afu-windows-x64.exe'
+            try {
+                Invoke-WebRequest -Uri $Url -OutFile $GeciciExe -UseBasicParsing
+                Invoke-WebRequest -Uri ($Url + '.sha256') -OutFile $GeciciSha -UseBasicParsing
+            } catch {
+                # Native-only releases can occupy GitHub's repository-wide latest slot.
+                $Surumler = Invoke-RestMethod -Uri 'https://api.github.com/repos/pirncedark/afu-cli/releases?per_page=30'
+                $SurumKaydi = $Surumler | Where-Object {
+                    -not $_.draft -and -not $_.prerelease -and $_.tag_name -match '^afu-v\d+\.\d+\.\d+$' -and
+                    @($_.assets | Where-Object { $_.name -eq 'afu-windows-x64.exe' -and $_.state -eq 'uploaded' }).Count -eq 1 -and
+                    @($_.assets | Where-Object { $_.name -eq 'afu-windows-x64.exe.sha256' -and $_.state -eq 'uploaded' }).Count -eq 1
+                } | Select-Object -First 1
+                if (-not $SurumKaydi) { throw $Hata }
+                $Url = 'https://github.com/pirncedark/afu-cli/releases/download/' + $SurumKaydi.tag_name + '/afu-windows-x64.exe'
+                Invoke-WebRequest -Uri $Url -OutFile $GeciciExe -UseBasicParsing
+                Invoke-WebRequest -Uri ($Url + '.sha256') -OutFile $GeciciSha -UseBasicParsing
+            }
+            $ShaMetni = Get-Content -LiteralPath $GeciciSha -Raw
+        }
+        $Hata = 'AFU dosyası doğrulanamadı; kurulumu tekrar deneyin.'
+        if ($ShaMetni.Trim() -notmatch '^([a-fA-F0-9]{64})(?:\s+\*?afu-windows-x64\.exe)?$') { throw $Hata }
+        $BeklenenSha = $Matches[1]
+        if ((Get-FileHash -LiteralPath $GeciciExe -Algorithm SHA256).Hash -ne $BeklenenSha) { throw $Hata }
+        $Hata = 'AFU başlatılamadı; dosyayı yeniden indirip kurulumu tekrar deneyin.'
+        $Surum = (& $GeciciExe --version 2>&1 | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0 -or $Surum -notmatch '^afu/\d+\.\d+\.\d+(?:[-+][\w.-]+)?$') { throw $Hata }
+        $Hata = 'AFU dosyası yerleştirilemedi; açık AFU pencerelerini kapatıp tekrar deneyin.'
+        Move-Item -LiteralPath $GeciciExe -Destination $KurulanExe -Force
+        $Surum = (& $KurulanExe --version 2>&1 | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0 -or $Surum -notmatch '^afu/\d+\.\d+\.\d+(?:[-+][\w.-]+)?$') { throw $Hata }
+        if ($PathEkleme) {
+            $Hata = 'AFU komutu eklenemedi; kurulumu tekrar deneyin.'
+            $KullaniciPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+            $DigerYollar = @($KullaniciPath -split ';' | Where-Object { $_ -and $_.TrimEnd('\') -ne $Hedef.TrimEnd('\') })
+            $YeniPath = (@($Hedef) + $DigerYollar) -join ';'
+            if ($YeniPath -cne $KullaniciPath) {
+                [Environment]::SetEnvironmentVariable('Path', $YeniPath, 'User')
+            }
+            $DigerYollar = @($env:Path -split ';' | Where-Object { $_ -and $_.TrimEnd('\') -ne $Hedef.TrimEnd('\') })
+            $env:Path = (@($Hedef) + $DigerYollar) -join ';'
+        }
+        Write-Host "AFU kuruldu. Yeni pencerede 'afu' yaz."
+    } catch {
+        throw $Hata
+    } finally {
+        foreach ($Dosya in @($GeciciExe, $GeciciSha)) {
+            if ($Dosya -and (Test-Path -LiteralPath $Dosya)) {
+                Remove-Item -LiteralPath $Dosya -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
 }
-
-if ($env:PROCESSOR_ARCHITECTURE -ne "AMD64") {
-  throw "Bu kurulum sadece Windows x64 icindir (bulunan: $env:PROCESSOR_ARCHITECTURE)."
-}
-
-Adim "Git kontrol"
-if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-  winget install --id Git.Git -e --silent --accept-package-agreements --accept-source-agreements
-  Yenile-Path
-  if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw "Git kurulamadi. https://git-scm.com adresinden elle kurup tekrar calistir." }
-}
-git --version
-
-Adim "Bun kontrol"
-Yenile-Path
-if (-not (Get-Command bun -ErrorAction SilentlyContinue)) {
-  powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://bun.sh/install.ps1 | iex"
-  Yenile-Path
-  if (-not (Get-Command bun -ErrorAction SilentlyContinue)) { throw "Bun kurulamadi. https://bun.sh adresinden elle kurup tekrar calistir." }
-}
-bun --version
-
-Adim "Kaynak kod ($Branch)"
-if (Test-Path (Join-Path $Dir ".git")) {
-  git -C $Dir fetch --depth 1 origin $Branch; Kontrol "git fetch"
-  git -C $Dir reset --hard "origin/$Branch"; Kontrol "git reset"
-} else {
-  git clone --depth 1 --branch $Branch --single-branch $Repo $Dir; Kontrol "git clone"
-}
-
-Adim "Bagimliliklar (bun install)"
-Push-Location $Dir
-try { bun install; Kontrol "bun install" } finally { Pop-Location }
-
-Adim "Native modul indiriliyor (~171 MB)"
-$NativePath = Join-Path $Dir "packages\natives\native\$NativeName"
-if (-not (Test-Path $NativePath) -or (Get-Item $NativePath).Length -lt 100MB) {
-  $ProgressPreference = "SilentlyContinue"
-  Invoke-WebRequest -Uri $NativeUrl -OutFile $NativePath -UseBasicParsing
-}
-Write-Host ("  " + [math]::Round((Get-Item $NativePath).Length / 1MB) + " MB")
-
-Adim "afu komutu olusturuluyor"
-New-Item -ItemType Directory -Force $BinDir | Out-Null
-$Bun = (Get-Command bun).Source
-$Cmd = "@echo off`r`n`"$Bun`" `"$Dir\packages\coding-agent\src\cli.ts`" %*`r`n"
-[IO.File]::WriteAllText((Join-Path $BinDir "afu.cmd"), $Cmd, [Text.Encoding]::ASCII)
-
-$UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if (($UserPath -split ";") -notcontains $BinDir) {
-  [Environment]::SetEnvironmentVariable("Path", ($UserPath.TrimEnd(";") + ";" + $BinDir), "User")
-}
-Yenile-Path; $env:Path += ";$BinDir"
-
-Adim "Test"
-& (Join-Path $BinDir "afu.cmd") --version; Kontrol "afu --version"
-
-Write-Host "`nKURULUM TAMAM." -ForegroundColor Green
-Write-Host "  1) Yeni bir terminal ac"
-Write-Host "  2) afu   yaz"
-Write-Host "  3) Icerde /login ile KENDI hesabinla giris yap"
-Write-Host "  Dil: /lang (tr <-> en)   Guncelleme: bu komutu tekrar calistir"

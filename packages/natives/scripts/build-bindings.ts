@@ -60,10 +60,15 @@ const rustDir = path.join(repoRoot, "crates/pi-natives");
 const nativeDir = path.join(import.meta.dir, "../native");
 const packageJsonPath = path.join(import.meta.dir, "../package.json");
 
+const variantIndex = process.argv.indexOf("--variant");
+const requestedVariant = variantIndex >= 0 ? process.argv[variantIndex + 1] : undefined;
+if (variantIndex >= 0 && (process.arch !== "x64" || !["baseline", "modern"].includes(requestedVariant ?? ""))) {
+	throw new Error("--variant requires an x64 host and baseline or modern");
+}
 const localAddon = resolveLocalHostAddon({
 	platform: process.platform,
 	arch: process.arch,
-	avx2: detectHostAvx2Support(),
+	avx2: requestedVariant ? requestedVariant === "modern" : detectHostAvx2Support(),
 });
 const effectiveVariant = localAddon.x64Variant;
 const variantSuffix = effectiveVariant ? `-${effectiveVariant}` : "";

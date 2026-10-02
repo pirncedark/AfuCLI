@@ -28,6 +28,7 @@ if (
 const transformersVersion = transformersManifest.version;
 // Worker threads re-enter the binary's single CLI host entry.
 const isDryRun = process.argv.includes("--dry-run");
+const isAfuRelease = process.argv.includes("--afu");
 const targets: BinaryTarget[] = [
 	{
 		id: "darwin-arm64",
@@ -129,6 +130,11 @@ async function embedNative(target: BinaryTarget): Promise<void> {
 		return;
 	}
 
+	if (isAfuRelease && target.id === "win32-x64") {
+		for (const variant of ["baseline", "modern"]) {
+			await fs.stat(path.join(repoRoot, "packages/natives/native", `pi_natives.win32-x64-${variant}.node`));
+		}
+	}
 	await runCommand(["bun", "run", "gen:native"], repoRoot, {
 		...Bun.env,
 		TARGET_PLATFORM: target.platform,
@@ -194,7 +200,12 @@ async function resetArtifacts(): Promise<void> {
 
 async function main(): Promise<void> {
 	const requestedTargets = parseRequestedTargets();
-	const selectedTargets = requestedTargets ? targets.filter(target => requestedTargets.has(target.id)) : targets;
+	const selectedTargets = (requestedTargets ? targets.filter(target => requestedTargets.has(target.id)) : targets).map(
+		target =>
+			isAfuRelease && target.id === "win32-x64"
+				? { ...target, outfile: "packages/coding-agent/binaries/afu-windows-x64.exe" }
+				: target,
+	);
 
 	if (requestedTargets) {
 		const unknownTargets = [...requestedTargets].filter(

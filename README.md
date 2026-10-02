@@ -18,7 +18,7 @@ irm https://raw.githubusercontent.com/pirncedark/afu-cli/afu-cli/scripts/afu-kur
 ```
 
 Sonra yeni bir terminal aç, `afu` yaz, içeride `/login` ile **kendi** hesabınla giriş yap.
-Git ve Bun yoksa script kendisi kurar; derlenmiş native modül hazır indirilir, Rust gerekmez.
+Hazır AFU uygulaması indirilir ve doğrulanır; Git, Bun veya Rust kurmanız gerekmez.
 Güncellemek için aynı komutu tekrar çalıştır ya da `afu update` / `/update`.
 
 ## omp'den farkı
@@ -26,7 +26,7 @@ Güncellemek için aynı komutu tekrar çalıştır ya da `afu update` / `/updat
 - **AFU markası** — `afu` komutu, AFU logosu, `ƒ` simgesi, bildirim ve sekme adları.
 - **Türkçe arayüz** — ~360 komut/bayrak açıklaması Türkçe; `/lang` ile Türkçe ↔ İngilizce.
 - **Sesli dikte** — Space'i ~2 sn basılı tutup bırak → Windows dikte (Win+H) açılır, konuştuğun metin kutuya yazılır.
-- **Kolay güncelleme** — `afu update` ve `/update`: upstream'i merge eder, `bun install` yapar.
+- **Kolay güncelleme** — `afu update` ve `/update`: Windows uygulamasını AFU release'inden günceller.
 - **Tek komut kurulum** — `afu-kur.ps1`.
 - **Düzeltmeler** — Windows'ta `session-stats` çökmesi ve repo temizliği.
 

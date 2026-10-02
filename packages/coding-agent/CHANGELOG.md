@@ -8,6 +8,8 @@
 
 ### Added
 
+- Windows users can install AFU as one verified executable without Git, Bun, or Rust and update it from AFU releases.
+
 - `/dump all` writes a zip to the temp directory with the main transcript, the LLM request JSON, and one file per subagent transcript (nested subagents included, killed ones marked aborted); the TUI copies the archive path to the clipboard. Plain `/dump` is unchanged ([#13908](https://github.com/can1357/oh-my-pi/pull/13908) by [@H4vC](https://github.com/H4vC))
 
 ### Changed
