@@ -77,7 +77,7 @@ jobs:
         run: |
           set -euo pipefail
           gh label create upstream-sync --color 0E8A16 --description "Upstream drift report" 2>/dev/null || true
-          ISSUE=$(gh issue list --label upstream-sync --state open --json number --jq '.[0].number // empty')
+          ISSUE=$(gh issue list --state open --search 'Upstream sync in:title' --json number,title --jq '[.[] | select(.title | startswith("Upstream sync"))][0].number // empty')
 
           if [ "$BEHIND" -eq 0 ]; then
             if [ -n "$ISSUE" ]; then
@@ -120,7 +120,7 @@ jobs:
           if [ -n "$ISSUE" ]; then
             gh issue edit "$ISSUE" --title "$TITLE" --body-file issue_body.md
           else
-            gh issue create --title "$TITLE" --label upstream-sync --body-file issue_body.md
+            gh issue create --title "$TITLE" --label upstream-sync --body-file issue_body.md \n              || gh issue create --title "$TITLE" --body-file issue_body.md
           fi
 
       - name: Push sync branch and open PR (only with UPSTREAM_SYNC_TOKEN)
