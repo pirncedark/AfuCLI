@@ -1,10 +1,17 @@
 # irm https://raw.githubusercontent.com/pirncedark/afu-cli/afu-cli/scripts/afu-kur.ps1 | iex
-[CmdletBinding()]
-param(
-    [string]$KaynakExe,
-    [string]$Hedef = (Join-Path $env:LOCALAPPDATA 'Programs\AFU'),
-    [bool]$PathEkleme = $true
-)
+# Not: `irm | iex` ile calisirken param() kullanilamaz; ayarlar ortam degiskenlerinden okunur.
+$KaynakExe = $env:AFU_KAYNAK_EXE
+$Hedef = if ($env:AFU_HEDEF) { $env:AFU_HEDEF } else { Join-Path $env:LOCALAPPDATA 'Programs\AFU' }
+$PathEkleme = $env:AFU_PATH_EKLEME -ne '0'
+
+# Get-FileHash modulune bagimli olmamak icin (bozuk PSModulePath'li makinelerde yuklenmeyebiliyor).
+function Dosya-Sha([string]$Yol) {
+    $Akis = [IO.File]::OpenRead($Yol)
+    try {
+        $Sha = [Security.Cryptography.SHA256]::Create()
+        try { return (($Sha.ComputeHash($Akis) | ForEach-Object { $_.ToString('x2') }) -join '') } finally { $Sha.Dispose() }
+    } finally { $Akis.Dispose() }
+}
 
 & {
     $ErrorActionPreference = 'Stop'
@@ -29,7 +36,7 @@ param(
             if (Test-Path -LiteralPath $YanSha) {
                 $ShaMetni = Get-Content -LiteralPath $YanSha -Raw
             } else {
-                $ShaMetni = (Get-FileHash -LiteralPath $KaynakExe -Algorithm SHA256).Hash
+                $ShaMetni = (Dosya-Sha $KaynakExe)
             }
         } else {
             $Hata = 'AFU indirilemedi; internet bağlantınızı kontrol edip kurulumu tekrar deneyin.'
@@ -56,7 +63,7 @@ param(
         $Hata = 'AFU dosyası doğrulanamadı; kurulumu tekrar deneyin.'
         if ($ShaMetni.Trim() -notmatch '^([a-fA-F0-9]{64})(?:\s+\*?afu-windows-x64\.exe)?$') { throw $Hata }
         $BeklenenSha = $Matches[1]
-        if ((Get-FileHash -LiteralPath $GeciciExe -Algorithm SHA256).Hash -ne $BeklenenSha) { throw $Hata }
+        if ((Dosya-Sha $GeciciExe) -ne $BeklenenSha) { throw $Hata }
         $Hata = 'AFU başlatılamadı; dosyayı yeniden indirip kurulumu tekrar deneyin.'
         $Surum = (& $GeciciExe --version 2>&1 | Out-String).Trim()
         if ($LASTEXITCODE -ne 0 -or $Surum -notmatch '^afu/\d+\.\d+\.\d+(?:[-+][\w.-]+)?$') { throw $Hata }
