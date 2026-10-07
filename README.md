@@ -11,10 +11,16 @@
 
 ## Kurulum (Windows x64)
 
-PowerShell'e yapıştır:
+**PowerShell** açıp yapıştır (pencerenin başında `PS` yazmalı):
 
 ```powershell
 irm https://raw.githubusercontent.com/pirncedark/AfuCLI/afu-cli/scripts/afu-kur.ps1 | iex
+```
+
+**Komut İstemi (CMD)** kullanıyorsan `'irm' is not recognized` hatası alırsın; onun yerine bunu yapıştır:
+
+```cmd
+powershell -NoProfile -Command "irm https://raw.githubusercontent.com/pirncedark/AfuCLI/afu-cli/scripts/afu-kur.ps1 | iex"
 ```
 
 Sonra yeni bir terminal aç, `afu` yaz, içeride `/login` ile **kendi** hesabınla giriş yap.
