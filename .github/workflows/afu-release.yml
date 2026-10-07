@@ -50,6 +50,19 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Baseline addon build failed.' }
           bun packages/natives/scripts/build-bindings.ts --variant modern
           if ($LASTEXITCODE -ne 0) { throw 'Modern addon build failed.' }
+      - name: Download Bun baseline runtime (retry, avoids flaky compile-time download)
+        run: |
+          $url = 'https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-windows-x64-baseline.zip'
+          $zip = Join-Path $env:RUNNER_TEMP 'bun-baseline.zip'
+          $dir = Join-Path $env:RUNNER_TEMP 'bun-baseline'
+          for ($i = 1; $i -le 4; $i++) {
+            try { Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing; break }
+            catch { if ($i -eq 4) { throw }; Start-Sleep -Seconds (5 * $i) }
+          }
+          Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+          $exe = Get-ChildItem -Path $dir -Recurse -Filter bun.exe | Select-Object -First 1
+          if (-not $exe) { throw 'bun.exe missing in baseline archive.' }
+          "AFU_BUN_BASELINE_EXE=$($exe.FullName)" >> $env:GITHUB_ENV
       - name: Compile standalone AFU
         run: bun run ci:release:build-binaries --targets win32-x64 --afu
       - name: Verify version and worker smoke test

@@ -157,7 +157,9 @@ async function buildBinary(target: BinaryTarget): Promise<void> {
 		entrypoint,
 		outfile: path.join(repoRoot, target.outfile),
 		transformersVersion,
-		target: target.target,
+		...(Bun.env.AFU_BUN_BASELINE_EXE && target.id === "win32-x64"
+			? { executablePath: Bun.env.AFU_BUN_BASELINE_EXE }
+			: { target: target.target }),
 		minifyIdentifiers: true,
 		skipBuiltinCodesign: shouldAdhocSignDarwinBinary(target),
 	});
