@@ -786,6 +786,7 @@ export class ProcessTerminal implements Terminal {
 	// Windows console fallback when kitty is unavailable: key records arrive as
 	// win32-input-mode sequences and are decoded before reaching the handler.
 	#win32InputDecoder?: Win32InputModeDecoder;
+	#win32KeyBuffer?: StdinBuffer;
 	#stdinBuffer?: StdinBuffer;
 	#stdinDataHandler?: (data: string) => void;
 	#disconnectHandler?: () => void;
@@ -1599,7 +1600,7 @@ export class ProcessTerminal implements Terminal {
 			if (this.#inputHandler) {
 				const win32Keys = this.#win32InputDecoder?.decode(sequence);
 				if (win32Keys !== undefined) {
-					for (const key of win32Keys) this.#inputHandler(key);
+					for (const key of win32Keys) this.#win32KeyBuffer?.process(key);
 					return;
 				}
 				// Windows console hosts drop AltGr text under kitty (AltGr+F → `CSI 102;3u`);
@@ -1892,6 +1893,10 @@ export class ProcessTerminal implements Terminal {
 			// and the mode splits arrow keys into Escape plus literal text (#14034).
 			this.#safeWrite("\x1b[?9001h");
 			this.#win32InputDecoder = new Win32InputModeDecoder();
+			// Console hosts can encode a VT mouse report as individual key records.
+			// Reassemble decoded bytes before Escape reaches the focused component.
+			this.#win32KeyBuffer = new StdinBuffer({ timeout: 50 });
+			this.#win32KeyBuffer.on("data", (sequence: string) => this.#inputHandler?.(sequence));
 			return;
 		}
 		// A remote terminal with no identifying env may not understand the request.
@@ -1904,6 +1909,8 @@ export class ProcessTerminal implements Terminal {
 		if (!this.#win32InputDecoder) return;
 		this.#safeWrite("\x1b[?9001l");
 		this.#win32InputDecoder = undefined;
+		this.#win32KeyBuffer?.destroy();
+		this.#win32KeyBuffer = undefined;
 	}
 
 	/**
