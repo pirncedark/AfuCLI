@@ -1,4 +1,4 @@
-# irm https://raw.githubusercontent.com/pirncedark/afu-cli/afu-cli/scripts/afu-kur.ps1 | iex
+# irm https://raw.githubusercontent.com/pirncedark/AfuCLI/afu-cli/scripts/afu-kur.ps1 | iex
 # Not: `irm | iex` ile calisirken param() kullanilamaz; ayarlar ortam degiskenlerinden okunur.
 $KaynakExe = $env:AFU_KAYNAK_EXE
 $Hedef = if ($env:AFU_HEDEF) { $env:AFU_HEDEF } else { Join-Path $env:LOCALAPPDATA 'Programs\AFU' }
@@ -41,20 +41,20 @@ function Dosya-Sha([string]$Yol) {
         } else {
             $Hata = 'AFU indirilemedi; internet bağlantınızı kontrol edip kurulumu tekrar deneyin.'
             [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-            $Url = 'https://github.com/pirncedark/afu-cli/releases/latest/download/afu-windows-x64.exe'
+            $Url = 'https://github.com/pirncedark/AfuCLI/releases/latest/download/afu-windows-x64.exe'
             try {
                 Invoke-WebRequest -Uri $Url -OutFile $GeciciExe -UseBasicParsing
                 Invoke-WebRequest -Uri ($Url + '.sha256') -OutFile $GeciciSha -UseBasicParsing
             } catch {
                 # Native-only releases can occupy GitHub's repository-wide latest slot.
-                $Surumler = Invoke-RestMethod -Uri 'https://api.github.com/repos/pirncedark/afu-cli/releases?per_page=30'
+                $Surumler = Invoke-RestMethod -Uri 'https://api.github.com/repos/pirncedark/AfuCLI/releases?per_page=30'
                 $SurumKaydi = $Surumler | Where-Object {
                     -not $_.draft -and -not $_.prerelease -and $_.tag_name -match '^afu-v\d+\.\d+\.\d+$' -and
                     @($_.assets | Where-Object { $_.name -eq 'afu-windows-x64.exe' -and $_.state -eq 'uploaded' }).Count -eq 1 -and
                     @($_.assets | Where-Object { $_.name -eq 'afu-windows-x64.exe.sha256' -and $_.state -eq 'uploaded' }).Count -eq 1
                 } | Select-Object -First 1
                 if (-not $SurumKaydi) { throw $Hata }
-                $Url = 'https://github.com/pirncedark/afu-cli/releases/download/' + $SurumKaydi.tag_name + '/afu-windows-x64.exe'
+                $Url = 'https://github.com/pirncedark/AfuCLI/releases/download/' + $SurumKaydi.tag_name + '/afu-windows-x64.exe'
                 Invoke-WebRequest -Uri $Url -OutFile $GeciciExe -UseBasicParsing
                 Invoke-WebRequest -Uri ($Url + '.sha256') -OutFile $GeciciSha -UseBasicParsing
             }

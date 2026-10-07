@@ -795,7 +795,7 @@ describe("migrateRenamedInstall transaction", () => {
 		const { steps, calls } = scriptedSteps({ install: [0, 0], verify: [false, false] });
 
 		await expect(migrateRenamedInstall(release, steps)).rejects.toThrow(
-			process.platform === "win32" ? "pirncedark/afu-cli" : "curl -fsSL https://omp.sh/install",
+			process.platform === "win32" ? "pirncedark/AfuCLI" : "curl -fsSL https://omp.sh/install",
 		);
 		expect(calls).toEqual(["install", "removeOld", "verify", "install", "verify"]);
 	});
@@ -809,7 +809,7 @@ describe("migrateRenamedInstall transaction", () => {
 			const { steps } = scriptedSteps({ install: [0, 0], verify: [false, false] });
 			const promise = migrateRenamedInstall(release, steps);
 			await expect(promise).rejects.toThrow(
-				"irm https://raw.githubusercontent.com/pirncedark/afu-cli/afu-cli/scripts/afu-kur.ps1",
+				"irm https://raw.githubusercontent.com/pirncedark/AfuCLI/afu-cli/scripts/afu-kur.ps1",
 			);
 			await expect(promise).rejects.not.toThrow("| sh");
 		} finally {

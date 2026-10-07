@@ -6,6 +6,10 @@
 
 - `SessionStorage.claimSessionFile(sessionPath)` is replaced by `claimSession(sessionId, sessionPath)` (which also refuses when the path now holds a different session), and `sessionOwnerLeasePath()` by `tryAcquireSessionLease(sessionId)`: custom storage backends that implemented `claimSessionFile` must implement `claimSession` to keep cross-process ownership ([#14095](https://github.com/can1357/oh-my-pi/pull/14095) by [@andrebrait](https://github.com/andrebrait))
 
+### Fixed
+
+- `afu update` on Windows failed with "AFU güncellemesi bulunamadı" because GitHub reports the renamed repository as `pirncedark/AfuCLI`; the download URL check is now case-insensitive and all AFU links use the canonical name. / `afu update` Windows'ta depo adı `AfuCLI` olarak değiştiği için güncelleme bulamıyordu; düzeltildi.
+
 ### Added
 
 - Windows users can install AFU as one verified executable without Git, Bun, or Rust and update it from AFU releases.

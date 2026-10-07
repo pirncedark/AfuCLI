@@ -19,7 +19,7 @@ function release(version: string) {
 				state: "uploaded",
 				size: 123,
 				digest,
-				browser_download_url: `https://github.com/pirncedark/afu-cli/releases/download/${tag}/${name}`,
+				browser_download_url: `https://github.com/pirncedark/AfuCLI/releases/download/${tag}/${name}`,
 			},
 		],
 	};
@@ -31,7 +31,7 @@ describe("AFU Windows releases", () => {
 			version: "18.4.13",
 			size: 123,
 			digest,
-			url: `https://github.com/pirncedark/afu-cli/releases/download/afu-v18.4.13/${name}`,
+			url: `https://github.com/pirncedark/AfuCLI/releases/download/afu-v18.4.13/${name}`,
 		});
 	});
 	it("ignores native-only and incomplete releases when choosing an AFU update", () => {
@@ -53,7 +53,7 @@ describe("AFU Windows releases", () => {
 			urls.push(String(input));
 			return Response.json([release("18.4.13")]);
 		});
-		expect(urls).toEqual(["https://api.github.com/repos/pirncedark/afu-cli/releases?per_page=30"]);
+		expect(urls).toEqual(["https://api.github.com/repos/pirncedark/AfuCLI/releases?per_page=30"]);
 		expect(latest.version).toBe("18.4.13");
 		expect(latest.dist).toBe("binary");
 	});

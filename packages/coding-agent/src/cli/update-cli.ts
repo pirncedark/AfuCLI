@@ -32,7 +32,7 @@ import {
 import { cfgUpdateChannel } from "../modes/settings";
 
 const REPO = "can1357/oh-my-pi";
-const WINDOWS_REPO = "pirncedark/afu-cli";
+const WINDOWS_REPO = "pirncedark/AfuCLI";
 const WINDOWS_BINARY = "afu-windows-x64.exe";
 
 function binaryRepository(binaryName: string): string {
@@ -285,7 +285,9 @@ export function resolveReleaseBinaryAsset(
 	}
 
 	const expectedUrl = `https://github.com/${binaryRepository(binaryName)}/releases/download/${expectedTag}/${binaryName}`;
-	if (asset.browser_download_url !== expectedUrl) {
+	// GitHub reports the canonical (renamed/case-changed) repo path, so compare case-insensitively.
+	const downloadUrl = asset.browser_download_url;
+	if (typeof downloadUrl !== "string" || downloadUrl.toLowerCase() !== expectedUrl.toLowerCase()) {
 		throw new Error(`GitHub release asset ${binaryName} has an unexpected download URL`);
 	}
 
@@ -2287,7 +2289,7 @@ export async function updateViaShimTakeover(
  */
 function installerHint(): string {
 	return process.platform === "win32"
-		? "irm https://raw.githubusercontent.com/pirncedark/afu-cli/afu-cli/scripts/afu-kur.ps1 | iex"
+		? "irm https://raw.githubusercontent.com/pirncedark/AfuCLI/afu-cli/scripts/afu-kur.ps1 | iex"
 		: "curl -fsSL https://omp.sh/install | sh -s -- --binary";
 }
 
