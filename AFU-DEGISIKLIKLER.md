@@ -64,6 +64,12 @@ Dosyalar: `modes/controllers/input-controller.ts`, `modes/components/custom-edit
 - Başarılı merge, fork'a (`origin`) push edilir, ardından `bun install`.
 - Oturum içinden kullanmak için yeni slash komutu: `/update [--force] [--check]`.
 
+## Otomatik denetim
+
+- Haftada bir Pazartesi 06:00 UTC'de GitHub Actions `afu-upstream-sync` workflow'u çalışır.
+- `scripts/afu-upstream-sync.sh` script'i merge testi, test çalıştırma ve PR açma işlemlerini yerine getirir.
+- `UPSTREAM_SYNC_TOKEN` (isteğe bağlı PAT) varsa otomatik PR oluşturulur; yoksa elle push'lanır.
+
 Dosyalar: `cli/update-cli.ts`, `slash-commands/builtin-lifecycle.ts`, `slash-commands/builtin-registry.ts`.
 
 ## 5. Tek komut Windows kurulumu

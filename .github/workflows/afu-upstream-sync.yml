@@ -1,0 +1,101 @@
+name: Upstream Sync
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    name: Check upstream updates
+    steps:
+      - name: Checkout afu-cli branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: afu-cli
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/can1357/oh-my-pi.git 2>/dev/null || true
+      - name: Fetch upstream main
+        run: git fetch upstream main
+      - name: Calculate commits behind
+        id: behind
+        run: echo "behind=$(git rev-list --count HEAD..upstream/main)" >> "$GITHUB_OUTPUT"
+      - name: Test merge
+        id: merge_test
+        run: |
+          MERGE_CODE=0
+          git merge-tree --write-tree HEAD upstream/main >/dev/null 2>&1 || MERGE_CODE=$?
+          if [ $MERGE_CODE -eq 0 ]; then
+            echo "status=clean" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Check workflow changes
+        id: workflows
+        run: |
+          if git diff --name-only HEAD...upstream/main -- .github/workflows | grep -q . ; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Fetch or create issue
+        id: issue
+        run: |
+          ISSUE_NUM=$(gh issue list --label upstream-sync --state open --json number --jq '.[0].number' 2>/dev/null || echo "")
+          if [ -z "$ISSUE_NUM" ]; then
+            ISSUE_JSON=$(gh issue create --title "Upstream sync" --label upstream-sync --body "Checking updates")
+            ISSUE_NUM=$(echo "$ISSUE_JSON" | grep -oP '(?<=issues/)\d+' || echo "1")
+          fi
+          echo "number=$ISSUE_NUM" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Update issue
+        run: |
+          BEHIND=${{ steps.behind.outputs.behind }}
+          MERGE_STATUS=${{ steps.merge_test.outputs.status }}
+          WF_CHANGES=${{ steps.workflows.outputs.has_changes }}
+          
+          if [ "$BEHIND" -eq 0 ]; then
+            gh issue close ${{ steps.issue.outputs.number }}
+            gh issue comment ${{ steps.issue.outputs.number }} --body "Guncel"
+            exit 0
+          fi
+          
+          if [ "$MERGE_STATUS" = "clean" ]; then
+            MERGE_INFO="Temiz"
+          else
+            MERGE_INFO="Cakisma"
+          fi
+          
+          if [ "$WF_CHANGES" = "true" ]; then
+            WF_INFO="Workflow degisikligi var"
+          else
+            WF_INFO="Workflow OK"
+          fi
+          
+          TITLE="Upstream sync ($BEHIND geride)"
+          BODY="Durum: $MERGE_INFO - $WF_INFO"
+          
+          gh issue edit ${{ steps.issue.outputs.number }} --title "$TITLE" --body "$BODY"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create PR if clean
+        if: steps.merge_test.outputs.status == 'clean' && secrets.UPSTREAM_SYNC_TOKEN != ''
+        run: |
+          gh auth login --with-token <<< '${{ secrets.UPSTREAM_SYNC_TOKEN }}'
+          BRANCH="upstream-sync/$(date +%Y-%m-%d)"
+          git config user.name "afu"
+          git config user.email "afu@example.com"
+          git switch -c "$BRANCH" 2>/dev/null || git switch "$BRANCH"
+          git merge --no-edit upstream/main || true
+          git push -u origin "$BRANCH" -f
+          gh pr create --base afu-cli --title "Upstream sync $(date +%Y-%m-%d)" --body "Once testleri kosmali" || true
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
