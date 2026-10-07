@@ -1,101 +1,144 @@
 name: Upstream Sync
+
+# Weekly check: how far behind can1357/oh-my-pi is the fork, and would a merge be clean?
+# It only reports (one issue, updated in place). The real merge is done locally with
+# `bash scripts/afu-upstream-sync.sh`, because GITHUB_TOKEN cannot push commits that
+# touch .github/workflows. Optional secret UPSTREAM_SYNC_TOKEN (PAT with `workflow`
+# scope) lets this job also push the sync branch and open the PR.
+# Turkce: haftalik denetim; gercek birlestirme yerelde scriptle yapilir.
+
 on:
   schedule:
     - cron: '0 6 * * 1'
   workflow_dispatch:
+
 permissions:
   contents: read
   issues: write
   pull-requests: write
+
 concurrency:
   group: upstream-sync
   cancel-in-progress: false
+
 jobs:
   check:
     runs-on: ubuntu-latest
     name: Check upstream updates
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
     steps:
       - name: Checkout afu-cli branch
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: afu-cli
-      - name: Add upstream remote
-        run: git remote add upstream https://github.com/can1357/oh-my-pi.git 2>/dev/null || true
-      - name: Fetch upstream main
-        run: git fetch upstream main
-      - name: Calculate commits behind
-        id: behind
-        run: echo "behind=$(git rev-list --count HEAD..upstream/main)" >> "$GITHUB_OUTPUT"
-      - name: Test merge
-        id: merge_test
+
+      - name: Fetch upstream
+        shell: bash
         run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/can1357/oh-my-pi.git
+          git fetch upstream main
+
+      - name: Measure drift
+        id: drift
+        shell: bash
+        run: |
+          set -euo pipefail
+          BEHIND=$(git rev-list --count HEAD..upstream/main)
           MERGE_CODE=0
-          git merge-tree --write-tree HEAD upstream/main >/dev/null 2>&1 || MERGE_CODE=$?
-          if [ $MERGE_CODE -eq 0 ]; then
-            echo "status=clean" >> "$GITHUB_OUTPUT"
+          TREE_OUT=$(git merge-tree --write-tree --name-only HEAD upstream/main 2>&1) || MERGE_CODE=$?
+          if [ "$MERGE_CODE" -eq 0 ]; then
+            STATUS=clean
+            CONFLICTS=""
           else
-            echo "status=conflict" >> "$GITHUB_OUTPUT"
+            STATUS=conflict
+            CONFLICTS=$(printf '%s\n' "$TREE_OUT" | sed -n '2,/^$/p' | sed '/^$/d' | head -30)
           fi
-      - name: Check workflow changes
-        id: workflows
-        run: |
-          if git diff --name-only HEAD...upstream/main -- .github/workflows | grep -q . ; then
-            echo "has_changes=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_changes=false" >> "$GITHUB_OUTPUT"
-          fi
-      - name: Fetch or create issue
-        id: issue
-        run: |
-          ISSUE_NUM=$(gh issue list --label upstream-sync --state open --json number --jq '.[0].number' 2>/dev/null || echo "")
-          if [ -z "$ISSUE_NUM" ]; then
-            ISSUE_JSON=$(gh issue create --title "Upstream sync" --label upstream-sync --body "Checking updates")
-            ISSUE_NUM=$(echo "$ISSUE_JSON" | grep -oP '(?<=issues/)\d+' || echo "1")
-          fi
-          echo "number=$ISSUE_NUM" >> "$GITHUB_OUTPUT"
+          WF_CHANGED=$(git diff --name-only HEAD...upstream/main -- .github/workflows | wc -l)
+          {
+            echo "behind=$BEHIND"
+            echo "status=$STATUS"
+            echo "wf_changed=$WF_CHANGED"
+            echo "conflicts<<EOF_CONFLICTS"
+            echo "$CONFLICTS"
+            echo "EOF_CONFLICTS"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Update the Upstream sync issue
+        shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Update issue
+          BEHIND: ${{ steps.drift.outputs.behind }}
+          STATUS: ${{ steps.drift.outputs.status }}
+          WF_CHANGED: ${{ steps.drift.outputs.wf_changed }}
+          CONFLICTS: ${{ steps.drift.outputs.conflicts }}
         run: |
-          BEHIND=${{ steps.behind.outputs.behind }}
-          MERGE_STATUS=${{ steps.merge_test.outputs.status }}
-          WF_CHANGES=${{ steps.workflows.outputs.has_changes }}
-          
+          set -euo pipefail
+          gh label create upstream-sync --color 0E8A16 --description "Upstream drift report" 2>/dev/null || true
+          ISSUE=$(gh issue list --label upstream-sync --state open --json number --jq '.[0].number // empty')
+
           if [ "$BEHIND" -eq 0 ]; then
-            gh issue close ${{ steps.issue.outputs.number }}
-            gh issue comment ${{ steps.issue.outputs.number }} --body "Guncel"
+            if [ -n "$ISSUE" ]; then
+              gh issue comment "$ISSUE" --body "Fork upstream ile güncel. / Fork is up to date with upstream."
+              gh issue close "$ISSUE"
+            fi
             exit 0
           fi
-          
-          if [ "$MERGE_STATUS" = "clean" ]; then
-            MERGE_INFO="Temiz"
+
+          if [ "$STATUS" = "clean" ]; then
+            VERDICT="Temiz birleştirme / Clean merge"
           else
-            MERGE_INFO="Cakisma"
+            VERDICT="Çakışma var / Conflicts"
           fi
-          
-          if [ "$WF_CHANGES" = "true" ]; then
-            WF_INFO="Workflow degisikligi var"
+          {
+            echo "Upstream (can1357/oh-my-pi) şu kadar commit ilerde / ahead by: **$BEHIND**"
+            echo
+            echo "- Durum / Status: **$VERDICT**"
+            if [ "$WF_CHANGED" -gt 0 ]; then
+              echo "- Upstream \`.github/workflows\` dosyalarını değiştirmiş; birleştirme dalını push etmek için \`workflow\` yetkili anahtar gerekir."
+            fi
+            if [ -n "$CONFLICTS" ]; then
+              echo
+              echo "Çakışan dosyalar / Conflicting files (ilk 30):"
+              echo '```'
+              echo "$CONFLICTS"
+              echo '```'
+            fi
+            echo
+            echo "Birleştirmek için (PC'nde, afu-cli dalında, temiz çalışma ağacıyla):"
+            echo '```'
+            echo "bash scripts/afu-upstream-sync.sh --dry-run   # önce dene"
+            echo "bash scripts/afu-upstream-sync.sh             # birleştir, test et, PR aç"
+            echo '```'
+            echo
+            echo "_Son denetim / Last check: $(date -u +%Y-%m-%d)_"
+          } > issue_body.md
+
+          TITLE="Upstream sync ($BEHIND commit geride)"
+          if [ -n "$ISSUE" ]; then
+            gh issue edit "$ISSUE" --title "$TITLE" --body-file issue_body.md
           else
-            WF_INFO="Workflow OK"
+            gh issue create --title "$TITLE" --label upstream-sync --body-file issue_body.md
           fi
-          
-          TITLE="Upstream sync ($BEHIND geride)"
-          BODY="Durum: $MERGE_INFO - $WF_INFO"
-          
-          gh issue edit ${{ steps.issue.outputs.number }} --title "$TITLE" --body "$BODY"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Create PR if clean
-        if: steps.merge_test.outputs.status == 'clean' && secrets.UPSTREAM_SYNC_TOKEN != ''
-        run: |
-          gh auth login --with-token <<< '${{ secrets.UPSTREAM_SYNC_TOKEN }}'
-          BRANCH="upstream-sync/$(date +%Y-%m-%d)"
-          git config user.name "afu"
-          git config user.email "afu@example.com"
-          git switch -c "$BRANCH" 2>/dev/null || git switch "$BRANCH"
-          git merge --no-edit upstream/main || true
-          git push -u origin "$BRANCH" -f
-          gh pr create --base afu-cli --title "Upstream sync $(date +%Y-%m-%d)" --body "Once testleri kosmali" || true
+
+      - name: Push sync branch and open PR (only with UPSTREAM_SYNC_TOKEN)
+        if: steps.drift.outputs.status == 'clean' && steps.drift.outputs.behind != '0' && env.SYNC_TOKEN != ''
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$SYNC_TOKEN"
+          BRANCH="upstream-sync/$(date -u +%Y-%m-%d)"
+          git config user.name "afu-upstream-sync"
+          git config user.email "noreply@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          git merge --no-edit upstream/main
+          git push "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$BRANCH"
+          if ! gh pr list --head "$BRANCH" --json number --jq '.[0].number // empty' | grep -q .; then
+            gh pr create --base afu-cli --head "$BRANCH" \
+              --title "Upstream sync $(date -u +%Y-%m-%d)" \
+              --body "Otomatik birleştirme. Testler çalıştırılmadı: merge etmeden önce yerelde \`bash scripts/afu-upstream-sync.sh --no-push\` mantığıyla tui ve update-cli testlerini koş. / Not tested: run the tui and update-cli tests before merging."
+          fi

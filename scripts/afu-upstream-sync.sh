@@ -79,9 +79,9 @@ if [ "$DRY_RUN" = true ]; then
 
   WF_CHANGES=$(git diff --name-only HEAD...upstream/main -- .github/workflows 2>/dev/null | wc -l)
   if [ "$WF_CHANGES" -gt 0 ]; then
-    echo "⚠️ Workflow değişiği var."
+    echo "⚠️ Workflow değişikliği var."
   else
-    echo "✓ Workflow değişiği yok."
+    echo "✓ Workflow değişikliği yok."
   fi
   
   exit 0
