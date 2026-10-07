@@ -66,7 +66,7 @@ Dosyalar: `modes/controllers/input-controller.ts`, `modes/components/custom-edit
 
 ## Otomatik denetim
 
-- Haftada bir Pazartesi 06:00 UTC'de GitHub Actions `afu-upstream-sync` workflow'u çalışır.
+- Haftada bir Pazartesi 06:00 UTC'de GitHub Actions `afu-upstream-sync` workflow'u çalışır; upstream'den kaç commit geride olduğunu ve birleştirmenin temiz mi çakışmalı mı olacağını **rapor eder** (Actions çalıştırma sayfasındaki "Summary" ve sarı uyarı). Bu fork'ta `GITHUB_TOKEN` issue açamıyor, bu yüzden issue best-effort; asıl rapor Summary'dedir.
 - `scripts/afu-upstream-sync.sh` script'i merge testi, test çalıştırma ve PR açma işlemlerini yerine getirir.
 - `UPSTREAM_SYNC_TOKEN` (isteğe bağlı PAT) varsa otomatik PR oluşturulur; yoksa elle push'lanır.
 
