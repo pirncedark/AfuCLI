@@ -1,4 +1,4 @@
-﻿# irm https://raw.githubusercontent.com/pirncedark/afu-cli/afu-cli/scripts/afu-kur.ps1 | iex
+# irm https://raw.githubusercontent.com/pirncedark/afu-cli/afu-cli/scripts/afu-kur.ps1 | iex
 [CmdletBinding()]
 param(
     [string]$KaynakExe,
