@@ -8,6 +8,8 @@
 
 ### Fixed
 
+- On Windows the `/model` menu closed immediately when the console split a mouse report into separate key records (the leading Esc cancelled it); decoded win32-input-mode keys are now reassembled first. / Windows'ta `/model` menüsü fare raporu parçalandığı için hemen kapanıyordu; düzeltildi.
+
 - `afu update` on Windows failed with "AFU güncellemesi bulunamadı" because GitHub reports the renamed repository as `pirncedark/AfuCLI`; the download URL check is now case-insensitive and all AFU links use the canonical name. / `afu update` Windows'ta depo adı `AfuCLI` olarak değiştiği için güncelleme bulamıyordu; düzeltildi.
 
 ### Added

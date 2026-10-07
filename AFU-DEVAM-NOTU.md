@@ -8,7 +8,7 @@
 
 ## Sürüm işleri / Release work
 - 18.4.13: etiket `afu-v18.4.13`, CI run 37655340202 (en son durum: GitHub Actions'a bak).
-- Sıradaki: sürüm 18.4.14'e çıkar (aşağıdaki dosyalarda `18.4.13` → `18.4.14`: `Cargo.toml`, `Cargo.lock`, `bun.lock`, kök `package.json`, `packages/*/package.json`, `packages/coding-agent/CHANGELOG.md` girişi), push, `afu-v18.4.14` etiketi. Etiket sürümle birebir eşleşmeli (workflow kontrol eder).
+- 18.4.13 CI başarılı, release yayında. 18.4.14 (içinde `/model` düzeltmesi): sürüm artışı + etiket `afu-v18.4.14` yapıldı; CI sonucunu GitHub Actions'tan doğrula. (Tekrarlamak gerekirse adımlar:) sürümü 18.4.14'e çıkar (aşağıdaki dosyalarda `18.4.13` → `18.4.14`: `Cargo.toml`, `Cargo.lock`, `bun.lock`, kök `package.json`, `packages/*/package.json`, `packages/coding-agent/CHANGELOG.md` girişi), push, `afu-v18.4.14` etiketi. Etiket sürümle birebir eşleşmeli (workflow kontrol eder).
 - 18.4.14 çıkınca gerçek yükseltme testi: 18.4.13'ü kur → `afu update` → `afu --version` = 18.4.14.
 
 ## Bilinenler / Gotchas
