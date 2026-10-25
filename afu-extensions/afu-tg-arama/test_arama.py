@@ -4,8 +4,10 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from arama import Arama, jsonl
+import arama as bridge
+from arama import Arama, TelegramBinding, jsonl
 
 
 class Binding:
@@ -23,6 +25,68 @@ class Binding:
 
     async def kapat(self):
         self.closed = True
+
+
+class CleanupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_hung_disconnect_cannot_keep_recordings(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class Client:
+            async def disconnect(self):
+                started.set()
+                await release.wait()
+
+        with tempfile.TemporaryDirectory() as directory:
+            file = Path(directory) / "duyulan-active.wav"
+            file.write_bytes(b"recording")
+            binding = TelegramBinding(1, "test")
+            binding.client = Client()
+            binding.calls = object()
+            binding.files.add(file)
+            task = asyncio.create_task(binding.kapat())
+            try:
+                await asyncio.wait_for(started.wait(), 1)
+                self.assertFalse(file.exists())
+                self.assertEqual(binding.files, set())
+                self.assertIsNone(binding.calls)
+            finally:
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+    async def test_close_timeout_removes_recordings(self):
+        class Client:
+            async def disconnect(self):
+                await asyncio.Event().wait()
+
+        with tempfile.TemporaryDirectory() as directory:
+            file = Path(directory) / "duyulan-cancelled.wav"
+            file.write_bytes(b"recording")
+            binding = TelegramBinding(1, "test")
+            binding.client = Client()
+            binding.files.add(file)
+            with self.assertRaises(TimeoutError):
+                await Arama(binding, 42).close()
+            self.assertFalse(file.exists())
+            self.assertEqual(binding.files, set())
+            self.assertIsNone(binding.client)
+
+
+class StartupTests(unittest.TestCase):
+    def test_startup_removes_only_old_recordings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old = [root / "duyulan-one.wav", root / "duyulan-two.wav"]
+            keep = [root / "reply.wav", root / "ikinci-numara.session", root / "duyulan-note.txt"]
+            for file in old + keep:
+                file.write_bytes(b"data")
+            with patch.object(bridge, "DIRECTORY", root), \
+                    patch.object(bridge.sys, "argv", ["arama.py", "--check"]), \
+                    patch.object(bridge.sys, "stdout", io.StringIO()):
+                bridge.main()
+            self.assertTrue(all(not file.exists() for file in old))
+            self.assertTrue(all(file.exists() for file in keep))
 
 
 class ProtocolTests(unittest.IsolatedAsyncioTestCase):

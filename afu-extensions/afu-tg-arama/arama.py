@@ -246,16 +246,19 @@ class TelegramBinding:
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(self.calls.leave_call(self.user), 0.5)
         finally:
-            if self.client:
-                await self.client.disconnect()
             for file in self.files:
                 file.unlink(missing_ok=True)
             self.files.clear()
             self.calls = None
+            client = self.client
             self.client = None
+            if client:
+                await client.disconnect()
 
 
 def main():
+    for file in DIRECTORY.glob("duyulan-*.wav"):
+        file.unlink(missing_ok=True)
     if sys.argv[1:] == ["--check"]:
         for name in ("pytgcalls", "telethon", "ntgcalls"):
             importlib.import_module(name)

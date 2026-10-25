@@ -18,7 +18,17 @@ export async function gunlukIzin(file: string, now: Date): Promise<boolean> {
 	if (isQuietHour(now)) return false;
 	await fs.mkdir(path.dirname(file), { recursive: true });
 	let lock: fs.FileHandle;
-	try { lock = await fs.open(`${file}.lock`, "wx", 0o600); } catch { return false; }
+	try {
+		lock = await fs.open(`${file}.lock`, "wx", 0o600);
+	} catch (error) {
+		if (!error || typeof error !== "object" || !("code" in error) || error.code !== "EEXIST") return false;
+		try {
+			const stat = await fs.stat(`${file}.lock`);
+			if (Date.now() - stat.mtimeMs <= 10_000) return false;
+			await fs.unlink(`${file}.lock`);
+			lock = await fs.open(`${file}.lock`, "wx", 0o600);
+		} catch { return false; }
+	}
 	const tmp = `${file}.${crypto.randomUUID()}.tmp`;
 	try {
 		let previous: DailyState = { day: "", count: 0 };

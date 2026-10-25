@@ -84,6 +84,23 @@ test("bozuk sayaç ve eşzamanlı başlatmalar sınırı aşamaz", async () => {
 	expect(results.filter(Boolean)).toHaveLength(1);
 });
 
+test("10 saniyeden eski kilit aramayi engellemez", async () => {
+	const file = await sayacYolu();
+	await Bun.write(`${file}.lock`, "");
+	const old = new Date(Date.now() - 11_000);
+	await fs.utimes(`${file}.lock`, old, old);
+	expect(await gunlukIzin(file, gunduz())).toBe(true);
+	expect((await Bun.file(file).json()).count).toBe(1);
+});
+
+test("taze kilit ikinci aramayi reddeder ve korunur", async () => {
+	const file = await sayacYolu();
+	await Bun.write(`${file}.lock`, "active");
+	expect(await gunlukIzin(file, gunduz())).toBe(false);
+	expect(await Bun.file(file).exists()).toBe(false);
+	expect(await Bun.file(`${file}.lock`).text()).toBe("active");
+});
+
 test("sahte süreçle duyulan → asistan → seslendirme → kapat tam döngüsü", async () => {
 	const h = harness({ sayac: await sayacYolu() });
 	await h.komut();
