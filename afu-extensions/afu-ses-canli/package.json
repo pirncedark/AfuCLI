@@ -1,0 +1,13 @@
+{
+	"name": "afu-ses-canli",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "AfuCLI yerel mikrofon konuşma döngüsü",
+	"scripts": {
+		"test": "bun test",
+		"check": "tsgo --noEmit --ignoreConfig --skipLibCheck --strict --target esnext --lib esnext,dom.asynciterable --module preserve --moduleResolution bundler --resolveJsonModule --allowArbitraryExtensions --types bun ../../types/assets/index.d.ts index.ts dongu.ts kayit.ts test-yardim.ts index.test.ts dongu.test.ts dongu.integration.test.ts kayit.test.ts"
+	},
+	"peerDependencies": { "@oh-my-pi/pi-coding-agent": "*" },
+	"omp": { "extensions": ["./index.ts"] }
+}

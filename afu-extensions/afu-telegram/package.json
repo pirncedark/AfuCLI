@@ -1,0 +1,19 @@
+{
+	"name": "afu-telegram",
+	"version": "0.1.0",
+	"private": true,
+	"workspaces": [],
+	"type": "module",
+	"scripts": {
+		"test": "bun test",
+		"check": "tsgo --noEmit --ignoreConfig --skipLibCheck --strict --target esnext --lib esnext,dom.asynciterable --module preserve --moduleResolution bundler --resolveJsonModule --allowArbitraryExtensions --types bun ../../types/assets/index.d.ts index.ts format.ts onay.ts format.test.ts onay.test.ts index.test.ts ses-mesaj.ts ses-mesaj.test.ts"
+	},
+	"dependencies": {
+		"grammy": "^1.46.0"
+	},
+	"omp": {
+		"extensions": [
+			"./index.ts"
+		]
+	}
+}

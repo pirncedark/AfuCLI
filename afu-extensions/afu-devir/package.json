@@ -1,0 +1,16 @@
+{
+	"name": "afu-devir",
+	"version": "0.1.0",
+	"private": true,
+	"workspaces": [],
+	"type": "module",
+	"scripts": {
+		"test": "bun test",
+		"check": "tsgo --noEmit --ignoreConfig --skipLibCheck --strict --target esnext --lib esnext,dom.asynciterable --module preserve --moduleResolution bundler --resolveJsonModule --allowArbitraryExtensions --types bun ../../types/assets/index.d.ts index.ts devir.ts codex-istemci.ts sahte-sunucu.ts devir.test.ts index.test.ts"
+	},
+	"omp": {
+		"extensions": [
+			"./index.ts"
+		]
+	}
+}

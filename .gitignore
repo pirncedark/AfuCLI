@@ -102,3 +102,6 @@ packages/coding-agent/bench/boot-baseline.json
 /packages/coding-agent/sablon.css
 /packages/coding-agent/nul
 /packages/typescript-edit-benchmark/runs/
+
+# AfuCLI eklenti sırları
+afu-extensions/**/.env
