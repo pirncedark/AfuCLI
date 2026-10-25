@@ -1,35 +1,53 @@
-# afu-ses-yerel
+﻿# afu-ses-yerel
 
-AfuCLI için iki yerel Türkçe ses aracı:
+Yerel Türkçe seslendirme ve yazıya dökme araçları. `seslendir` OGG/Opus dosyası üretir; `yaziyaDok(dosya, options)` mevcut ses kaydını yazıya döker. Sessizlik veya yalnız halüsinasyon içeren kayıt boş metin döndürür.
 
-1. `seslendir({ text: "Merhaba, ben Afu." })` → OGG/Opus dosyasının tam yolu (`details.dosya`).
-2. `yaziya_dok({ dosya: "C:\\kayit.ogg" })` → Türkçe metin (`details.text`). Göreli yollar oturumun çalışma klasörüne göre çözülür.
+## Kalıcı Whisper
 
-## Çalıştırma
+`yaziyaDok` ilk kullanımda tek Python sunucusu başlatır. Model bir kez yüklenir ve 0,5 saniyelik sessiz örnekle ısıtılır. Sonraki çağrılar aynı modeli kullanır. Kayıttan önce `await whisperIsit()` çağrısı ilk yükleme gecikmesini öne alır. Uygulama kapanırken `whisperKapat()` çağrılabilir; işlem çıkışında da temizlenir.
 
-```powershell
-cd C:\Users\afuuu\Desktop\oh-my-pi\afu-extensions\afu-ses-yerel
-bun test
-```
+İstekler benzersiz kimlikle eşlenir. Bir isteğin `signal` ile iptali diğer istekleri ve modeli korur; başlamış çıkarımın geç yanıtı yok sayılır. Sunucu ölürse etkilenen istek bir kez yeni sunucuyla denenir; sonraki çağrılar da gerektiğinde yeni süreç başlatır. Başlatma ve istek bekleme sınırı 180 saniyedir. `whisperKapat` bekleyen istekleri reddeder ve kendiliğinden yeniden başlatmaz.
 
-JavaScript bağımlılığı eklemek veya kök projede kurulum yapmak gerekmez. Eklentiyi yükleyen OMP, `ExtensionAPI` ve şema oluşturucuyu sağlar. Paket bildirimi `omp.extensions` üzerinden `index.ts` dosyasını gösterir. Eklentinin OMP yapılandırmasına kaydını ana işçi yapar.
+Varsayılan model `large-v3-turbo`, cihaz CUDA, hesaplama `float16` olur. CUDA/model yükleme/çıkarım hatasında otomatik `small` + CPU + `int8` kullanılır. Her iki modelin de önceden indirilmiş olması gerekir; çalışma sırasında ağ erişimi ve indirme kapalıdır.
+
+Transkripsiyon: Türkçe, `beam_size=1`, VAD açık, önceki metne koşullama kapalı, `no_speech_threshold=0.6`. `no_speech_prob > 0.6` segmentleri atılır. Saf `halusinasyon_suz` işlevi abone olma, beğenme, yorum hatırlatmaları, izleme teşekkürü ve altyazı/M.K. kalıplarından oluşan cümleleri kaldırır; diğer cümleleri korur.
 
 ## Gerekli bileşenler
 
-- `C:\Program Files\Python311\Scripts\piper.exe`
-- `C:\Program Files\Python311\python.exe` içinde `faster-whisper`
-- PATH üzerinde `ffmpeg`; test için ayrıca `ffprobe`
-- Piper: `F:\afu_buyuk\piper\tr_TR-dfki-medium.onnx` ve yanındaki `.onnx.json`
-- Whisper: `F:\afu_buyuk\whisper` altında indirilmiş Hugging Face `Systran/faster-whisper-small` önbelleği
+- `C:\Program Files\Python311\python.exe`: `faster-whisper`, CTranslate2, NumPy ve CUDA çalışma kitaplıkları.
+- `F:\afu_buyuk\whisper`: `mobiuslabsgmbh/faster-whisper-large-v3-turbo` ve CPU yedeği `Systran/faster-whisper-small` önbellekleri.
+- Seslendirme için mevcut Piper kurulumu, `F:\afu_buyuk\piper\tr_TR-dfki-medium.onnx` ve `.onnx.json`; PATH üzerinde FFmpeg.
 
-Gelişmiş seçenekler: `AFU_PIPER_MODEL` ONNX dosyasını, `AFU_WHISPER_DIR` Whisper önbellek kökünü değiştirir. Whisper CPU üzerinde `int8`, Türkçe (`tr`) çalışır. Ağ erişimi ve model indirmesi kapalıdır; modelleri ana işçi indirir, bu eklenti F: üzerindeki model klasörlerine yazmaz.
+Gelişmiş ortam değişkenleri: `AFU_WHISPER_MODEL` varsayılan CUDA modelini, `AFU_WHISPER_DIR` önbellek kökünü değiştirir. `options.whisperDir` çağrı için önbellek kökünü seçer; farklı bir klasöre geçiş bekleyen istek varken reddedilir. `AFU_PIPER_MODEL` ve `AFU_SES_DIR` seslendirme için geçerlidir. Üretilen OGG dosyasını tüketen taraf kaldırmalıdır; varsayılan çıktı klasörü `~/.omp/afu-ses` olur.
 
-Piper girdisi UTF-8 standart girdiden verilir; FFmpeg `-c:a libopus -b:a 64k` kullanır. Alt süreçler kabuksuz ve gizli pencereyle çalışır; iptal sinyali ve süreç başına 3 dakika sınırı vardır. Hatalar tek cümle Türkçe olarak OMP'ye iletilir.
+## Python CLI ve JSONL
 
-Üretilen `afu-ses-<benzersiz kimlik>.ogg` dosyası bu eklenti klasöründe kalır; gönderen/tüketen taraf kullandıktan sonra kaldırmalıdır. Ara WAV her durumda, yarım OGG hata durumunda kaldırılır. Test ürettiği OGG'yi de kaldırır. Yükleme sırasında ses işlemi veya mesaj gönderimi başlamaz.
+Tek seferlik kullanım korunur:
 
-## Test kapsamı
+```powershell
+& 'C:\Program Files\Python311\python.exe' -B .\yaziya_dok.py .\kayit.wav
+& 'C:\Program Files\Python311\python.exe' -B .\yaziya_dok.py --check
+```
 
-Boş metin, eksik model/dosya ve iptal sınırları test edilir. Gerçek uçtan uca test `Merhaba, ben Afu.` metnini üretir, dosya boyutunu, Opus kodlamasını, 0,5 saniyeden uzun süreyi ve aynı dosyanın transkripsiyonunda `merhaba` bulunmasını doğrular. Model hazır değilse `atlandı` mesajı verir; eksik çalıştırılabilir bileşenler test hatasıdır.
+`--sunucu` standart girdiden satır başına `{"id":"1","dosya":"C:\\kayit.wav"}` okur. Model ısındığında bir kez `{"id":null,"metin":""}` hazır bildirimi gönderir. Yanıtlar `{"id":"1","metin":"..."}` veya `{"id":"1","hata":"..."}` biçimindedir; her satır hemen flush edilir. Tanılama stderr'e gider. EOF sunucuyu kapatır.
 
-Telegram bağlantısı ayrı işin kapsamındadır; bu paket bot başlatmaz.
+## Doğrulama
+
+Bu klasörde:
+
+```powershell
+bun run check
+bun test
+& 'C:\Program Files\Python311\python.exe' -B -m unittest whisper_test
+```
+
+Bun birim testleri sahte süreçle kimlik eşleme, modelin yeniden kullanımı, ölümden kurtarma, sınırlı yeniden deneme, istek iptali, boş yanıt, hata ve kapanışı sınar. Python birim testleri süzgeci, no-speech eşiğini, JSONL yanıtlarını ve CUDA → CPU geçişini sınar.
+
+Gerçek donanım entegrasyonu varsayılan olarak atlanır. Piper/Whisper/CUDA ve alt süreç izinleri hazır ortamda:
+
+```powershell
+$env:AFU_SES_ENTEGRASYON = '1'
+bun test ses.integration.test.ts
+```
+
+Entegrasyon `Merhaba, ben Afu.` → Opus → metinde `merhaba` ve `afu` doğrulaması yapar; ikinci transkripsiyonun 1000 ms altında olmasını ister ve ölçümü yazar. Ayrı test sessiz WAV için boş metni doğrular. Bu eşik yalnız transkripsiyonu ölçer; sustuktan sonra ilk sese kadar tüm zincirin 1,5 saniye hedefi ayrıca ölçülmelidir.

@@ -1,3 +1,4 @@
+import { readLines } from "@oh-my-pi/pi-utils/stream";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -154,7 +155,156 @@ export async function seslendir(
 	}
 }
 
-/** Reads an existing audio file without downloading or modifying models. */
+const WHISPER_ERROR = "Ses yazıya dökülemedi, Whisper kurulumunu ve indirilen modelleri kontrol edin.";
+const WHISPER_TIMEOUT = 180_000;
+
+class WhisperProcessError extends Error {}
+
+interface WhisperReply {
+	id: string | null;
+	metin?: string;
+	hata?: string;
+}
+
+interface WhisperPending {
+	resolve(text: string): void;
+	reject(error: Error): void;
+}
+
+let whisperServer: WhisperServer | undefined;
+
+class WhisperServer {
+	readonly child: Bun.Subprocess<"pipe", "pipe", "pipe">;
+	readonly ready = Promise.withResolvers<void>();
+	readonly pending = new Map<string, WhisperPending>();
+	readonly dir: string;
+	#closed = false;
+	#startupTimer: Timer;
+
+	constructor(dir: string) {
+		this.dir = dir;
+		this.child = Bun.spawn([
+			PYTHON, "-B", "-u", path.join(import.meta.dir, "yaziya_dok.py"),
+			"--sunucu", "--model-dir", dir,
+		], {
+			cwd: import.meta.dir, stdin: "pipe", stdout: "pipe", stderr: "pipe", windowsHide: true,
+			env: { ...process.env, PYTHONUTF8: "1", PYTHONDONTWRITEBYTECODE: "1",
+				HF_HUB_OFFLINE: "1", HF_HUB_DISABLE_TELEMETRY: "1" },
+		});
+		this.#startupTimer = setTimeout(() => this.stop(new Error(WHISPER_ERROR)), WHISPER_TIMEOUT);
+		// Handlers are installed immediately, including when every waiting caller aborts.
+		void this.ready.promise.catch(() => {});
+		void this.#read();
+		void this.#drainErrors();
+		void this.child.exited.then(
+			() => this.stop(new WhisperProcessError(WHISPER_ERROR)),
+			() => this.stop(new WhisperProcessError(WHISPER_ERROR)),
+		);
+	}
+
+	async #drainErrors(): Promise<void> {
+		try {
+			// Drain without retaining unbounded library diagnostics in memory.
+			for await (const _line of readLines(this.child.stderr)) { /* drained */ }
+		} catch { /* Process shutdown also closes the pipe. */ }
+	}
+
+	async #read(): Promise<void> {
+		try {
+			const decoder = new TextDecoder();
+			for await (const line of readLines(this.child.stdout)) {
+				const reply = JSON.parse(decoder.decode(line)) as WhisperReply;
+				if (reply.id === null && reply.metin === "") {
+					clearTimeout(this.#startupTimer);
+					this.ready.resolve();
+					if (this.pending.size === 0) this.child.unref();
+					continue;
+				}
+				const pending = this.pending.get(reply.id ?? "");
+				if (!pending) continue; // Late reply to a cancelled request.
+				if (typeof reply.hata === "string") pending.reject(new Error(WHISPER_ERROR));
+				else if (typeof reply.metin === "string") pending.resolve(reply.metin);
+				else throw new Error("Invalid Whisper reply");
+			}
+		} catch { /* Invalid protocol and pipe failures both invalidate this server. */ }
+		this.stop(new WhisperProcessError(WHISPER_ERROR));
+	}
+
+	request(dosya: string, signal?: AbortSignal): Promise<string> {
+		checkCancelled(signal);
+		if (this.#closed) return Promise.reject(new WhisperProcessError(WHISPER_ERROR));
+		const id = crypto.randomUUID();
+		const result = Promise.withResolvers<string>();
+		this.child.ref();
+		const cleanup = () => {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", abort);
+			this.pending.delete(id);
+			if (this.pending.size === 0) this.child.unref();
+		};
+		const abort = () => {
+			cleanup();
+			result.reject(new Error("Ses işlemi iptal edildi, yeniden deneyin."));
+		};
+		const timer = setTimeout(() => this.stop(new Error(WHISPER_ERROR)), WHISPER_TIMEOUT);
+		this.pending.set(id, {
+			resolve: text => { cleanup(); result.resolve(text); },
+			reject: error => { cleanup(); result.reject(error); },
+		});
+		signal?.addEventListener("abort", abort, { once: true });
+		if (signal?.aborted) abort();
+		void this.ready.promise.then(async () => {
+			if (!this.pending.has(id)) return;
+			try {
+				this.child.stdin.write(JSON.stringify({ id, dosya }) + "\n");
+				await this.child.stdin.flush();
+			} catch { this.stop(new WhisperProcessError(WHISPER_ERROR)); }
+		}, error => this.pending.get(id)?.reject(error));
+		return result.promise;
+	}
+
+	stop(error: Error): void {
+		if (this.#closed) return;
+		this.#closed = true;
+		clearTimeout(this.#startupTimer);
+		if (whisperServer === this) whisperServer = undefined;
+		this.ready.reject(error);
+		for (const pending of this.pending.values()) pending.reject(error);
+		try { this.child.stdin.end(); } catch { /* Already closed. */ }
+		this.child.kill();
+		this.child.unref();
+	}
+}
+
+function getWhisper(dir?: string): WhisperServer {
+	const resolvedDir = path.resolve(dir || process.env.AFU_WHISPER_DIR || DEFAULT_WHISPER_DIR);
+	if (whisperServer && whisperServer.dir !== resolvedDir) {
+		if (whisperServer.pending.size > 0) throw new Error("Ses işlemi sürüyor, model klasörünü değiştirmeden önce tamamlanmasını bekleyin.");
+		whisperKapat();
+	}
+	if (!whisperServer) {
+		try { whisperServer = new WhisperServer(resolvedDir); }
+		catch { throw new Error(WHISPER_ERROR); }
+	}
+	return whisperServer;
+}
+
+/** Load and warm the shared model before the first recording. */
+export async function whisperIsit(): Promise<void> {
+	for (let attempt = 0; ; attempt++) {
+		try { await getWhisper().ready.promise; return; }
+		catch (error) { if (!(error instanceof WhisperProcessError) || attempt >= 1) throw error; }
+	}
+}
+
+/** Stop the shared process and reject outstanding requests. Safe to call repeatedly. */
+export function whisperKapat(): void {
+	whisperServer?.stop(new Error("Ses işlemi kapatıldı, yeniden deneyin."));
+}
+
+process.once("exit", whisperKapat);
+
+/** Reads an existing audio file; silence and filtered hallucinations return empty text. */
 export async function yaziyaDok(
 	dosya: string,
 	options: SesOptions = {},
@@ -165,21 +315,9 @@ export async function yaziyaDok(
 	} catch {
 		throw new Error("Ses dosyası okunamadı, geçerli bir dosya seçin.");
 	}
-	const text = await run(
-		[
-			PYTHON,
-			"-B",
-			path.join(import.meta.dir, "yaziya_dok.py"),
-			path.resolve(dosya),
-			"--model-dir",
-			options.whisperDir || process.env.AFU_WHISPER_DIR || DEFAULT_WHISPER_DIR,
-		],
-		"Ses yazıya dökülemedi, Whisper kurulumunu ve indirilen small modelini kontrol edin.",
-		options.signal,
-	);
-	if (!text)
-		throw new Error(
-			"Konuşma algılanamadı, daha anlaşılır bir ses kaydı seçin.",
-		);
-	return text;
+	for (let attempt = 0; ; attempt++) {
+		checkCancelled(options.signal);
+		try { return await getWhisper(options.whisperDir).request(path.resolve(dosya), options.signal); }
+		catch (error) { if (!(error instanceof WhisperProcessError) || attempt >= 1) throw error; }
+	}
 }
