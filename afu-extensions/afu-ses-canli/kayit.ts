@@ -1,4 +1,6 @@
+import { readLines } from "@oh-my-pi/pi-utils/stream";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 
 export interface Kayit { dosya: string; temizle(): Promise<void>; }
@@ -9,10 +11,30 @@ export type SesSureci = (args: string[], signal: AbortSignal, timeoutMs: number)
 export const sesSureci: SesSureci = async (args, signal, timeoutMs) => {
 	signal.throwIfAborted();
 	const child = Bun.spawn(args, {
-		stdin: "ignore", stdout: "ignore", stderr: "pipe", windowsHide: true,
-		signal, timeout: timeoutMs, maxBuffer: 1024 * 1024,
+		stdin: "pipe", stdout: "ignore", stderr: "pipe", windowsHide: true,
+		signal, timeout: timeoutMs,
 	});
-	const [hata, kod] = await Promise.all([new Response(child.stderr).text(), child.exited]);
+	const oku = async (): Promise<string> => {
+		const decoder = new TextDecoder();
+		let hata = "";
+		let konusmaBasladi = false;
+		let durduruldu = false;
+		const sessizlikIzle = args.includes("silencedetect=noise=-35dB:d=1.2");
+		for await (const bytes of readLines(child.stderr, signal)) {
+			const satir = decoder.decode(bytes);
+			hata += `${satir}\n`;
+			if (!sessizlikIzle || durduruldu) continue;
+			if (satir.includes("silence_end:")) konusmaBasladi = true;
+			if (konusmaBasladi && satir.includes("silence_start:")) {
+				signal.throwIfAborted();
+				durduruldu = true;
+				child.stdin.write("q\n");
+				await child.stdin.flush();
+			}
+		}
+		return hata;
+	};
+	const [hata, kod] = await Promise.all([oku(), child.exited]);
 	signal.throwIfAborted();
 	return { kod, hata };
 };
@@ -35,14 +57,15 @@ export async function kaydet(signal: AbortSignal, options: KayitSecenekleri = {}
 		mikrofon = mikrofonSec(liste.hata);
 	}
 	signal.throwIfAborted();
-	const klasor = options.klasor ?? path.join(import.meta.dir, ".kayitlar");
+	const klasor = options.klasor ?? process.env.AFU_SES_DIR ?? path.join(os.homedir(), ".omp", "afu-ses");
 	await fs.mkdir(klasor, { recursive: true });
 	const dosya = path.join(klasor, `mikrofon-${crypto.randomUUID()}.wav`);
 	const temizle = async () => { await fs.rm(dosya, { force: true }); };
 	try {
 		const sonuc = await surec([
-			"ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-			"-f", "dshow", "-i", `audio=${mikrofon}`, "-t", "15", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", dosya,
+			"ffmpeg", "-hide_banner", "-loglevel", "info", "-y",
+			"-f", "dshow", "-i", `audio=${mikrofon}`, "-t", "15", "-af", "silencedetect=noise=-35dB:d=1.2",
+			"-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", dosya,
 		], signal, 20_000);
 		signal.throwIfAborted();
 		if (sonuc.kod !== 0 || (await fs.stat(dosya)).size === 0) {
