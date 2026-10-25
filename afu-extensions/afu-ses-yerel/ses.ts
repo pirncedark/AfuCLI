@@ -14,10 +14,16 @@ export interface SesOptions {
 }
 
 function checkCancelled(signal?: AbortSignal): void {
-	if (signal?.aborted) throw new Error("Ses işlemi iptal edildi, yeniden deneyin.");
+	if (signal?.aborted)
+		throw new Error("Ses işlemi iptal edildi, yeniden deneyin.");
 }
 
-async function run(command: string[], message: string, signal?: AbortSignal, input?: string): Promise<string> {
+async function run(
+	command: string[],
+	message: string,
+	signal?: AbortSignal,
+	input?: string,
+): Promise<string> {
 	checkCancelled(signal);
 	let stderr = "";
 	try {
@@ -53,15 +59,52 @@ async function run(command: string[], message: string, signal?: AbortSignal, inp
 	}
 }
 
+/** Only letters, numbers and speech pauses reach Piper; code is never spoken. */
+export function sesIcinTemizle(text: string): string {
+	return text
+		.replace(
+			/[#*\d]\uFE0F?\u20E3|\p{Extended_Pictographic}(?:\uFE0F|\p{Emoji_Modifier})?(?:\u200D\p{Extended_Pictographic}(?:\uFE0F|\p{Emoji_Modifier})?)*|\p{Regional_Indicator}/gu,
+			" ",
+		)
+		.replace(/```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)/gu, " ")
+		.replace(/`[^`]*(?:`|$)/gu, " ")
+		.replace(/!?\[([^\]]*)\]\([^)]*\)/gu, "$1")
+		.replace(/(?:https?:\/\/|www\.)[^\s<>]+/giu, " ")
+		.replace(/^\s*(?:[-*+•]|\d+[.)])\s+/gmu, " ")
+		.replace(/[^\p{L}\p{M}\p{N}\s.,!?:;]/gu, " ")
+		.split(/\r?\n/u)
+		.map((line) =>
+			line
+				.replace(/([.,!?:;])[\s.,!?:;]*/gu, "$1 ")
+				.replace(/^\s*[.,!?:;]+\s*/u, "")
+				.replace(/\s+([.,!?:;])/gu, "$1")
+				.trim(),
+		)
+		.filter(Boolean)
+		.join(" ")
+		.replace(/\s+/gu, " ")
+		.trim();
+}
+
 /** Produces a persistent OGG/Opus file in AFU_SES_DIR or ~/.omp/afu-ses; the caller owns it. */
-export async function seslendir(text: string, options: SesOptions = {}): Promise<string> {
+export async function seslendir(
+	text: string,
+	options: SesOptions = {},
+): Promise<string> {
 	checkCancelled(options.signal);
-	if (!text.trim()) throw new Error("Seslendirmek için metin yazın.");
+	text = sesIcinTemizle(text);
+	if (!text) throw new Error("Seslendirmek için metin yazın.");
 	const model = options.model || process.env.AFU_PIPER_MODEL || DEFAULT_MODEL;
-	if (!(await Bun.file(model).exists()) || !(await Bun.file(`${model}.json`).exists())) {
-		throw new Error("Ses modeli eksik, model indirmesinin tamamlanmasını bekleyin.");
+	if (
+		!(await Bun.file(model).exists()) ||
+		!(await Bun.file(`${model}.json`).exists())
+	) {
+		throw new Error(
+			"Ses modeli eksik, model indirmesinin tamamlanmasını bekleyin.",
+		);
 	}
-	const dir = process.env.AFU_SES_DIR || path.join(os.homedir(), ".omp", "afu-ses");
+	const dir =
+		process.env.AFU_SES_DIR || path.join(os.homedir(), ".omp", "afu-ses");
 	await fs.mkdir(dir, { recursive: true });
 	const base = path.join(dir, `afu-ses-${crypto.randomUUID()}`);
 	const wav = `${base}.wav`;
@@ -95,7 +138,7 @@ export async function seslendir(text: string, options: SesOptions = {}): Promise
 		);
 		const size = await fs
 			.stat(ogg)
-			.then(stat => stat.size)
+			.then((stat) => stat.size)
 			.catch(() => 0);
 		if (size === 0) throw new Error("Ses dosyası boş oluştu, yeniden deneyin.");
 		return ogg;
@@ -103,14 +146,19 @@ export async function seslendir(text: string, options: SesOptions = {}): Promise
 		await fs.unlink(ogg).catch(() => {});
 		throw error instanceof Error
 			? error
-			: new Error("Ses kaydedilemedi, klasörün yazılabilir olduğunu kontrol edin.");
+			: new Error(
+					"Ses kaydedilemedi, klasörün yazılabilir olduğunu kontrol edin.",
+				);
 	} finally {
 		await fs.unlink(wav).catch(() => {});
 	}
 }
 
 /** Reads an existing audio file without downloading or modifying models. */
-export async function yaziyaDok(dosya: string, options: SesOptions = {}): Promise<string> {
+export async function yaziyaDok(
+	dosya: string,
+	options: SesOptions = {},
+): Promise<string> {
 	checkCancelled(options.signal);
 	try {
 		if (!(await fs.stat(dosya)).isFile()) throw new Error();
@@ -129,6 +177,9 @@ export async function yaziyaDok(dosya: string, options: SesOptions = {}): Promis
 		"Ses yazıya dökülemedi, Whisper kurulumunu ve indirilen small modelini kontrol edin.",
 		options.signal,
 	);
-	if (!text) throw new Error("Konuşma algılanamadı, daha anlaşılır bir ses kaydı seçin.");
+	if (!text)
+		throw new Error(
+			"Konuşma algılanamadı, daha anlaşılır bir ses kaydı seçin.",
+		);
 	return text;
 }

@@ -1,12 +1,16 @@
 import * as fs from "node:fs/promises";
 import { seslendir, yaziyaDok } from "../afu-ses-yerel/ses";
-import { cal, kaydet, type Kayit } from "./kayit";
+import type { SesDurumu } from "./panel";
+import { cal, kaydet, type Kayit, type SeviyeBildir } from "./kayit";
 
 export interface DonguBaglari {
-	kaydet(signal: AbortSignal): Promise<Kayit>;
+	kaydet(
+		signal: AbortSignal,
+		options?: { seviye?: SeviyeBildir },
+	): Promise<Kayit>;
 	yaziyaDok(dosya: string, options: { signal: AbortSignal }): Promise<string>;
 	seslendir(text: string, options: { signal: AbortSignal }): Promise<string>;
-	cal(dosya: string, signal: AbortSignal): Promise<void>;
+	cal(dosya: string, signal: AbortSignal, seviye?: SeviyeBildir): Promise<void>;
 	temizleSes(dosya: string): Promise<void>;
 }
 
@@ -15,11 +19,16 @@ export interface DonguOrtami {
 	zamanla(fn: () => Promise<void>, ms: number): () => void;
 	musait(): boolean;
 	bildir(text: string): void;
+	durum?(durum: SesDurumu | undefined): void;
+	seviye?: SeviyeBildir;
 }
 
 const yerel: DonguBaglari = {
-	kaydet, yaziyaDok, seslendir, cal,
-	temizleSes: dosya => fs.unlink(dosya),
+	kaydet,
+	yaziyaDok,
+	seslendir,
+	cal,
+	temizleSes: (dosya) => fs.unlink(dosya),
 };
 
 interface Tur {
@@ -38,12 +47,16 @@ export class Dongu {
 		readonly baglar: DonguBaglari = yerel,
 	) {}
 
-	get aktif(): boolean { return this.#tur !== undefined; }
+	get aktif(): boolean {
+		return this.#tur !== undefined;
+	}
 
 	baslat(): void {
 		if (this.#tur) return;
 		if (this.#beklenen) {
-			this.ortam.bildir("Önceki cevap bekleniyor, cevap tamamlanınca /konus yazın.");
+			this.ortam.bildir(
+				"Önceki cevap bekleniyor, cevap tamamlanınca /konus yazın.",
+			);
 			return;
 		}
 		const tur: Tur = { iptal: new AbortController() };
@@ -56,6 +69,7 @@ export class Dongu {
 		this.#tur = undefined;
 		tur?.zamanlayici?.();
 		tur?.iptal.abort();
+		this.ortam.durum?.(undefined);
 	}
 
 	/** Called only for a settled agent_end; notification handler never waits for TTS. */
@@ -65,53 +79,99 @@ export class Dongu {
 		if (!tur || !this.#guncel(tur)) return;
 		this.#zamanla(tur, async () => {
 			if (text.trim()) {
-				const dosya = await this.baglar.seslendir(text, { signal: tur.iptal.signal });
+				const dosya = await this.baglar.seslendir(text, {
+					signal: tur.iptal.signal,
+				});
 				try {
-					if (this.#guncel(tur)) await this.baglar.cal(dosya, tur.iptal.signal);
-				} finally { await this.baglar.temizleSes(dosya); }
+					if (this.#guncel(tur)) {
+						this.ortam.durum?.("Konuşuyor");
+						try {
+							await this.baglar.cal(dosya, tur.iptal.signal, this.#seviye(tur));
+						} finally {
+							if (this.#guncel(tur)) this.ortam.durum?.(undefined);
+						}
+					}
+				} finally {
+					await this.baglar.temizleSes(dosya);
+				}
 			}
 			this.#zamanla(tur, () => this.#dinle(tur));
 		});
 	}
 
-	#guncel(tur: Tur): boolean { return this.#tur === tur && !tur.iptal.signal.aborted; }
+	#seviye(tur: Tur): SeviyeBildir {
+		return (deger) => {
+			if (this.#guncel(tur)) this.ortam.seviye?.(deger);
+		};
+	}
+
+	#guncel(tur: Tur): boolean {
+		return this.#tur === tur && !tur.iptal.signal.aborted;
+	}
 
 	#zamanla(tur: Tur, fn: () => Promise<void>): void {
 		if (!this.#guncel(tur)) return;
 		tur.zamanlayici = this.ortam.zamanla(async () => {
 			tur.zamanlayici = undefined;
 			if (!this.#guncel(tur)) return;
-			try { await fn(); }
-			catch {
+			try {
+				await fn();
+			} catch {
 				if (!this.#guncel(tur)) return;
 				this.durdur();
-				this.ortam.bildir("Ses işlemi tamamlanamadı, mikrofon ve yerel ses kurulumunu kontrol edip /konus yazın.");
+				this.ortam.bildir(
+					"Ses işlemi tamamlanamadı, mikrofon ve yerel ses kurulumunu kontrol edip /konus yazın.",
+				);
 			}
 		}, 100);
 	}
 
 	async #dinle(tur: Tur): Promise<void> {
-		if (!this.ortam.musait()) { this.#zamanla(tur, () => this.#dinle(tur)); return; }
-		const kayit = await this.baglar.kaydet(tur.iptal.signal);
+		if (!this.ortam.musait()) {
+			this.#zamanla(tur, () => this.#dinle(tur));
+			return;
+		}
+		this.ortam.durum?.("Dinliyorum");
+		const kayit = await this.baglar.kaydet(tur.iptal.signal, {
+			seviye: this.#seviye(tur),
+		});
 		let text: string;
 		try {
 			if (!this.#guncel(tur)) return;
-			text = (await this.baglar.yaziyaDok(kayit.dosya, { signal: tur.iptal.signal })).trim();
-		} finally { await kayit.temizle(); }
+			this.ortam.durum?.("Anlıyorum");
+			text = (
+				await this.baglar.yaziyaDok(kayit.dosya, { signal: tur.iptal.signal })
+			).trim();
+		} finally {
+			await kayit.temizle();
+		}
 		if (!this.#guncel(tur)) return;
-		if (/^(dur|kapat)[.!?…]*$/iu.test(text)) { this.durdur(); return; }
-		if (!text) { this.#zamanla(tur, () => this.#dinle(tur)); return; }
+		if (/^(dur|kapat)[.!?…]*$/iu.test(text)) {
+			this.durdur();
+			return;
+		}
+		if (!text) {
+			this.#zamanla(tur, () => this.#dinle(tur));
+			return;
+		}
 		this.#gonder(tur, text);
 	}
 
 	#gonder(tur: Tur, text: string): void {
 		if (!this.#guncel(tur)) return;
 		if (!this.ortam.musait()) {
-			this.#zamanla(tur, async () => { this.#gonder(tur, text); });
+			this.#zamanla(tur, async () => {
+				this.#gonder(tur, text);
+			});
 			return;
 		}
+		this.ortam.durum?.("Düşünüyorum");
 		this.#beklenen = tur;
-		try { this.gonder(text); }
-		catch (error) { this.#beklenen = undefined; throw error; }
+		try {
+			this.gonder(text);
+		} catch (error) {
+			this.#beklenen = undefined;
+			throw error;
+		}
 	}
 }
