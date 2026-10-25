@@ -22,6 +22,19 @@ async function downloadVoice(url: string): Promise<Uint8Array> {
 	return new Uint8Array(await response.arrayBuffer());
 }
 
+export function prepareVoiceText(text: string): string {
+	const plain = text.replace(/```[\s\S]*?```/g, "").trim();
+	if (plain.length <= 500) return plain;
+	const clipped = plain.slice(0, 500);
+	let sentenceEnd = 0;
+	for (const match of plain.matchAll(/[.!?…]+(?=\s|$)/g)) {
+		const end = match.index + match[0].length;
+		if (end > 500) break;
+		sentenceEnd = end;
+	}
+	return clipped.slice(0, sentenceEnd || clipped.length).trim();
+}
+
 export class SesMesaj {
 	constructor(readonly options: SesMesajOptions = {}) {}
 
@@ -42,7 +55,9 @@ export class SesMesaj {
 	}
 
 	async reply(api: SesApi, chat: string, text: string, silent: boolean): Promise<void> {
-		const file = await (this.options.seslendir ?? seslendir)(text);
+		const spoken = prepareVoiceText(text);
+		if (!spoken) return;
+		const file = await (this.options.seslendir ?? seslendir)(spoken);
 		try {
 			await api.sendVoice(chat, new InputFile(file), { disable_notification: silent });
 		} finally {

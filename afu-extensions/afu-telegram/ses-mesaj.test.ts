@@ -99,3 +99,31 @@ test("reply uploads generated audio as InputFile and cleans it even when Telegra
 	await expect(voice.reply(telegram, "42", "Cevap", false)).rejects.toThrow("Telegram unavailable");
 	expect(await fs.readdir(directory)).toEqual([]);
 });
+
+test("direct voice replies cap speech at 500 characters when there is no sentence boundary", async () => {
+	const directory = await temporaryDirectory();
+	const spoken: string[] = [];
+	const file = path.join(directory, "reply.ogg");
+	const voice = new SesMesaj({
+		async seslendir(text) {
+			spoken.push(text);
+			await Bun.write(file, new Uint8Array([1]));
+			return file;
+		},
+	});
+	await voice.reply(api(), "42", "x".repeat(550), false);
+	expect(spoken).toEqual(["x".repeat(500)]);
+});
+
+test("direct code-only voice reply skips both synthesis and Telegram upload", async () => {
+	let synthesized = 0;
+	let uploads = 0;
+	const voice = new SesMesaj({
+		async seslendir() { synthesized++; throw new Error("must not synthesize code"); },
+	});
+	const telegram = api();
+	telegram.sendVoice = async () => { uploads++; };
+	await voice.reply(telegram, "42", "  ```ts\nconst x = 1;\n```  ", false);
+	expect(synthesized).toBe(0);
+	expect(uploads).toBe(0);
+});

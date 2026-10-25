@@ -10,7 +10,7 @@ import {
 	splitTelegramHtml,
 	telegramChunks,
 } from "./format";
-import { SesMesaj, type SesApi, type SesMesajOptions } from "./ses-mesaj";
+import { prepareVoiceText, SesMesaj, type SesApi, type SesMesajOptions } from "./ses-mesaj";
 
 export interface SendOptions {
 	parse_mode: "HTML";
@@ -246,6 +246,10 @@ export function registerTelegram(
 					deliver(text, true);
 				} catch {
 					/* A failed download/transcription must not stop polling. */
+					await activeBot.api.sendMessage(chat, "Sesli mesaj anlaşılamadı, yeniden gönderin ya da yazın.", {
+						parse_mode: "HTML",
+						disable_notification: isQuietHour(now()),
+					}).catch(() => {});
 				}
 			});
 			activeBot.on("callback_query:data", async update => {
@@ -322,8 +326,10 @@ export function registerTelegram(
 			}
 		}
 		if (spoken && !closed) {
+			const voiceText = prepareVoiceText(text);
+			if (!voiceText) return;
 			try {
-				await voice.reply(bot.api, chat, text, isQuietHour(now()));
+				await voice.reply(bot.api, chat, voiceText, isQuietHour(now()));
 			} catch {
 				/* The text reply is already delivered; voice is best effort. */
 			}

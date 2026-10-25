@@ -360,7 +360,7 @@ test("registered approval tool denies on shutdown and polling cannot start after
 	expect(early.running()).toBe(false);
 });
 
-async function voiceFixture(failSpeech = false) {
+async function voiceFixture(failSpeech = false, failTranscription = false) {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "afu-telegram-voice-"));
 	cleanups.push(() => fs.rm(directory, { recursive: true, force: true }));
 	const downloads: string[] = [];
@@ -374,6 +374,7 @@ async function voiceFixture(failSpeech = false) {
 		async yaziyaDok(file: string) {
 			expect(path.dirname(file)).toBe(directory);
 			expect(await Bun.file(file).bytes()).toEqual(new Uint8Array([79, 103, 103]));
+			if (failTranscription) throw new Error("Transcription unavailable");
 			return "Sesli sorum";
 		},
 		async seslendir(text: string) {
@@ -392,6 +393,51 @@ async function voiceFixture(failSpeech = false) {
 	};
 	return { ...f, downloads, spoken, receive };
 }
+
+test("transcription failure notifies the chat and polling still handles the next text question", async () => {
+	const f = await voiceFixture(false, true);
+	await f.receive();
+	expect(f.outgoing).toEqual([{
+		text: "Sesli mesaj anlaşılamadı, yeniden gönderin ya da yazın.",
+		options: { parse_mode: "HTML", disable_notification: true },
+	}]);
+	expect(f.incoming).toEqual([]);
+	expect(f.running()).toBe(true);
+	expect(f.stops()).toBe(0);
+	await f.updates.get("message:text")?.({ chat: { id: 42 }, message: { text: "again" } });
+	await f.end("Still working");
+	expect(f.incoming).toEqual(["again"]);
+	expect(f.outgoing.at(-1)?.text).toBe("Still working");
+	expect(f.voices).toEqual([]);
+});
+
+test("voice replies omit fenced code while the text reply retains it", async () => {
+	const f = await voiceFixture();
+	await f.receive();
+	await f.end("Başlangıç.\n```ts\nconst secret = 1;\n```\nBitti.");
+	expect(f.spoken).toEqual(["Başlangıç.\n\nBitti."]);
+	expect(f.outgoing[0]?.text).toContain("const secret = 1;");
+	expect(f.voices.length).toBe(1);
+});
+
+test("voice replies stop at the last sentence within 500 characters without truncating text", async () => {
+	const f = await voiceFixture();
+	const sentence = `${"a".repeat(470)}...`;
+	const text = `${sentence} ${"b".repeat(100)}`;
+	await f.receive();
+	await f.end(text);
+	expect(f.spoken).toEqual([sentence]);
+	expect(f.outgoing[0]?.text).toBe(text);
+});
+
+test("code-only replies still send text but never synthesize or send a voice note", async () => {
+	const f = await voiceFixture();
+	await f.receive();
+	await f.end("```ts\nconst answer = 42;\n```");
+	expect(f.outgoing[0]?.text).toContain("const answer = 42;");
+	expect(f.spoken).toEqual([]);
+	expect(f.voices).toEqual([]);
+});
 
 test("voice transcript uses the same idle and busy delivery as text messages", async () => {
 	const f = await voiceFixture();
