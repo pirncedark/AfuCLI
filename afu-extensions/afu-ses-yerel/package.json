@@ -5,7 +5,8 @@
 	"description": "AfuCLI için yerel Türkçe seslendirme ve yazıya dökme araçları",
 	"type": "module",
 	"scripts": {
-		"test": "bun test"
+		"test": "bun test",
+		"check": "tsgo --noEmit --ignoreConfig --skipLibCheck --strict --target esnext --lib esnext,dom.asynciterable --module preserve --moduleResolution bundler --resolveJsonModule --allowArbitraryExtensions --types bun ../../types/assets/index.d.ts index.ts ses.ts ses.test.ts ses.integration.test.ts"
 	},
 	"peerDependencies": {
 		"@oh-my-pi/pi-coding-agent": "*"
