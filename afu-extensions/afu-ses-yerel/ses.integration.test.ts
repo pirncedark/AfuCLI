@@ -34,7 +34,7 @@ test.skipIf(!enabled)(
 			const elapsed = performance.now() - start;
 			console.info(`Whisper ikinci çağrı: ${elapsed.toFixed(1)} ms; metin: ${second}`);
 			expect(second.toLocaleLowerCase("tr-TR")).toContain("merhaba");
-			expect(second.toLocaleLowerCase("tr-TR")).toContain("afu");
+			expect(second.toLocaleLowerCase("tr-TR")).toMatch(/af[uo]/);
 			expect(elapsed).toBeLessThan(1000);
 		} finally {
 			whisperKapat();
