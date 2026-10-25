@@ -29,10 +29,20 @@ Codex'in çalışan ses oturumu veya iç ekran kodu bu çalışmada gözlemlenme
 
 Mikrofon → mono 16 kHz WAV → yerel Whisper → `pi.sendUserMessage` → son
 `agent_end` cevabı → yerel Piper → FFplay → otomatik yeniden dinleme.
-Ses tanıma ve seslendirme için ücretli API eklenmez; cevap mevcut AfuCLI modeliyle üretilir.
+Ses tanıma ve seslendirme için ücretli API eklenmez. Konuşma başlayınca mevcut
+model ve düşünme seviyesi saklanır, yapılandırmadaki `default` rolü
+`ctx.models.resolve("@default")` ile seçilir ve düşünme `low` yapılır.
+Rol çözülemezse model korunur. Dur, Esc, hata veya oturum kapanışında önceki
+model ve düşünme seviyesi geri yüklenir.
 `../afu-ses-yerel/ses` işlevleri import edilir; o pakete dosya yazılmaz.
 
-FFplay çalışırken ayrı FFmpeg dshow kaydı mikrofonu dinler. 100 ms'lik astats
+Söz kesme varsayılan kapalıdır: çalma sırasında ve bitişinden sonraki 350 ms
+boyunca mikrofon açılmaz, panelde mikrofon çubuğu sönük kalır. Sonra yeniden
+dinlenir. 400 ms'den kısa konuşmalar Whisper'a gönderilmeden temizlenir ve
+yeni dinleme turuna geçilir; sessiz bekleme konuşma süresine eklenmez.
+
+`AFU_SOZ_KESME=1` ile açıldığında FFplay çalışırken ayrı FFmpeg dshow kaydı
+mikrofonu dinler. 100 ms'lik astats
 RMS örnekleri eşik üstünde yaklaşık 300 ms kesintisiz kaldığında FFplay iptal
 edilir. Kısa darbeler ve araya giren sessizlik eşiğin süresini sıfırlar.
 Panel hemen dinliyorum olur; mikrofon kapanıp yeniden açılmaz. Aynı WAV'ın
@@ -53,9 +63,11 @@ Whisper ve Piper Türkçe modeli kurulumu. Yeni bağımlılık kurulumu gerekmez
 
 | Değişken | Varsayılan | İşlev |
 | --- | --- | --- |
+| `AFU_SOZ_KESME` | 0 | Yalnız `1` ile çalma sırasında söz kesmeyi açar |
+| `AFU_KONUS_MODEL` | `@default` | İsteğe bağlı `provider/id` konuşma modeli |
 | `AFU_SOZ_KESME_DB` | -30 | Söz kesme RMS eşiği (-100 ile 0 dB) |
 | `AFU_SESSIZLIK_DB` | -30 | Konuşma sonu sessizlik eşiği |
-| `AFU_SESSIZLIK_SN` | 0.8 | Konuşma sonu sessizlik süresi |
+| `AFU_SESSIZLIK_SN` | 0.5 | Konuşma sonu sessizlik süresi |
 | `AFU_KAYIT_UST_SN` | 10 | Bir konuşmanın azami süresi |
 | `AFU_MIKROFON` | Otomatik | dshow listesindeki ilk ses cihazı |
 | `AFU_SES_DIR` | `~/.omp/afu-ses` | Geçici kayıt klasörü |
@@ -159,3 +171,13 @@ tekrar başlatıp Esc ile durdur.
 ## Bilinen sınırlar
 
 - Söz kesmede yankı engelleme yok. Hoparlörden çıkan afu sesi mikrofona geri gelir; -30 dB eşiği aşılırsa afu kendi sözünü keser. Kulaklıksız denemede afu sürekli kendini kesiyorsa eşiği yükseltin: `AFU_SOZ_KESME_DB=-15` (ya da daha yüksek).
+
+
+## Sesli sohbet sistem yönergesi
+
+Mevcut sistem istemi korunur; yalnız ana ajanda ve döngü açıkken aşağıdaki
+statik yönerge sonuna eklenir. Döngü kapanınca eklenmez.
+
+<!-- sesli-istem -->
+Su an sesli sohbettesin. Arkadasca, dogal konusma dilinde ve kisa cevap ver (cogunlukla 1-3 cumle). Liste, baslik, kod blogu, link ve emoji kullanma. Rapor ya da ozet okuma; gerekirse kisa bir karsi soru sor. Uzun bir is gerekiyorsa once bunu tek cumleyle soyle, ayrintiyi ekrana yaz. Kod yazmak, dosya degistirmek gibi uzun bir is istenirse isi mevcut task/alt ajan araciyla arka plana ver, Baslattim, bitince soylerim de ve sohbete devam et.
+<!-- sesli-istem -->

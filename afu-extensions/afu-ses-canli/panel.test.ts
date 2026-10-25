@@ -10,7 +10,11 @@ function ortam() {
 		hasUI: true,
 		mode: "tui",
 		ui: {
-			setWidget: (_key: string, content: string[] | undefined, options?: { placement: string }) => {
+			setWidget: (
+				_key: string,
+				content: string[] | undefined,
+				options?: { placement: string },
+			) => {
 				if (content) expect(options?.placement).toBe("aboveEditor");
 				widgets.push(content);
 			},
@@ -57,22 +61,28 @@ test("iki renkli sekiz örnek sağdan girer, soldan çıkar; güncelleme 100 ms 
 	expect(h.timers.size).toBe(0);
 });
 
-test("anlama ve düşünme boyunca panel düz kalır; konuşurken iki kanal da ölçülür", () => {
+test("anlama ve düşünmede panel düz, konuşurken mikrofon sönük kalır", () => {
 	const h = ortam();
 	h.panel.durum("Dinliyorum");
 	for (const durum of ["Anlıyorum", "Düşünüyorum"] as const) {
 		h.panel.durum(durum);
 		h.panel.seviye(1);
 		h.tick();
-		expect(Bun.stripANSI(h.widgets.at(-1)![0])).toContain(durum.toLocaleLowerCase("tr-TR"));
-		expect(Bun.stripANSI(h.widgets.at(-1)![1])).toBe("mic ▁▁▁▁▁▁▁▁  afu ▁▁▁▁▁▁▁▁");
+		expect(Bun.stripANSI(h.widgets.at(-1)![0])).toContain(
+			durum.toLocaleLowerCase("tr-TR"),
+		);
+		expect(Bun.stripANSI(h.widgets.at(-1)![1])).toBe(
+			"mic ▁▁▁▁▁▁▁▁  afu ▁▁▁▁▁▁▁▁",
+		);
 		expect(h.timers.size).toBe(1);
 	}
 	h.panel.durum("Konuşuyor");
 	h.panel.seviye(1, "afu");
 	h.panel.seviye(0.5, "mic");
 	h.tick();
-	expect(Bun.stripANSI(h.widgets.at(-1)![1])).toBe("mic ▁▁▁▁▁▁▁▄  afu ▁▁▁▁▁▁▁█");
+	expect(Bun.stripANSI(h.widgets.at(-1)![1])).toBe(
+		"mic ▁▁▁▁▁▁▁▁  afu ▁▁▁▁▁▁▁█",
+	);
 	h.panel.durum("Dinliyorum");
 	h.tick();
 	expect(Bun.stripANSI(h.widgets.at(-1)![1])).toEndWith("afu ▁▁▁▁▁▁▁▁");

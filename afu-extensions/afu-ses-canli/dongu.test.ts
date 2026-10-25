@@ -8,8 +8,8 @@ test("dinleme, Whisper, düşünme ve oynatma durumları ses seviyeleriyle sıra
 	const h = ortam();
 	const durumlar: Array<string | undefined> = [];
 	const seviyeler: number[] = [];
-	h.dongu.ortam.durum = d => durumlar.push(d);
-	h.dongu.ortam.seviye = n => seviyeler.push(n);
+	h.dongu.ortam.durum = (d) => durumlar.push(d);
+	h.dongu.ortam.seviye = (n) => seviyeler.push(n);
 	let gecSeviye: ((n: number) => void) | undefined;
 	h.baglar.kaydet = async (_signal, options) => {
 		options?.seviye?.(0.7);
@@ -25,7 +25,13 @@ test("dinleme, Whisper, düşünme ve oynatma durumları ses seviyeleriyle sıra
 	await h.adim();
 	h.dongu.durdur();
 	gecSeviye?.(1);
-	expect(durumlar).toEqual(["Dinliyorum", "Anlıyorum", "Düşünüyorum", "Konuşuyor", undefined]);
+	expect(durumlar).toEqual([
+		"Dinliyorum",
+		"Anlıyorum",
+		"Düşünüyorum",
+		"Konuşuyor",
+		undefined,
+	]);
 	expect(seviyeler).toEqual([0.7, 0.3]);
 });
 
@@ -40,7 +46,7 @@ function ortam(zaman: ZamanSecenekleri = {}) {
 	let musait = true;
 	let signal: AbortSignal | undefined;
 	const baglar: DonguBaglari = {
-		kaydet: async iptal => {
+		kaydet: async (iptal) => {
 			signal = iptal;
 			return {
 				dosya: "hazir.wav",
@@ -50,19 +56,19 @@ function ortam(zaman: ZamanSecenekleri = {}) {
 			};
 		},
 		yaziyaDok: async () => metin,
-		seslendir: async text => {
+		seslendir: async (text) => {
 			sesler.push(text);
 			return "cevap.ogg";
 		},
-		cal: async dosya => {
+		cal: async (dosya) => {
 			calinan.push(dosya);
 		},
-		temizleSes: async dosya => {
+		temizleSes: async (dosya) => {
 			silinen.push(dosya);
 		},
 	};
 	const ctx: DonguOrtami = {
-		zamanla: fn => {
+		zamanla: (fn) => {
 			kuyruk.push(fn);
 			return () => {
 				const i = kuyruk.indexOf(fn);
@@ -70,12 +76,12 @@ function ortam(zaman: ZamanSecenekleri = {}) {
 			};
 		},
 		musait: () => musait,
-		bildir: text => {
+		bildir: (text) => {
 			hatalar.push(text);
 		},
 	};
 	const dongu = new Dongu(
-		text => {
+		(text) => {
 			mesajlar.push(text);
 		},
 		ctx,
@@ -131,9 +137,21 @@ test("iki konuşma turu ayrı ölçülür; agent beklemesi ve oynatma öncesi ge
 	const dosya = path.join(klasor, "zaman.log");
 	let simdi = 1000;
 	const h = ortam({ env: { AFU_SES_ZAMAN: "1" }, dosya, saat: () => simdi });
-	h.baglar.kaydet = async () => ({ dosya: "test.wav", zaman: { konusmaBitti: simdi - 800, kayitKapandi: simdi }, temizle: async () => { simdi += 5; } });
-	h.baglar.yaziyaDok = async () => { simdi += 20; return "Soru"; };
-	h.baglar.seslendir = async () => { simdi += 40; return "cevap.ogg"; };
+	h.baglar.kaydet = async () => ({
+		dosya: "test.wav",
+		zaman: { konusmaBitti: simdi - 800, kayitKapandi: simdi },
+		temizle: async () => {
+			simdi += 5;
+		},
+	});
+	h.baglar.yaziyaDok = async () => {
+		simdi += 20;
+		return "Soru";
+	};
+	h.baglar.seslendir = async () => {
+		simdi += 40;
+		return "cevap.ogg";
+	};
 	h.baglar.cal = async (_dosya, _signal, _seviye, options) => {
 		simdi += 10;
 		await options?.basladi?.();
@@ -148,8 +166,21 @@ test("iki konuşma turu ayrı ölçülür; agent beklemesi ve oynatma öncesi ge
 			simdi += 100; // Existing scheduled TTS delay belongs to total, not synthesis.
 			await h.adim();
 		}
-		const satirlar = (await Bun.file(dosya).text()).trim().split("\n").map(satir => JSON.parse(satir));
-		expect(satirlar).toEqual([1, 2].map(tur => ({ tur, konusma_bitti_kayit_kapandi_ms: 800, yaziyaDok_ms: 20, sendUserMessage_agent_end_ms: 50, seslendir_ms: 40, calma_basladi_ms: 10, toplam_sustu_ilk_ses_ms: 1025 })));
+		const satirlar = (await Bun.file(dosya).text())
+			.trim()
+			.split("\n")
+			.map((satir) => JSON.parse(satir));
+		expect(satirlar).toEqual(
+			[1, 2].map((tur) => ({
+				tur,
+				konusma_bitti_kayit_kapandi_ms: 800,
+				yaziyaDok_ms: 20,
+				sendUserMessage_agent_end_ms: 50,
+				seslendir_ms: 40,
+				calma_basladi_ms: 10,
+				toplam_sustu_ilk_ses_ms: 1025,
+			})),
+		);
 	} finally {
 		h.dongu.durdur();
 		await fs.rm(klasor, { recursive: true, force: true });
@@ -157,24 +188,33 @@ test("iki konuşma turu ayrı ölçülür; agent beklemesi ve oynatma öncesi ge
 });
 
 test("ölçüm kapalıyken tam konuşma turu log veya saat okuması üretmez", async () => {
-	const dosya = path.join(import.meta.dir, `.dongu-kapali-${crypto.randomUUID()}.log`);
+	const dosya = path.join(
+		import.meta.dir,
+		`.dongu-kapali-${crypto.randomUUID()}.log`,
+	);
 	let saatOkuma = 0;
 	const h = ortam({ env: {}, dosya, saat: () => ++saatOkuma });
 	let baslamaBildirildi = false;
-	h.baglar.cal = async (_dosya, _signal, _seviye, options) => { baslamaBildirildi = options?.basladi !== undefined; };
+	h.baglar.cal = async (_dosya, _signal, _seviye, options) => {
+		baslamaBildirildi = options?.basladi !== undefined;
+	};
 	try {
-		h.dongu.baslat(); await h.adim();
-		h.dongu.cevap("Cevap"); await h.adim();
+		h.dongu.baslat();
+		await h.adim();
+		h.dongu.cevap("Cevap");
+		await h.adim();
 		expect(saatOkuma).toBe(0);
 		expect(baslamaBildirildi).toBe(false);
 		expect(await Bun.file(dosya).exists()).toBe(false);
-	} finally { h.dongu.durdur(); }
+	} finally {
+		h.dongu.durdur();
+	}
 });
 
 test("söz kesince eldeki kayıt yazıya dökülür, yeni mikrofon açılmaz ve panel kaldırılmaz", async () => {
 	const h = ortam();
 	const durumlar: Array<string | undefined> = [];
-	h.dongu.ortam.durum = d => durumlar.push(d);
+	h.dongu.ortam.durum = (d) => durumlar.push(d);
 	h.dongu.baslat();
 	await h.adim();
 	let temizlendi = false;
@@ -188,7 +228,7 @@ test("söz kesince eldeki kayıt yazıya dökülür, yeni mikrofon açılmaz ve 
 		};
 	};
 	const dosyalar: string[] = [];
-	h.baglar.yaziyaDok = async dosya => {
+	h.baglar.yaziyaDok = async (dosya) => {
 		dosyalar.push(dosya);
 		return "Yeni soru";
 	};
@@ -269,4 +309,27 @@ test("agent meşgulse kayıt ertelenir; ses hatası döngüyü güvenle durdurur
 	await hata.adim();
 	expect(hata.dongu.aktif).toBe(false);
 	expect(hata.hatalar).toHaveLength(1);
+});
+
+test("kısa kayıt Whisper'a veya ajana gönderilmeden temizlenir ve yeniden dinlenir", async () => {
+	const h = ortam();
+	let temiz = false;
+	let whisper = false;
+	h.baglar.kaydet = async () => ({
+		dosya: "kisa.wav",
+		bos: true,
+		temizle: async () => {
+			temiz = true;
+		},
+	});
+	h.baglar.yaziyaDok = async () => {
+		whisper = true;
+		return "uydurma";
+	};
+	h.dongu.baslat();
+	await h.adim();
+	expect(temiz).toBe(true);
+	expect(whisper).toBe(false);
+	expect(h.dongu.aktif).toBe(true);
+	h.dongu.durdur();
 });

@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
-	cal,
+	cal as gercekCal,
 	kaydet,
 	kayitAyarlari,
 	mikrofonSec,
@@ -16,7 +16,9 @@ import {
 function iptaliBekle(signal: AbortSignal): Promise<SurecSonucu> {
 	signal.throwIfAborted();
 	const bekle = Promise.withResolvers<SurecSonucu>();
-	signal.addEventListener("abort", () => bekle.reject(signal.reason), { once: true });
+	signal.addEventListener("abort", () => bekle.reject(signal.reason), {
+		once: true,
+	});
 	return bekle.promise;
 }
 
@@ -47,10 +49,11 @@ async function calmaSenaryosu(son: "bitti" | "iptal" | "mikrofon-hatasi") {
 			},
 		});
 		if (son === "bitti") expect(await is).toBeUndefined();
-		else if (son === "iptal") await expect(is).rejects.toMatchObject({ name: "AbortError" });
+		else if (son === "iptal")
+			await expect(is).rejects.toMatchObject({ name: "AbortError" });
 		else await expect(is).rejects.toThrow("Mikrofon kapandı");
 		expect(signals).toHaveLength(2);
-		expect(signals.every(s => s.aborted)).toBe(true);
+		expect(signals.every((s) => s.aborted)).toBe(true);
 		expect(sozKesildi).toBe(false);
 		expect(await fs.readdir(klasor)).toEqual([]);
 	} finally {
@@ -58,7 +61,8 @@ async function calmaSenaryosu(son: "bitti" | "iptal" | "mikrofon-hatasi") {
 	}
 }
 
-test("normal oynatma bitince bekleyen mikrofon iptal edilir, kısmi kayıt silinir", () => calmaSenaryosu("bitti"));
+test("normal oynatma bitince bekleyen mikrofon iptal edilir, kısmi kayıt silinir", () =>
+	calmaSenaryosu("bitti"));
 
 test("kayıt ölçümü sessizlik beklemesini içerir ve EOF silence_end konuşma sonunu silmez", async () => {
 	const klasor = await fs.mkdtemp(path.join(import.meta.dir, ".kayit-zaman-"));
@@ -72,10 +76,17 @@ test("kayıt ölçümü sessizlik beklemesini içerir ve EOF silence_end konuşm
 		return { kod: 0, hata: "" };
 	};
 	try {
-		const kayit = await kaydet(new AbortController().signal, { mikrofon: "Test", klasor, surec, saat: () => simdi });
-		expect(kayit.zaman).toEqual({ konusmaBitti: 200, kayitKapandi: 1050 });
+		const kayit = await kaydet(new AbortController().signal, {
+			mikrofon: "Test",
+			klasor,
+			surec,
+			saat: () => simdi,
+		});
+		expect(kayit.zaman).toEqual({ konusmaBitti: 500, kayitKapandi: 1050 });
 		await kayit.temizle();
-	} finally { await fs.rm(klasor, { recursive: true, force: true }); }
+	} finally {
+		await fs.rm(klasor, { recursive: true, force: true });
+	}
 });
 
 test("oynatma başlangıcı zarf analizi bittikten sonra ve ses bitmeden bildirilir", async () => {
@@ -88,11 +99,22 @@ test("oynatma başlangıcı zarf analizi bittikten sonra ve ses bitmeden bildiri
 		}
 		return { kod: 0, hata: "" };
 	};
-	await cal("cevap.wav", new AbortController().signal, () => {}, surec, undefined, () => { olaylar.push("ilk-ses-gostergesi"); });
+	await cal(
+		"cevap.wav",
+		new AbortController().signal,
+		() => {},
+		surec,
+		undefined,
+		() => {
+			olaylar.push("ilk-ses-gostergesi");
+		},
+	);
 	expect(olaylar).toEqual(["analiz", "ilk-ses-gostergesi", "oynatma-bitti"]);
 });
-test("oynatırken Esc/shutdown sinyali iki süreci de kapatır ve kısmi kaydı siler", () => calmaSenaryosu("iptal"));
-test("oynatırken mikrofon hatası FFplay'i de durdurur ve kısmi kaydı siler", () => calmaSenaryosu("mikrofon-hatasi"));
+test("oynatırken Esc/shutdown sinyali iki süreci de kapatır ve kısmi kaydı siler", () =>
+	calmaSenaryosu("iptal"));
+test("oynatırken mikrofon hatası FFplay'i de durdurur ve kısmi kaydı siler", () =>
+	calmaSenaryosu("mikrofon-hatasi"));
 
 test("söz kesme eşiği sayısal env değerini okur; boş, bozuk ve aralık dışını reddeder", () => {
 	expect(sozKesmeEsigi({ AFU_SOZ_KESME_DB: " -42 " })).toBe(-42);
@@ -118,10 +140,10 @@ test("oynatma sırasındaki sessizlik ffmpeg'i kapatmaz, söz kesildikten sonrak
 	} as unknown as Bun.Subprocess);
 	try {
 		await sesSureci(
-			["ffmpeg", "-af", "silencedetect=noise=-30dB:d=0.8"],
+			["ffmpeg", "-af", "silencedetect=noise=-30dB:d=0.5"],
 			new AbortController().signal,
 			15000,
-			satir => {
+			(satir) => {
 				if (satir === "KESILDI") kesildi = true;
 				return kesildi ? undefined : false;
 			},
@@ -145,7 +167,12 @@ test("söz kesildikten sonra süre sınırı sessizlik olmasa da ffmpeg'i tek q 
 		},
 	} as unknown as Bun.Subprocess);
 	try {
-		await sesSureci(["ffmpeg"], new AbortController().signal, 15000, () => "dur");
+		await sesSureci(
+			["ffmpeg"],
+			new AbortController().signal,
+			15000,
+			() => "dur",
+		);
 		expect(yazilan).toEqual(["q\n"]);
 	} finally {
 		spawn.mockRestore();
@@ -204,13 +231,19 @@ test("300 ms sürekli mikrofon RMS'i FFplay'i keser, aynı kayıt ilk heceyle Wh
 		return { kod: 0, hata: "" };
 	};
 	try {
-		const sonuc = await cal("cevap.wav", new AbortController().signal, undefined, surec, {
-			micSeviye: n => seviyeler.push(n),
-			sozKesildi: () => {
-				kesildi++;
+		const sonuc = await cal(
+			"cevap.wav",
+			new AbortController().signal,
+			undefined,
+			surec,
+			{
+				micSeviye: (n) => seviyeler.push(n),
+				sozKesildi: () => {
+					kesildi++;
+				},
+				kayit: { mikrofon: "Test", klasor },
 			},
-			kayit: { mikrofon: "Test", klasor },
-		});
+		);
 		expect(kesildi).toBe(1);
 		expect(seviyeler).toContain((60 - 20) / 60);
 		expect(Number(kirpma)).toBeCloseTo(0.9);
@@ -236,14 +269,15 @@ test("env kayıt eşiğini ve süreyi değiştirir; geçersiz değerler güvenli
 			AFU_SESSIZLIK_SN: "-1",
 			AFU_KAYIT_UST_SN: "Infinity",
 		}),
-	).toEqual({ db: -30, sessizlik: 0.8, ust: 10 });
+	).toEqual({ db: -30, sessizlik: 0.5, ust: 10 });
 });
 
 test("parçalı astats stderr kayıt seviyesine sıfır, yarım ve tam olarak ulaşır", async () => {
 	const klasor = await fs.mkdtemp(path.join(import.meta.dir, ".kayit-test-"));
 	const seviyeler: number[] = [];
 	const surec: SesSureci = async (args, _signal, _timeout, satir) => {
-		for (const db of ["-inf", "-30", "6"]) satir?.(`lavfi.astats.Overall.RMS_level=${db}`);
+		for (const db of ["-inf", "-30", "6"])
+			satir?.(`lavfi.astats.Overall.RMS_level=${db}`);
 		await Bun.write(args.at(-1)!, "pcm");
 		return { kod: 0, hata: "" };
 	};
@@ -252,7 +286,7 @@ test("parçalı astats stderr kayıt seviyesine sıfır, yarım ve tam olarak ul
 			mikrofon: "Test",
 			klasor,
 			surec,
-			seviye: n => seviyeler.push(n),
+			seviye: (n) => seviyeler.push(n),
 		});
 		expect(seviyeler).toEqual([0, 0.5, 1]);
 		await kayit.temizle();
@@ -264,7 +298,9 @@ test("parçalı astats stderr kayıt seviyesine sıfır, yarım ve tam olarak ul
 test("oynatma zarfı zamanla ilerler ve hata halinde seviye sıfırlanır", async () => {
 	const seviyeler: number[] = [];
 	const saat = spyOn(performance, "now").mockReturnValue(0);
-	const interval = spyOn(globalThis, "setInterval").mockImplementation(((fn: () => void) => {
+	const interval = spyOn(globalThis, "setInterval").mockImplementation(((
+		fn: () => void,
+	) => {
 		saat.mockReturnValue(200);
 		fn();
 		return 123;
@@ -282,9 +318,14 @@ test("oynatma zarfı zamanla ilerler ve hata halinde seviye sıfırlanır", asyn
 		return { kod: 1, hata: "failure" };
 	};
 	try {
-		await expect(cal("ses.ogg", new AbortController().signal, n => seviyeler.push(n), surec)).rejects.toThrow(
-			"Ses çalınamadı",
-		);
+		await expect(
+			cal(
+				"ses.ogg",
+				new AbortController().signal,
+				(n) => seviyeler.push(n),
+				surec,
+			),
+		).rejects.toThrow("Ses çalınamadı");
 		expect(seviyeler.at(-1)).toBe(0);
 		expect(clear).toHaveBeenCalledWith(123);
 	} finally {
@@ -307,7 +348,11 @@ test("kayıt ilk anda konuşmayla başlarsa ilk sessizlikte kapanır", async () 
 		},
 	} as unknown as Bun.Subprocess);
 	try {
-		await sesSureci(["ffmpeg", "-af", "silencedetect=noise=-30dB:d=0.8"], new AbortController().signal, 15000);
+		await sesSureci(
+			["ffmpeg", "-af", "silencedetect=noise=-30dB:d=0.5"],
+			new AbortController().signal,
+			15000,
+		);
 		expect(yazilan).toEqual(["q\n"]);
 	} finally {
 		spawn.mockRestore();
@@ -318,7 +363,7 @@ test("varsayılan kayıt yolu eklenti dışında, AFU_SES_DIR ise iç içe klas�
 	const kok = await fs.mkdtemp(path.join(os.tmpdir(), "afu-ses-test-"));
 	const onceki = process.env.AFU_SES_DIR;
 	const home = spyOn(os, "homedir").mockReturnValue(kok);
-	const surec: SesSureci = async args => {
+	const surec: SesSureci = async (args) => {
 		await Bun.write(args[args.length - 1], "fake pcm");
 		return { kod: 0, hata: "" };
 	};
@@ -329,9 +374,13 @@ test("varsayılan kayıt yolu eklenti dışında, AFU_SES_DIR ise iç içe klas�
 			surec,
 		});
 		try {
-			expect(path.dirname(varsayilan.dosya)).toBe(path.join(kok, ".omp", "afu-ses"));
+			expect(path.dirname(varsayilan.dosya)).toBe(
+				path.join(kok, ".omp", "afu-ses"),
+			);
 			const goreli = path.relative(import.meta.dir, varsayilan.dosya);
-			expect(path.isAbsolute(goreli) || goreli.startsWith(`..${path.sep}`)).toBe(true);
+			expect(
+				path.isAbsolute(goreli) || goreli.startsWith(`..${path.sep}`),
+			).toBe(true);
 		} finally {
 			await varsayilan.temizle();
 		}
@@ -392,7 +441,7 @@ for (const konusma of [true, false]) {
 			} as unknown as Bun.Subprocess);
 			try {
 				const sonuc = await sesSureci(
-					["ffmpeg", "-af", "silencedetect=noise=-30dB:d=0.8"],
+					["ffmpeg", "-af", "silencedetect=noise=-30dB:d=0.5"],
 					new AbortController().signal,
 					20_000,
 				);
@@ -411,7 +460,9 @@ for (const konusma of [true, false]) {
 
 test("dshow listesinden video ve alternatif adlar atlanıp ilk ses cihazı seçilir", () => {
 	expect(
-		mikrofonSec('"Kamera" (video)\n"Mikrofon (USB)" (audio)\n Alternative name "@device_x"\n"İkinci" (audio)'),
+		mikrofonSec(
+			'"Kamera" (video)\n"Mikrofon (USB)" (audio)\n Alternative name "@device_x"\n"İkinci" (audio)',
+		),
 	).toBe("Mikrofon (USB)");
 	expect(() => mikrofonSec('"Kamera" (video)')).toThrow("mikrofon");
 });
@@ -419,7 +470,7 @@ test("dshow listesinden video ve alternatif adlar atlanıp ilk ses cihazı seçi
 test("seçilen mikrofon 10 saniyelik mono WAV kaydına dönüşür ve temizlik yalnız kaydı siler", async () => {
 	const klasor = await fs.mkdtemp(path.join(import.meta.dir, ".kayit-test-"));
 	const komutlar: string[][] = [];
-	const surec: SesSureci = async args => {
+	const surec: SesSureci = async (args) => {
 		komutlar.push(args);
 		await Bun.write(args[args.length - 1], "fake pcm");
 		return { kod: 0, hata: "" };
@@ -431,10 +482,15 @@ test("seçilen mikrofon 10 saniyelik mono WAV kaydına dönüşür ve temizlik y
 			surec,
 		});
 		expect(komutlar[0]).toContain("audio=Benim Mikrofonum");
-		expect(komutlar[0].slice(komutlar[0].indexOf("-t"), komutlar[0].indexOf("-t") + 2)).toEqual(["-t", "10"]);
+		expect(
+			komutlar[0].slice(
+				komutlar[0].indexOf("-t"),
+				komutlar[0].indexOf("-t") + 2,
+			),
+		).toEqual(["-t", "10"]);
 		expect(komutlar[0]).toContain("pcm_s16le");
 		expect(komutlar[0][komutlar[0].indexOf("-af") + 1]).toBe(
-			"silencedetect=noise=-30dB:d=0.8,astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level",
+			"silencedetect=noise=-30dB:d=0.5,astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level",
 		);
 		expect(komutlar[0]).not.toContain("-nostdin");
 		expect(komutlar[0]).not.toContain("error");
@@ -447,8 +503,9 @@ test("seçilen mikrofon 10 saniyelik mono WAV kaydına dönüşür ve temizlik y
 
 test("env seçimi yokken ffmpeg keşfi yapılır; iptal edilen kayıt alt süreç açmaz", async () => {
 	const klasor = await fs.mkdtemp(path.join(import.meta.dir, ".kayit-test-"));
-	const surec: SesSureci = async args => {
-		if (args.includes("-list_devices")) return { kod: 1, hata: '"İlk Ses" (audio)' };
+	const surec: SesSureci = async (args) => {
+		if (args.includes("-list_devices"))
+			return { kod: 1, hata: '"İlk Ses" (audio)' };
 		expect(args).toContain("audio=İlk Ses");
 		await Bun.write(args[args.length - 1], "fake pcm");
 		return { kod: 0, hata: "" };
@@ -472,3 +529,65 @@ test("env seçimi yokken ffmpeg keşfi yapılır; iptal edilen kayıt alt süre�
 		await fs.rm(klasor, { recursive: true, force: true });
 	}
 });
+
+test("varsayılan çalmada mikrofon açılmaz ve 350 ms kuyruk beklenir", async () => {
+	const argslar: string[][] = [];
+	const seviyeler: number[] = [];
+	const surec: SesSureci = async (args) => {
+		argslar.push(args);
+		return { kod: 0, hata: "" };
+	};
+	const onceki = process.env.AFU_SOZ_KESME;
+	delete process.env.AFU_SOZ_KESME;
+	try {
+		const baslangic = performance.now();
+		await gercekCal("ses.wav", new AbortController().signal, undefined, surec, {
+			micSeviye: (n) => seviyeler.push(n),
+		});
+		expect(performance.now() - baslangic).toBeGreaterThanOrEqual(340);
+		expect(argslar.map((args) => args[0])).toEqual(["ffplay"]);
+		expect(seviyeler.every((n) => n === 0)).toBe(true);
+	} finally {
+		if (onceki === undefined) delete process.env.AFU_SOZ_KESME;
+		else process.env.AFU_SOZ_KESME = onceki;
+	}
+});
+
+// Existing playback tests exercise explicit opt-in, without leaving env mutations behind.
+async function cal(...args: Parameters<typeof gercekCal>) {
+	const onceki = process.env.AFU_SOZ_KESME;
+	process.env.AFU_SOZ_KESME = "1";
+	try {
+		return await gercekCal(...args);
+	} finally {
+		if (onceki === undefined) delete process.env.AFU_SOZ_KESME;
+		else process.env.AFU_SOZ_KESME = onceki;
+	}
+}
+
+for (const sure of [0, 0.399, 0.4, 0.8]) {
+	test(`${sure} saniye gerçek konuşma 400 ms sınırında boş tur olarak ayrılır`, async () => {
+		const klasor = await fs.mkdtemp(path.join(import.meta.dir, ".kayit-test-"));
+		try {
+			const sonuc = await kaydet(new AbortController().signal, {
+				mikrofon: "Test",
+				klasor,
+				surec: async (args, _signal, _timeout, satir) => {
+					satir?.("silence_start: 0");
+					if (sure) {
+						satir?.("silence_end: 2");
+						satir?.(`silence_start: ${2 + sure}`);
+					}
+					satir?.(`silence_end: ${2 + sure + 0.5}`); // EOF silence is not speech.
+					await Bun.write(args.at(-1)!, "pcm");
+					return { kod: 0, hata: "" };
+				},
+			});
+			expect(sonuc.bos).toBe(sure < 0.4);
+			await sonuc.temizle();
+			expect(await fs.readdir(klasor)).toEqual([]);
+		} finally {
+			await fs.rm(klasor, { recursive: true, force: true });
+		}
+	});
+}
