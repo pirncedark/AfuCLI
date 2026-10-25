@@ -1,0 +1,10 @@
+{
+	"name": "afu-ses-canli",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "AfuCLI yerel mikrofon konuşma döngüsü",
+	"scripts": { "test": "bun test" },
+	"peerDependencies": { "@oh-my-pi/pi-coding-agent": "*" },
+	"omp": { "extensions": ["./index.ts"] }
+}
