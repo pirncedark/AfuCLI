@@ -1,13 +1,14 @@
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { Bot } from "grammy";
 import {
-	dailyAllowance,
 	escapeHtml,
 	isDangerousCommand,
 	isQuietHour,
 	splitTelegramHtml,
 	telegramChunks,
-	type DailyState,
 } from "./format";
 
 export interface SendOptions {
@@ -130,6 +131,54 @@ export interface TelegramBot {
 	isRunning(): boolean;
 }
 
+class PollingLock {
+	#owner = `${process.pid}\n${crypto.randomUUID()}`;
+	#held = false;
+
+	constructor(readonly file: string) {}
+
+	async acquire(): Promise<boolean> {
+		await fs.mkdir(path.dirname(this.file), { recursive: true });
+		for (let attempt = 0; attempt < 2; attempt++) {
+			try {
+				const handle = await fs.open(this.file, "wx");
+				try {
+					await handle.writeFile(this.#owner);
+					this.#held = true;
+				} finally {
+					await handle.close();
+				}
+				return true;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			}
+			const owner = await Bun.file(this.file).text();
+			const pid = Number(owner.split("\n", 1)[0]);
+			// An empty/invalid file may still be in the process of being written.
+			if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+			try {
+				process.kill(pid, 0);
+				return false;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ESRCH") return false;
+			}
+			if ((await Bun.file(this.file).text()) !== owner) return false;
+			await fs.unlink(this.file);
+		}
+		return false;
+	}
+
+	async release(): Promise<void> {
+		if (!this.#held) return;
+		this.#held = false;
+		try {
+			if ((await Bun.file(this.file).text()) === this.#owner) await fs.unlink(this.file);
+		} catch {
+			/* A removed/replaced lock must not prevent shutdown. */
+		}
+	}
+}
+
 /** Registration is separated from the grammy constructor to enable offline tests. */
 export function registerTelegram(
 	pi: ExtensionAPI,
@@ -139,6 +188,7 @@ export function registerTelegram(
 		AFU_CLI_TG_CHAT: Bun.env.AFU_CLI_TG_CHAT,
 	},
 	now: () => Date = () => new Date(),
+	lockPath: string = path.join(os.homedir(), ".omp", "afu-telegram.lock"),
 ): void {
 	const token = env.AFU_CLI_TG_TOKEN?.trim();
 	const chat = env.AFU_CLI_TG_CHAT?.trim();
@@ -149,13 +199,8 @@ export function registerTelegram(
 	let closed = false;
 	let ready = false;
 	let replyExpected = false;
-	let daily: DailyState = { day: "", count: 0 };
-
-	const takeAlert = () => {
-		const next = dailyAllowance(daily, now());
-		daily = next.state;
-		return next.allowed;
-	};
+	let starting = false;
+	const lock = new PollingLock(lockPath);
 	const scheduleFrom =
 		(ctx: ExtensionContext): Schedule =>
 		(callback, milliseconds) => {
@@ -163,9 +208,15 @@ export function registerTelegram(
 			return () => ctx.clearTimer(timer);
 		};
 
-	pi.on("session_start", (_event, ctx) => {
-		if (bot || closed) return;
+	pi.on("session_start", async (_event, ctx) => {
+		if (ctx.agent.kind !== "main" || bot || closed || starting) return;
+		starting = true;
 		try {
+			if (!(await lock.acquire())) return;
+			if (closed) {
+				await lock.release();
+				return;
+			}
 			const activeBot = createBot(token);
 			bot = activeBot;
 			approvals = new Approvals(activeBot.api, chat, scheduleFrom(ctx), now);
@@ -173,7 +224,7 @@ export function registerTelegram(
 			activeBot.on("message:text", update => {
 				if (closed || String(update.chat.id) !== chat) return;
 				try {
-					pi.sendUserMessage(update.message.text, { deliverAs: "followUp" });
+					pi.sendUserMessage(update.message.text, ctx.isIdle() ? undefined : { deliverAs: "followUp" });
 					replyExpected = true;
 				} catch {
 					/* Runtime may already be shutting down. */
@@ -210,6 +261,9 @@ export function registerTelegram(
 			}, 0);
 		} catch {
 			ready = false;
+			await lock.release();
+		} finally {
+			starting = false;
 		}
 	});
 
@@ -224,6 +278,7 @@ export function registerTelegram(
 				/* Shutdown must remain bounded. */
 			}
 		}
+		await lock.release();
 	});
 
 	pi.on("agent_end", async event => {
@@ -237,7 +292,7 @@ export function registerTelegram(
 		if (!text.trim()) return;
 		const replying = replyExpected;
 		replyExpected = false;
-		if (!replying && !takeAlert()) return;
+		if (!replying) return;
 		for (const chunk of telegramChunks(text)) {
 			if (closed) return;
 			try {
@@ -264,14 +319,17 @@ export function registerTelegram(
 		},
 	});
 
-	pi.on("tool_call", async event => {
+	pi.on("tool_call", async (event, ctx) => {
 		if (
 			event.toolName !== "bash" ||
 			typeof event.input.command !== "string" ||
 			!isDangerousCommand(event.input.command)
 		)
 			return;
-		const approved = ready && !closed && approvals && takeAlert() ? await approvals.ask(event.input.command) : false;
-		if (!approved) return { block: true, reason: "Telegram onayı alınamadı; işlemi yeniden deneyin." };
+		const approved =
+			ready && !closed && approvals
+				? await approvals.ask(event.input.command)
+				: ctx.hasUI && (await ctx.ui.confirm("Onay gerekiyor", event.input.command));
+		if (!approved) return { block: true, reason: "İşlem onayı alınamadı; işlemi yeniden deneyin." };
 	});
 }

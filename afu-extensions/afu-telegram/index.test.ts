@@ -1,4 +1,7 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { registerTelegram, type SendOptions, type TelegramBot } from "./onay";
@@ -14,17 +17,28 @@ type Tool = {
 	): Promise<{ details: { approved: boolean } }>;
 };
 
-function fixture(env = { AFU_CLI_TG_TOKEN: "test-token", AFU_CLI_TG_CHAT: "42" }) {
+const cleanups: (() => Promise<void>)[] = [];
+afterEach(async () => {
+	for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+});
+
+function fixture(
+	env = { AFU_CLI_TG_TOKEN: "test-token", AFU_CLI_TG_CHAT: "42" },
+	lockPath = path.join(os.tmpdir(), `afu-telegram-${crypto.randomUUID()}.lock`),
+) {
 	const handlers = new Map<string, Handler>();
 	const updates = new Map<string, (ctx: unknown) => unknown>();
 	const tools = new Map<string, Tool>();
 	const timers = new Map<number, { callback: () => unknown; ms: number }>();
 	const incoming: string[] = [];
+	const delivery: unknown[] = [];
+	const confirmations: string[] = [];
 	const outgoing: { text: string; options: SendOptions }[] = [];
 	let timerId = 0;
 	let constructions = 0;
 	let running = false;
 	let stops = 0;
+	let starts = 0;
 	let date = new Date("2026-10-25T01:00:00Z");
 	const polling = Promise.withResolvers<void>();
 	const bot = {
@@ -41,6 +55,7 @@ function fixture(env = { AFU_CLI_TG_TOKEN: "test-token", AFU_CLI_TG_CHAT: "42" }
 		catch() {},
 		async init() {},
 		async start() {
+			starts++;
 			running = true;
 			await polling.promise;
 		},
@@ -62,11 +77,21 @@ function fixture(env = { AFU_CLI_TG_TOKEN: "test-token", AFU_CLI_TG_CHAT: "42" }
 		registerTool(tool: Tool & { name: string }) {
 			tools.set(tool.name, tool);
 		},
-		sendUserMessage(text: string) {
+		sendUserMessage(text: string, options?: unknown) {
 			incoming.push(text);
+			delivery.push(options);
 		},
 	} as unknown as ExtensionAPI;
 	const ctx = {
+		agent: { kind: "main" },
+		hasUI: false,
+		isIdle: () => true,
+		ui: {
+			async confirm(_title: string, text: string) {
+				confirmations.push(text);
+				return true;
+			},
+		},
 		setTimeout(callback: () => unknown, ms: number) {
 			const id = ++timerId;
 			timers.set(id, { callback, ms });
@@ -84,8 +109,15 @@ function fixture(env = { AFU_CLI_TG_TOKEN: "test-token", AFU_CLI_TG_CHAT: "42" }
 		},
 		env,
 		() => date,
+		lockPath,
 	);
 	const emit = async (event: string, payload: unknown = {}) => handlers.get(event)?.(payload, ctx);
+	cleanups.push(async () => {
+		await fs.rm(lockPath, { force: true });
+	});
+	cleanups.push(async () => {
+		await emit("session_shutdown");
+	});
 	const start = async () => {
 		await emit("session_start");
 		for (const [id, timer] of timers) {
@@ -115,6 +147,9 @@ function fixture(env = { AFU_CLI_TG_TOKEN: "test-token", AFU_CLI_TG_CHAT: "42" }
 		tools,
 		timers,
 		incoming,
+		delivery,
+		confirmations,
+		lockPath,
 		outgoing,
 		updates,
 		emit,
@@ -124,6 +159,7 @@ function fixture(env = { AFU_CLI_TG_TOKEN: "test-token", AFU_CLI_TG_CHAT: "42" }
 		constructions: () => constructions,
 		running: () => running,
 		stops: () => stops,
+		starts: () => starts,
 		setDate(value: Date) {
 			date = value;
 		},
@@ -163,18 +199,108 @@ test("only allowed chat reaches agent; last assistant text is HTML, without thin
 	expect(f.incoming).toEqual(["hello"]);
 });
 
-test("eleventh proactive alert is suppressed; incoming replies and next day still work", async () => {
+test("terminal turns stay silent; only Telegram questions receive one reply", async () => {
 	const f = fixture();
 	await f.start();
 	for (let i = 0; i < 11; i++) await f.end(`alert ${i}`);
-	expect(f.outgoing.length).toBe(10);
+	expect(f.outgoing.length).toBe(0);
 	await f.updates.get("message:text")?.({ chat: { id: 42 }, message: { text: "question" } });
 	await f.end("answer");
 	expect(f.outgoing.at(-1)?.text).toBe("answer");
 	f.setDate(new Date("2026-10-26T09:00:00Z"));
 	await f.end("new day");
+	expect(f.outgoing.length).toBe(1);
+	await f.updates.get("message:text")?.({ chat: { id: 42 }, message: { text: "next question" } });
+	await f.end("next answer");
 	expect(f.outgoing.at(-1)?.options.disable_notification).toBe(false);
 	await f.emit("session_shutdown");
+});
+
+test("idle Telegram input starts a turn without explicit deliverAs", async () => {
+	const f = fixture();
+	await f.start();
+	await f.updates.get("message:text")?.({ chat: { id: 42 }, message: { text: "start" } });
+	expect(f.incoming).toEqual(["start"]);
+	expect((f.delivery[0] as { deliverAs?: string } | undefined)?.deliverAs).toBeUndefined();
+	f.ctx.isIdle = () => false;
+	await f.updates.get("message:text")?.({ chat: { id: 42 }, message: { text: "queued" } });
+	expect(f.incoming).toEqual(["start", "queued"]);
+	expect(f.delivery[1]).toEqual({ deliverAs: "followUp" });
+});
+
+test("subagents never start Telegram polling", async () => {
+	const f = fixture();
+	f.ctx.agent = { ...f.ctx.agent, kind: "sub" };
+	await f.start();
+	expect(f.starts()).toBe(0);
+	expect(f.constructions()).toBe(0);
+});
+
+test("only one instance polls and a non-owner shutdown preserves the lock", async () => {
+	const owner = fixture();
+	const other = fixture(undefined, owner.lockPath);
+	await Promise.all([owner.start(), other.start()]);
+	expect(owner.starts() + other.starts()).toBe(1);
+	const winner = owner.starts() ? owner : other;
+	const loser = owner.starts() ? other : owner;
+	await loser.emit("session_shutdown");
+	expect(await Bun.file(owner.lockPath).exists()).toBe(true);
+	await winner.emit("session_shutdown");
+	expect(await Bun.file(owner.lockPath).exists()).toBe(false);
+});
+
+test("a dead PID lock is reclaimed but a live PID prevents polling", async () => {
+	const f = fixture();
+	await Bun.write(f.lockPath, "2147483647");
+	await f.start();
+	expect(f.starts()).toBe(1);
+	await f.emit("session_shutdown");
+	const live = fixture();
+	await Bun.write(live.lockPath, String(process.pid));
+	await live.start();
+	expect(live.starts()).toBe(0);
+	await live.emit("session_shutdown");
+	expect(await Bun.file(live.lockPath).text()).toBe(String(process.pid));
+});
+
+test("shutdown leaves a replacement owner's lock intact", async () => {
+	const f = fixture();
+	await f.start();
+	await fs.rm(f.lockPath);
+	await Bun.write(f.lockPath, `${process.pid}\nreplacement`);
+	await f.emit("session_shutdown");
+	expect(await Bun.file(f.lockPath).text()).toContain("replacement");
+});
+
+test("unavailable Telegram uses terminal confirmation and headless execution blocks", async () => {
+	const f = fixture();
+	const event = { toolName: "bash", input: { command: "git reset --hard" } };
+	expect(await f.emit("tool_call", event)).toMatchObject({ block: true });
+	f.ctx.hasUI = true;
+	expect(await f.emit("tool_call", event)).toBeUndefined();
+	expect(f.confirmations).toEqual([event.input.command]);
+	f.ctx.ui.confirm = async () => false;
+	expect(await f.emit("tool_call", event)).toMatchObject({ block: true });
+	await f.start();
+	await f.emit("session_shutdown");
+	f.ctx.ui.confirm = async () => true;
+	expect(await f.emit("tool_call", event)).toBeUndefined();
+});
+
+test("approval requests remain available after ten requests on the same day", async () => {
+	const f = fixture();
+	await f.start();
+	for (let i = 0; i < 11; i++) {
+		const pending = f.emit("tool_call", { toolName: "bash", input: { command: "git reset --hard" } });
+		await Bun.sleep(0);
+		expect(f.outgoing.length).toBe(i + 1);
+		const data = f.outgoing.at(-1)?.options.reply_markup?.inline_keyboard[0][0].callback_data;
+		await f.updates.get("callback_query:data")?.({
+			callbackQuery: { data, message: { message_id: f.outgoing.length, chat: { id: 42 } } },
+			async answerCallbackQuery() {},
+		});
+		expect(await pending).toBeUndefined();
+	}
 });
 
 test("dangerous tool blocks before startup, on rejection and timeout; matching approval allows it", async () => {
