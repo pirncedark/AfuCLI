@@ -15,16 +15,11 @@ export type SesSureci = (
 	args: string[],
 	signal: AbortSignal,
 	timeoutMs: number,
-	satirOku?: (satir: string) => void,
+	satirOku?: (satir: string) => false | "dur" | void,
 ) => Promise<SurecSonucu>;
 
 /** Bounded, hidden subprocess; abort terminates capture/playback without a new window. */
-export const sesSureci: SesSureci = async (
-	args,
-	signal,
-	timeoutMs,
-	satirOku,
-) => {
+export const sesSureci: SesSureci = async (args, signal, timeoutMs, satirOku) => {
 	signal.throwIfAborted();
 	const child = Bun.spawn(args, {
 		stdin: "pipe",
@@ -40,17 +35,22 @@ export const sesSureci: SesSureci = async (
 		let konusmaBasladi = false;
 		let sessizlikGoruldu = false;
 		let durduruldu = false;
-		const sessizlikIzle = args.some((arg) => arg.includes("silencedetect="));
+		const sessizlikIzle = args.some(arg => arg.includes("silencedetect="));
 		for await (const bytes of readLines(child.stderr, signal)) {
 			const satir = decoder.decode(bytes);
 			hata = `${hata}${satir}\n`.slice(-64_000);
-			satirOku?.(satir);
+			const yonetim = satirOku?.(satir);
+			if (yonetim === "dur" && !durduruldu) {
+				durduruldu = true;
+				child.stdin.write("q\n");
+				await child.stdin.flush();
+			}
+			if (yonetim === false || yonetim === "dur") continue;
 			if (!sessizlikIzle || durduruldu) continue;
 			if (satir.includes("silence_end:")) konusmaBasladi = true;
 			const baslangic = /silence_start:\s*([\d.]+)/u.exec(satir);
 			if (baslangic) {
-				if (!sessizlikGoruldu && Number(baslangic[1]) > 0)
-					konusmaBasladi = true;
+				if (!sessizlikGoruldu && Number(baslangic[1]) > 0) konusmaBasladi = true;
 				sessizlikGoruldu = true;
 			}
 			if (konusmaBasladi && satir.includes("silence_start:")) {
@@ -69,10 +69,7 @@ export const sesSureci: SesSureci = async (
 
 export function mikrofonSec(liste: string): string {
 	const ad = /"([^"\r\n]+)"\s+\(audio\)/u.exec(liste)?.[1];
-	if (!ad)
-		throw new Error(
-			"Kullanılabilir mikrofon bulunamadı, mikrofonu bağlayıp /konus yazın.",
-		);
+	if (!ad) throw new Error("Kullanılabilir mikrofon bulunamadı, mikrofonu bağlayıp /konus yazın.");
 	return ad;
 }
 
@@ -82,17 +79,27 @@ interface KayitSecenekleri {
 	klasor?: string;
 	surec?: SesSureci;
 	seviye?: SeviyeBildir;
+	sozKesme?: { basladi(): void; db?: number };
 }
 
-export function kayitAyarlari(
-	env: Record<string, string | undefined> = process.env,
-): { db: number; sessizlik: number; ust: number } {
-	const sayi = (
-		ad: string,
-		varsayilan: number,
-		min: number,
-		max: number,
-	): number => {
+export interface CalSecenekleri {
+	micSeviye?: SeviyeBildir;
+	sozKesildi?(): void;
+	kayit?: Omit<KayitSecenekleri, "sozKesme" | "seviye" | "surec">;
+}
+
+export function sozKesmeEsigi(env: Record<string, string | undefined> = process.env): number {
+	const ham = env.AFU_SOZ_KESME_DB?.trim();
+	const db = ham ? Number(ham) : NaN;
+	return Number.isFinite(db) && db >= -100 && db <= 0 ? db : -30;
+}
+
+export function kayitAyarlari(env: Record<string, string | undefined> = process.env): {
+	db: number;
+	sessizlik: number;
+	ust: number;
+} {
+	const sayi = (ad: string, varsayilan: number, min: number, max: number): number => {
 		const ham = env[ad]?.trim();
 		const n = ham ? Number(ham) : NaN;
 		return Number.isFinite(n) && n >= min && n <= max ? n : varsayilan;
@@ -106,38 +113,21 @@ export function kayitAyarlari(
 
 /** Logarithmic display range: silence at -60 dB, full scale at 0 dB. */
 export function rmsSeviye(satir: string): number | undefined {
-	const match = /lavfi\.astats\.Overall\.RMS_level=(-?inf|[-+\d.eE]+)/u.exec(
-		satir,
-	);
+	const match = /lavfi\.astats\.Overall\.RMS_level=(-?inf|[-+\d.eE]+)/u.exec(satir);
 	if (!match) return undefined;
 	const db = Number(match[1]);
 	if (match[1] === "-inf") return 0;
-	return Number.isFinite(db)
-		? Math.max(0, Math.min(1, (db + 60) / 60))
-		: undefined;
+	return Number.isFinite(db) ? Math.max(0, Math.min(1, (db + 60) / 60)) : undefined;
 }
 
-export async function kaydet(
-	signal: AbortSignal,
-	options: KayitSecenekleri = {},
-): Promise<Kayit> {
+export async function kaydet(signal: AbortSignal, options: KayitSecenekleri = {}): Promise<Kayit> {
 	signal.throwIfAborted();
 	const surec = options.surec ?? sesSureci;
 	const ayar = kayitAyarlari();
 	let mikrofon = options.mikrofon ?? process.env.AFU_MIKROFON;
 	if (!mikrofon?.trim()) {
 		const liste = await surec(
-			[
-				"ffmpeg",
-				"-nostdin",
-				"-hide_banner",
-				"-list_devices",
-				"true",
-				"-f",
-				"dshow",
-				"-i",
-				"dummy",
-			],
+			["ffmpeg", "-nostdin", "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
 			signal,
 			10_000,
 		);
@@ -145,15 +135,19 @@ export async function kaydet(
 		mikrofon = mikrofonSec(liste.hata);
 	}
 	signal.throwIfAborted();
-	const klasor =
-		options.klasor ??
-		process.env.AFU_SES_DIR ??
-		path.join(os.homedir(), ".omp", "afu-ses");
+	const klasor = options.klasor ?? process.env.AFU_SES_DIR ?? path.join(os.homedir(), ".omp", "afu-ses");
 	await fs.mkdir(klasor, { recursive: true });
 	const dosya = path.join(klasor, `mikrofon-${crypto.randomUUID()}.wav`);
+	const kirpilmis = `${dosya}.kes.wav`;
 	const temizle = async () => {
-		await fs.rm(dosya, { force: true });
+		await Promise.all([fs.rm(dosya, { force: true }), fs.rm(kirpilmis, { force: true })]);
 	};
+	let zaman = 0;
+	let yuksekBaslangic: number | undefined;
+	let oncekiZaman: number | undefined;
+	let sozBaslangici: number | undefined;
+	const esik = options.sozKesme?.db ?? sozKesmeEsigi();
+	const ust = options.sozKesme ? 180 + ayar.ust : ayar.ust;
 	try {
 		const sonuc = await surec(
 			[
@@ -164,12 +158,13 @@ export async function kaydet(
 				"-y",
 				"-f",
 				"dshow",
+				...(options.sozKesme ? ["-audio_buffer_size", "50"] : []),
 				"-i",
 				`audio=${mikrofon}`,
 				"-t",
-				String(ayar.ust),
+				String(ust),
 				"-af",
-				`silencedetect=noise=${ayar.db}dB:d=${ayar.sessizlik},astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level`,
+				`${options.sozKesme ? "aresample=16000,asetnsamples=n=1600:p=0," : ""}silencedetect=noise=${ayar.db}dB:d=${ayar.sessizlik},astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level`,
 				"-ac",
 				"1",
 				"-ar",
@@ -179,17 +174,62 @@ export async function kaydet(
 				dosya,
 			],
 			signal,
-			(ayar.ust + 5) * 1000,
-			(satir) => {
+			(ust + 5) * 1000,
+			satir => {
+				const pts = /pts_time:([\d.]+)/u.exec(satir);
+				if (pts) zaman = Number(pts[1]);
 				const seviye = rmsSeviye(satir);
 				if (seviye !== undefined) options.seviye?.(seviye);
+				if (options.sozKesme && sozBaslangici === undefined) {
+					if (seviye !== undefined) {
+						const db = /RMS_level=([-+\d.eE]+)/u.exec(satir)?.[1];
+						if (db !== undefined && Number(db) > esik) {
+							if (oncekiZaman === undefined || zaman - oncekiZaman > 0.2) yuksekBaslangic = zaman;
+							yuksekBaslangic ??= zaman;
+							if (zaman - yuksekBaslangic >= 0.3 - 1e-6) {
+								sozBaslangici = Math.max(0, yuksekBaslangic - 0.1);
+								options.sozKesme.basladi();
+							}
+						} else yuksekBaslangic = undefined;
+						oncekiZaman = zaman;
+					}
+					return false; // Ignore playback-phase silences until the user takes the turn.
+				}
+				if (sozBaslangici !== undefined && zaman - sozBaslangici >= ayar.ust) return "dur";
+				return undefined;
 			},
 		);
 		signal.throwIfAborted();
 		if (sonuc.kod !== 0 || (await fs.stat(dosya)).size === 0) {
-			throw new Error(
-				"Mikrofon kaydedilemedi, mikrofon iznini ve FFmpeg kurulumunu kontrol edin.",
+			throw new Error("Mikrofon kaydedilemedi, mikrofon iznini ve FFmpeg kurulumunu kontrol edin.");
+		}
+		if (options.sozKesme) {
+			if (sozBaslangici === undefined) throw new Error("Mikrofon bekleme süresi doldu, /konus ile tekrar deneyin.");
+			const kirp = await surec(
+				[
+					"ffmpeg",
+					"-nostdin",
+					"-v",
+					"error",
+					"-y",
+					"-ss",
+					String(sozBaslangici),
+					"-i",
+					dosya,
+					"-t",
+					String(ayar.ust),
+					"-c:a",
+					"pcm_s16le",
+					kirpilmis,
+				],
+				signal,
+				20_000,
 			);
+			signal.throwIfAborted();
+			if (kirp.kod !== 0 || (await fs.stat(kirpilmis)).size === 0)
+				throw new Error("Konuşma hazırlanamadı, /konus ile tekrar deneyin.");
+			await fs.rm(dosya, { force: true });
+			return { dosya: kirpilmis, temizle };
 		}
 		return { dosya, temizle };
 	} catch (error) {
@@ -203,7 +243,8 @@ export async function cal(
 	signal: AbortSignal,
 	seviye?: SeviyeBildir,
 	surec: SesSureci = sesSureci,
-): Promise<void> {
+	options?: CalSecenekleri,
+): Promise<Kayit | void> {
 	const zarf: Array<{ zaman: number; seviye: number }> = [];
 	let zaman = 0;
 	if (seviye) {
@@ -224,15 +265,14 @@ export async function cal(
 			],
 			signal,
 			180_000,
-			(satir) => {
+			satir => {
 				const pts = /pts_time:([\d.]+)/u.exec(satir);
 				if (pts) zaman = Number(pts[1]);
 				const deger = rmsSeviye(satir);
 				if (deger !== undefined) zarf.push({ zaman, seviye: deger });
 			},
 		);
-		if (analiz.kod !== 0)
-			throw new Error("Ses çözülemedi, FFmpeg kurulumunu kontrol edin.");
+		if (analiz.kod !== 0) throw new Error("Ses çözülemedi, FFmpeg kurulumunu kontrol edin.");
 	}
 	signal.throwIfAborted();
 	const baslangic = performance.now();
@@ -244,19 +284,69 @@ export async function cal(
 	};
 	guncelle();
 	const timer = seviye ? setInterval(guncelle, 100) : undefined;
+	const oynatma = new AbortController();
+	const mikrofon = new AbortController();
+	const iptal = () => {
+		oynatma.abort(signal.reason);
+		mikrofon.abort(signal.reason);
+	};
+	signal.addEventListener("abort", iptal, { once: true });
+	let kesildi = false;
+	let kayit: Kayit | undefined;
+	const dinleme = options
+		? kaydet(mikrofon.signal, {
+				...options.kayit,
+				surec,
+				seviye: options.micSeviye,
+				sozKesme: {
+					basladi: () => {
+						kesildi = true;
+						oynatma.abort();
+						options.sozKesildi?.();
+					},
+				},
+			}).then(
+				sonuc => {
+					kayit = sonuc;
+				},
+				error => {
+					if (mikrofon.signal.aborted && !kesildi) return;
+					oynatma.abort();
+					throw error;
+				},
+			)
+		: Promise.resolve();
 	try {
-		const sonuc = await surec(
-			["ffplay", "-nodisp", "-autoexit", "-loglevel", "error", dosya],
-			signal,
-			180_000,
-		);
+		const oynat = async () => {
+			try {
+				const sonuc = await surec(
+					["ffplay", "-nodisp", "-autoexit", "-loglevel", "error", dosya],
+					oynatma.signal,
+					180_000,
+				);
+				if (sonuc.kod !== 0) throw new Error("Ses çalınamadı, hoparlörü ve FFplay kurulumunu kontrol edin.");
+			} catch (error) {
+				if (!kesildi || signal.aborted) throw error;
+			} finally {
+				clearInterval(timer);
+				seviye?.(0);
+				if (!kesildi) mikrofon.abort();
+			}
+		};
+		const [calinan, dinlenen] = await Promise.allSettled([oynat(), dinleme]);
 		signal.throwIfAborted();
-		if (sonuc.kod !== 0)
-			throw new Error(
-				"Ses çalınamadı, hoparlörü ve FFplay kurulumunu kontrol edin.",
-			);
+		if (dinlenen.status === "rejected") throw dinlenen.reason;
+		if (calinan.status === "rejected") throw calinan.reason;
+		return kayit;
+	} catch (error) {
+		await kayit?.temizle();
+		throw error;
 	} finally {
+		signal.removeEventListener("abort", iptal);
+		mikrofon.abort();
+		oynatma.abort();
 		clearInterval(timer);
 		seviye?.(0);
+		options?.micSeviye?.(0);
 	}
 }

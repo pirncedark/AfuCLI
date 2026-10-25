@@ -5,8 +5,8 @@ test("dinleme, Whisper, düşünme ve oynatma durumları ses seviyeleriyle sıra
 	const h = ortam();
 	const durumlar: Array<string | undefined> = [];
 	const seviyeler: number[] = [];
-	h.dongu.ortam.durum = (d) => durumlar.push(d);
-	h.dongu.ortam.seviye = (n) => seviyeler.push(n);
+	h.dongu.ortam.durum = d => durumlar.push(d);
+	h.dongu.ortam.seviye = n => seviyeler.push(n);
 	let gecSeviye: ((n: number) => void) | undefined;
 	h.baglar.kaydet = async (_signal, options) => {
 		options?.seviye?.(0.7);
@@ -22,14 +22,7 @@ test("dinleme, Whisper, düşünme ve oynatma durumları ses seviyeleriyle sıra
 	await h.adim();
 	h.dongu.durdur();
 	gecSeviye?.(1);
-	expect(durumlar).toEqual([
-		"Dinliyorum",
-		"Anlıyorum",
-		"Düşünüyorum",
-		"Konuşuyor",
-		undefined,
-		undefined,
-	]);
+	expect(durumlar).toEqual(["Dinliyorum", "Anlıyorum", "Düşünüyorum", "Konuşuyor", undefined]);
 	expect(seviyeler).toEqual([0.7, 0.3]);
 });
 
@@ -44,7 +37,7 @@ function ortam() {
 	let musait = true;
 	let signal: AbortSignal | undefined;
 	const baglar: DonguBaglari = {
-		kaydet: async (iptal) => {
+		kaydet: async iptal => {
 			signal = iptal;
 			return {
 				dosya: "hazir.wav",
@@ -54,19 +47,19 @@ function ortam() {
 			};
 		},
 		yaziyaDok: async () => metin,
-		seslendir: async (text) => {
+		seslendir: async text => {
 			sesler.push(text);
 			return "cevap.ogg";
 		},
-		cal: async (dosya) => {
+		cal: async dosya => {
 			calinan.push(dosya);
 		},
-		temizleSes: async (dosya) => {
+		temizleSes: async dosya => {
 			silinen.push(dosya);
 		},
 	};
 	const ctx: DonguOrtami = {
-		zamanla: (fn) => {
+		zamanla: fn => {
 			kuyruk.push(fn);
 			return () => {
 				const i = kuyruk.indexOf(fn);
@@ -74,12 +67,12 @@ function ortam() {
 			};
 		},
 		musait: () => musait,
-		bildir: (text) => {
+		bildir: text => {
 			hatalar.push(text);
 		},
 	};
 	const dongu = new Dongu(
-		(text) => {
+		text => {
 			mesajlar.push(text);
 		},
 		ctx,
@@ -123,8 +116,48 @@ test("kayıt yazıya gönderilir, yalnız beklenen son cevap çalınır ve ardı
 	expect(h.calinan).toEqual(["cevap.ogg"]);
 	expect(h.silinen).toContain("cevap.ogg");
 	expect(h.kuyruk).toHaveLength(1);
+	await h.adim();
+	expect(h.mesajlar).toEqual(["Merhaba Afu", "Merhaba Afu"]);
 	h.dongu.durdur();
 	expect(h.kuyruk).toHaveLength(0);
+});
+
+test("söz kesince eldeki kayıt yazıya dökülür, yeni mikrofon açılmaz ve panel kaldırılmaz", async () => {
+	const h = ortam();
+	const durumlar: Array<string | undefined> = [];
+	h.dongu.ortam.durum = d => durumlar.push(d);
+	h.dongu.baslat();
+	await h.adim();
+	let temizlendi = false;
+	h.baglar.cal = async (_dosya, _signal, _seviye, options) => {
+		options?.sozKesildi?.();
+		return {
+			dosya: "soz-kesme.wav",
+			temizle: async () => {
+				temizlendi = true;
+			},
+		};
+	};
+	const dosyalar: string[] = [];
+	h.baglar.yaziyaDok = async dosya => {
+		dosyalar.push(dosya);
+		return "Yeni soru";
+	};
+	h.dongu.cevap("Uzun cevap");
+	await h.adim();
+	expect(dosyalar).toEqual(["soz-kesme.wav"]);
+	expect(h.mesajlar).toEqual(["Merhaba Afu", "Yeni soru"]);
+	expect(temizlendi).toBe(true);
+	expect(durumlar).toEqual([
+		"Dinliyorum",
+		"Anlıyorum",
+		"Düşünüyorum",
+		"Konuşuyor",
+		"Dinliyorum",
+		"Anlıyorum",
+		"Düşünüyorum",
+	]);
+	h.dongu.durdur();
 });
 
 test("dur ve kapat sözü modele gönderilmeden mikrofon döngüsünü bitirir", async () => {
