@@ -91,3 +91,7 @@ bun test: 31 pass, 1 skip, 0 fail
 Elle kontrol (2 dakika): `/konus` → soru sor → cevap sürerken yeni soru sor →
 sesin kesilip yeni sorunun işlendiğini kontrol et → sonraki turda “dur” de →
 tekrar başlatıp Esc ile durdur.
+
+## Bilinen sınırlar
+
+- Söz kesmede yankı engelleme yok. Hoparlörden çıkan afu sesi mikrofona geri gelir; -30 dB eşiği aşılırsa afu kendi sözünü keser. Kulaklıksız denemede afu sürekli kendini kesiyorsa eşiği yükseltin: `AFU_SOZ_KESME_DB=-15` (ya da daha yüksek).
