@@ -1,0 +1,218 @@
+import { expect, test } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
+import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { registerTelegram, type SendOptions, type TelegramBot } from "./onay";
+
+type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
+type Tool = {
+	execute(
+		id: string,
+		params: { text: string },
+		signal: AbortSignal | undefined,
+		update: undefined,
+		ctx: ExtensionContext,
+	): Promise<{ details: { approved: boolean } }>;
+};
+
+function fixture(env = { AFU_CLI_TG_TOKEN: "test-token", AFU_CLI_TG_CHAT: "42" }) {
+	const handlers = new Map<string, Handler>();
+	const updates = new Map<string, (ctx: unknown) => unknown>();
+	const tools = new Map<string, Tool>();
+	const timers = new Map<number, { callback: () => unknown; ms: number }>();
+	const incoming: string[] = [];
+	const outgoing: { text: string; options: SendOptions }[] = [];
+	let timerId = 0;
+	let constructions = 0;
+	let running = false;
+	let stops = 0;
+	let date = new Date("2026-10-25T01:00:00Z");
+	const polling = Promise.withResolvers<void>();
+	const bot = {
+		api: {
+			async sendMessage(_chat: string, text: string, options: SendOptions) {
+				outgoing.push({ text, options });
+				return { message_id: outgoing.length };
+			},
+			async editMessageReplyMarkup() {},
+		} satisfies TelegramBot["api"],
+		on(filter: string, handler: (ctx: unknown) => unknown) {
+			updates.set(filter, handler);
+		},
+		catch() {},
+		async init() {},
+		async start() {
+			running = true;
+			await polling.promise;
+		},
+		async stop() {
+			stops++;
+			running = false;
+			polling.resolve();
+		},
+		isRunning() {
+			return running;
+		},
+	};
+	// Host overloads are intentionally narrowed to the events used by this extension.
+	const pi = {
+		arktype: type,
+		on(event: string, handler: Handler) {
+			handlers.set(event, handler);
+		},
+		registerTool(tool: Tool & { name: string }) {
+			tools.set(tool.name, tool);
+		},
+		sendUserMessage(text: string) {
+			incoming.push(text);
+		},
+	} as unknown as ExtensionAPI;
+	const ctx = {
+		setTimeout(callback: () => unknown, ms: number) {
+			const id = ++timerId;
+			timers.set(id, { callback, ms });
+			return id;
+		},
+		clearTimer(id: number) {
+			timers.delete(id);
+		},
+	} as unknown as ExtensionContext;
+	registerTelegram(
+		pi,
+		() => {
+			constructions++;
+			return bot as unknown as TelegramBot;
+		},
+		env,
+		() => date,
+	);
+	const emit = async (event: string, payload: unknown = {}) => handlers.get(event)?.(payload, ctx);
+	const start = async () => {
+		await emit("session_start");
+		for (const [id, timer] of timers) {
+			if (timer.ms === 0) {
+				timers.delete(id);
+				void timer.callback();
+			}
+		}
+		await Bun.sleep(0);
+	};
+	const end = (text: string, extra = {}) =>
+		emit("agent_end", {
+			messages: [
+				{ role: "assistant", content: [{ type: "text", text: "old response" }] },
+				{
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: "secret" },
+						{ type: "text", text },
+					],
+				},
+			],
+			...extra,
+		});
+	return {
+		handlers,
+		tools,
+		timers,
+		incoming,
+		outgoing,
+		updates,
+		emit,
+		start,
+		end,
+		ctx,
+		constructions: () => constructions,
+		running: () => running,
+		stops: () => stops,
+		setDate(value: Date) {
+			date = value;
+		},
+	};
+}
+
+test("missing credentials register nothing and never create a bot", async () => {
+	for (const env of [
+		{ AFU_CLI_TG_TOKEN: "", AFU_CLI_TG_CHAT: "42" },
+		{ AFU_CLI_TG_TOKEN: "test", AFU_CLI_TG_CHAT: "" },
+		{ AFU_CLI_TG_TOKEN: "test", AFU_CLI_TG_CHAT: "@someone" },
+	]) {
+		const f = fixture(env);
+		await f.start();
+		expect(f.constructions()).toBe(0);
+		expect(f.handlers.size).toBe(0);
+		expect(f.tools.size).toBe(0);
+	}
+});
+
+test("only allowed chat reaches agent; last assistant text is HTML, without thinking", async () => {
+	const f = fixture();
+	expect(f.constructions()).toBe(0);
+	await f.start();
+	const receive = f.updates.get("message:text");
+	await receive?.({ chat: { id: 99 }, message: { text: "intruder" } });
+	await receive?.({ chat: { id: 42 }, message: { text: "hello" } });
+	expect(f.incoming).toEqual(["hello"]);
+	await f.end("**reply**");
+	expect(f.outgoing).toEqual([{ text: "<b>reply</b>", options: { parse_mode: "HTML", disable_notification: true } }]);
+	await f.end("retry", { willContinue: true });
+	expect(f.outgoing.length).toBe(1);
+	await f.emit("session_shutdown");
+	expect(f.running()).toBe(false);
+	expect(f.stops()).toBe(1);
+	await receive?.({ chat: { id: 42 }, message: { text: "late" } });
+	expect(f.incoming).toEqual(["hello"]);
+});
+
+test("eleventh proactive alert is suppressed; incoming replies and next day still work", async () => {
+	const f = fixture();
+	await f.start();
+	for (let i = 0; i < 11; i++) await f.end(`alert ${i}`);
+	expect(f.outgoing.length).toBe(10);
+	await f.updates.get("message:text")?.({ chat: { id: 42 }, message: { text: "question" } });
+	await f.end("answer");
+	expect(f.outgoing.at(-1)?.text).toBe("answer");
+	f.setDate(new Date("2026-10-26T09:00:00Z"));
+	await f.end("new day");
+	expect(f.outgoing.at(-1)?.options.disable_notification).toBe(false);
+	await f.emit("session_shutdown");
+});
+
+test("dangerous tool blocks before startup, on rejection and timeout; matching approval allows it", async () => {
+	const f = fixture();
+	const event = { toolName: "bash", input: { command: "git reset --hard" } };
+	expect(await f.emit("tool_call", event)).toMatchObject({ block: true });
+	await f.start();
+	expect(await f.emit("tool_call", { toolName: "bash", input: { command: "git status" } })).toBeUndefined();
+	for (const verdict of ["no", "timeout", "yes"]) {
+		const result = f.emit("tool_call", event);
+		await Bun.sleep(0);
+		const markup = f.outgoing.at(-1)?.options.reply_markup;
+		const data = markup?.inline_keyboard[0][verdict === "yes" ? 0 : 1].callback_data;
+		if (verdict === "timeout") {
+			for (const timer of f.timers.values()) timer.callback();
+		} else {
+			await f.updates.get("callback_query:data")?.({
+				callbackQuery: { data, message: { message_id: f.outgoing.length, chat: { id: 42 } } },
+				async answerCallbackQuery() {},
+			});
+		}
+		if (verdict === "yes") expect(await result).toBeUndefined();
+		else expect(await result).toMatchObject({ block: true, reason: expect.stringContaining("onay") });
+	}
+	await f.emit("session_shutdown");
+});
+
+test("registered approval tool denies on shutdown and polling cannot start after shutdown", async () => {
+	const f = fixture();
+	await f.start();
+	const result = f.tools.get("telegram_onay")?.execute("id", { text: "continue?" }, undefined, undefined, f.ctx);
+	await Bun.sleep(0);
+	await f.emit("session_shutdown");
+	expect(await result).toMatchObject({ details: { approved: false } });
+	const early = fixture();
+	await early.emit("session_start");
+	await early.emit("session_shutdown");
+	for (const timer of early.timers.values()) void timer.callback();
+	await Bun.sleep(0);
+	expect(early.running()).toBe(false);
+});
