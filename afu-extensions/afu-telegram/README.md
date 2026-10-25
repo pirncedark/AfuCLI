@@ -34,7 +34,8 @@ ayarına ekleme işlemi kullanıcı/koordinatör tarafından ayrıca yapılır.
 - `session_start`: çalışma zamanı zamanlayıcısıyla grammy long-polling başlar.
   Eski, bekleyen güncellemeler atılır. Aynı oturumda ikinci dinleyici başlatılmaz.
 - Yalnız `AFU_CLI_TG_CHAT` mesajları `pi.sendUserMessage(..., {deliverAs: 'followUp'})`
-  üzerinden ajana ulaşır. Fotoğraf/ses ve düzenlenen mesajlar bu sürümde işlenmez.
+  üzerinden ajana ulaşır. Ajan boşsa yeni tur başlatılır; meşgulse `followUp` kullanılır.
+  Fotoğraf ve düzenlenen mesajlar bu sürümde işlenmez.
 - `agent_end`: son asistan mesajının metin blokları gönderilir; düşünce ve
   araç çağrısı blokları gönderilmez. Otomatik devam turlarının ara çıktıları atlanır.
 - Markdown'ın kalın, italik, üstü çizili, kod bloğu, satır içi kod ve HTTP(S)
@@ -62,11 +63,35 @@ ayarına ekleme işlemi kullanıcı/koordinatör tarafından ayrıca yapılır.
   çağırır. Başlatma sırasında kapanırsa sonradan polling açılmaz.
   HTTP zaman aşımı 1,5 saniye, long-polling beklemesi 1 saniyedir.
 
+## Sesli mesajlar (0b + 0c)
+
+İzinli chat'ten gönderilen ses kaydı Telegram `getFile` ile bulunur ve indirilir.
+Dosya `~/.omp/afu-ses` altında geçici olarak kaydedilir; `afu-ses-yerel/ses`
+içindeki `yaziyaDok` konuşmayı metne çevirir. Transkript, metin mesajlarıyla
+aynı yolu kullanır: ajan boşsa yeni tur başlatır, meşgulse `followUp` olarak iletilir.
+
+Son yanıt önce metin olarak gönderilir. Sesli soru için ayrıca `seslendir` ile
+üretilen OGG/Opus dosyası Telegram `sendVoice` üzerinden gönderilir. Otomatik
+devam turları bitene kadar yanıt bekletilir. Seslendirme veya ses gönderimi
+başarısız olursa metin yanıtı korunur ve sonraki mesajlar çalışmaya devam eder.
+İndirilen kayıt işlem bitince, üretilen yanıt dosyası gönderim denemesi bitince silinir.
+
+Yerel ses paketinin Piper, FFmpeg ve Whisper small modelinin kurulu olması gerekir.
+Telegram eklentisi model indirmez; mevcut yerel ses kurulumunu kullanır.
+Testlerde indirme, kayıt dizini, `yaziyaDok` ve `seslendir` bağımlılıkları enjekte edilir.
+
+## Bilinen sınırlar
+
+1. Polling görevinin `finally` bloğu kilidi serbest bırakmaz; polling hata ile
+   biterse aynı süreç yaşadıkça başka oturum botu devralamaz. Oturum kapanışı kilidi bırakır.
+2. Telegram hazırken tehlikeli komut onayı yalnız Telegram'dan verilebilir;
+   bu durumda terminaldeki onay kullanılmaz.
+
 ## Doğrulama
 
 ```powershell
+bun run check
 bun test
-bun check
 ```
 
 Testler sahte API ve kontrollü zamanlayıcılar kullanır; token veya Telegram

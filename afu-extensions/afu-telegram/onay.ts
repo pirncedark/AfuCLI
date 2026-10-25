@@ -10,6 +10,7 @@ import {
 	splitTelegramHtml,
 	telegramChunks,
 } from "./format";
+import { SesMesaj, type SesApi, type SesMesajOptions } from "./ses-mesaj";
 
 export interface SendOptions {
 	parse_mode: "HTML";
@@ -118,7 +119,7 @@ export class Approvals {
 }
 
 export interface TelegramBot {
-	api: ApprovalApi;
+	api: ApprovalApi & SesApi;
 	on: Bot["on"];
 	catch(handler: (error: unknown) => void): void;
 	init(): Promise<void>;
@@ -189,6 +190,7 @@ export function registerTelegram(
 	},
 	now: () => Date = () => new Date(),
 	lockPath: string = path.join(os.homedir(), ".omp", "afu-telegram.lock"),
+	voiceOptions: SesMesajOptions = {},
 ): void {
 	const token = env.AFU_CLI_TG_TOKEN?.trim();
 	const chat = env.AFU_CLI_TG_CHAT?.trim();
@@ -199,8 +201,10 @@ export function registerTelegram(
 	let closed = false;
 	let ready = false;
 	let replyExpected = false;
+	let voiceReplyExpected = false;
 	let starting = false;
 	const lock = new PollingLock(lockPath);
+	const voice = new SesMesaj(voiceOptions);
 	const scheduleFrom =
 		(ctx: ExtensionContext): Schedule =>
 		(callback, milliseconds) => {
@@ -221,13 +225,27 @@ export function registerTelegram(
 			bot = activeBot;
 			approvals = new Approvals(activeBot.api, chat, scheduleFrom(ctx), now);
 			activeBot.catch(() => {});
+			const deliver = (text: string, spoken: boolean) => {
+				if (closed || !text.trim()) return;
+				pi.sendUserMessage(text, ctx.isIdle() ? undefined : { deliverAs: "followUp" });
+				replyExpected = true;
+				voiceReplyExpected ||= spoken;
+			};
 			activeBot.on("message:text", update => {
 				if (closed || String(update.chat.id) !== chat) return;
 				try {
-					pi.sendUserMessage(update.message.text, ctx.isIdle() ? undefined : { deliverAs: "followUp" });
-					replyExpected = true;
+					deliver(update.message.text, false);
 				} catch {
 					/* Runtime may already be shutting down. */
+				}
+			});
+			activeBot.on("message:voice", async update => {
+				if (closed || String(update.chat.id) !== chat) return;
+				try {
+					const text = await voice.transcribe(activeBot.api, token, update.message.voice.file_id);
+					deliver(text, true);
+				} catch {
+					/* A failed download/transcription must not stop polling. */
 				}
 			});
 			activeBot.on("callback_query:data", async update => {
@@ -291,7 +309,9 @@ export function registerTelegram(
 			.join("\n");
 		if (!text.trim()) return;
 		const replying = replyExpected;
+		const spoken = voiceReplyExpected;
 		replyExpected = false;
+		voiceReplyExpected = false;
 		if (!replying) return;
 		for (const chunk of telegramChunks(text)) {
 			if (closed) return;
@@ -299,6 +319,13 @@ export function registerTelegram(
 				await bot.api.sendMessage(chat, chunk, { parse_mode: "HTML", disable_notification: isQuietHour(now()) });
 			} catch {
 				return;
+			}
+		}
+		if (spoken && !closed) {
+			try {
+				await voice.reply(bot.api, chat, text, isQuietHour(now()));
+			} catch {
+				/* The text reply is already delivered; voice is best effort. */
 			}
 		}
 	});

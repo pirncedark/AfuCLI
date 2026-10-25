@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { InputFile } from "grammy";
 import { registerTelegram, type SendOptions, type TelegramBot } from "./onay";
 
 type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
@@ -25,6 +26,7 @@ afterEach(async () => {
 function fixture(
 	env = { AFU_CLI_TG_TOKEN: "test-token", AFU_CLI_TG_CHAT: "42" },
 	lockPath = path.join(os.tmpdir(), `afu-telegram-${crypto.randomUUID()}.lock`),
+	voiceOptions = {},
 ) {
 	const handlers = new Map<string, Handler>();
 	const updates = new Map<string, (ctx: unknown) => unknown>();
@@ -34,6 +36,9 @@ function fixture(
 	const delivery: unknown[] = [];
 	const confirmations: string[] = [];
 	const outgoing: { text: string; options: SendOptions }[] = [];
+	const voices: { chat: string; voice: InputFile; options: { disable_notification: boolean } }[] = [];
+	const files: string[] = [];
+	let voiceFails = false;
 	let timerId = 0;
 	let constructions = 0;
 	let running = false;
@@ -43,6 +48,14 @@ function fixture(
 	const polling = Promise.withResolvers<void>();
 	const bot = {
 		api: {
+			async getFile(id: string) {
+				files.push(id);
+				return { file_path: "voice/test.oga" };
+			},
+			async sendVoice(chat: string, voice: InputFile, options: { disable_notification: boolean }) {
+				if (voiceFails) throw new Error("offline");
+				voices.push({ chat, voice, options });
+			},
 			async sendMessage(_chat: string, text: string, options: SendOptions) {
 				outgoing.push({ text, options });
 				return { message_id: outgoing.length };
@@ -110,6 +123,7 @@ function fixture(
 		env,
 		() => date,
 		lockPath,
+		voiceOptions,
 	);
 	const emit = async (event: string, payload: unknown = {}) => handlers.get(event)?.(payload, ctx);
 	cleanups.push(async () => {
@@ -151,6 +165,9 @@ function fixture(
 		confirmations,
 		lockPath,
 		outgoing,
+		voices,
+		files,
+		failVoice() { voiceFails = true; },
 		updates,
 		emit,
 		start,
@@ -341,4 +358,98 @@ test("registered approval tool denies on shutdown and polling cannot start after
 	for (const timer of early.timers.values()) void timer.callback();
 	await Bun.sleep(0);
 	expect(early.running()).toBe(false);
+});
+
+async function voiceFixture(failSpeech = false) {
+	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "afu-telegram-voice-"));
+	cleanups.push(() => fs.rm(directory, { recursive: true, force: true }));
+	const downloads: string[] = [];
+	const spoken: string[] = [];
+	const f = fixture(undefined, path.join(directory, "poll.lock"), {
+		directory,
+		async download(url: string) {
+			downloads.push(url);
+			return new Uint8Array([79, 103, 103]);
+		},
+		async yaziyaDok(file: string) {
+			expect(path.dirname(file)).toBe(directory);
+			expect(await Bun.file(file).bytes()).toEqual(new Uint8Array([79, 103, 103]));
+			return "Sesli sorum";
+		},
+		async seslendir(text: string) {
+			spoken.push(text);
+			if (failSpeech) throw new Error("Piper unavailable");
+			const file = path.join(directory, "answer.ogg");
+			await Bun.write(file, new Uint8Array([79, 103, 103]));
+			return file;
+		},
+	});
+	await f.start();
+	const receive = async (chat = 42) => {
+		const handler = f.updates.get("message:voice");
+		expect(handler).toBeDefined();
+		await handler?.({ chat: { id: chat }, message: { voice: { file_id: "voice-id" } } });
+	};
+	return { ...f, downloads, spoken, receive };
+}
+
+test("voice transcript uses the same idle and busy delivery as text messages", async () => {
+	const f = await voiceFixture();
+	await f.receive();
+	f.ctx.isIdle = () => false;
+	await f.receive();
+	expect(f.incoming).toEqual(["Sesli sorum", "Sesli sorum"]);
+	expect(f.delivery).toEqual([undefined, { deliverAs: "followUp" }]);
+	expect(f.files).toEqual(["voice-id", "voice-id"]);
+	expect(f.downloads).toEqual(Array(2).fill("https://api.telegram.org/file/bottest-token/voice/test.oga"));
+});
+
+test("voice question receives text and an InputFile voice reply once after the final turn", async () => {
+	const f = await voiceFixture();
+	await f.receive();
+	await f.end("intermediate", { willContinue: true });
+	expect(f.voices).toEqual([]);
+	await f.end("Yanıt");
+	expect(f.outgoing.map(message => message.text)).toEqual(["Yanıt"]);
+	expect(f.spoken).toEqual(["Yanıt"]);
+	expect(f.voices).toEqual([{ chat: "42", voice: expect.any(InputFile), options: { disable_notification: true } }]);
+	await f.updates.get("message:text")?.({ chat: { id: 42 }, message: { text: "text question" } });
+	await f.end("text reply");
+	expect(f.voices.length).toBe(1);
+	expect(f.outgoing.at(-1)?.text).toBe("text reply");
+});
+
+test("speech synthesis failure keeps the text reply and resets voice expectation", async () => {
+	const f = await voiceFixture(true);
+	await f.receive();
+	await f.end("Yanıt");
+	expect(f.outgoing.map(message => message.text)).toEqual(["Yanıt"]);
+	expect(f.voices).toEqual([]);
+	await f.end("unrequested reply");
+	expect(f.spoken).toEqual(["Yanıt"]);
+	expect(f.outgoing.length).toBe(1);
+});
+
+test("sendVoice failure does not reject agent_end or prevent the next text reply", async () => {
+	const f = await voiceFixture();
+	f.failVoice();
+	await f.receive();
+	await f.end("Yanıt");
+	await f.updates.get("message:text")?.({ chat: { id: 42 }, message: { text: "again" } });
+	await f.end("Still working");
+	expect(f.outgoing.map(message => message.text)).toEqual(["Yanıt", "Still working"]);
+	expect(f.spoken).toEqual(["Yanıt"]);
+	expect(f.voices).toEqual([]);
+});
+
+test("unauthorized and post-shutdown voice messages never download or reach the agent", async () => {
+	const f = await voiceFixture();
+	await f.receive(99);
+	await f.emit("session_shutdown");
+	await f.receive();
+	expect(f.files).toEqual([]);
+	expect(f.downloads).toEqual([]);
+	expect(f.incoming).toEqual([]);
+	await f.end("no reply");
+	expect(f.voices).toEqual([]);
 });
