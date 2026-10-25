@@ -3,7 +3,6 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
-const PIPER = "C:\\Program Files\\Python311\\Scripts\\piper.exe";
 const PYTHON = "C:\\Program Files\\Python311\\python.exe";
 const DEFAULT_MODEL = "F:\\afu_buyuk\\piper\\tr_TR-dfki-medium.onnx";
 const DEFAULT_WHISPER_DIR = "F:\\afu_buyuk\\whisper";
@@ -87,111 +86,97 @@ export function sesIcinTemizle(text: string): string {
 		.trim();
 }
 
-/** Produces a persistent OGG/Opus file in AFU_SES_DIR or ~/.omp/afu-ses; the caller owns it. */
-export async function seslendir(
-	text: string,
-	options: SesOptions = {},
-): Promise<string> {
+/** Local playback consumes MP3 (Edge) or PCM WAV (Piper), without transcoding. */
+export async function seslendirWav(text: string, options: SesOptions = {}): Promise<string> {
 	checkCancelled(options.signal);
 	text = sesIcinTemizle(text);
 	if (!text) throw new Error("Seslendirmek için metin yazın.");
-	const model = options.model || process.env.AFU_PIPER_MODEL || DEFAULT_MODEL;
-	if (
-		!(await Bun.file(model).exists()) ||
-		!(await Bun.file(`${model}.json`).exists())
-	) {
-		throw new Error(
-			"Ses modeli eksik, model indirmesinin tamamlanmasını bekleyin.",
-		);
-	}
-	const dir =
-		process.env.AFU_SES_DIR || path.join(os.homedir(), ".omp", "afu-ses");
+	const dir = process.env.AFU_SES_DIR || path.join(os.homedir(), ".omp", "afu-ses");
 	await fs.mkdir(dir, { recursive: true });
 	const base = path.join(dir, `afu-ses-${crypto.randomUUID()}`);
-	const wav = `${base}.wav`;
-	const ogg = `${base}.ogg`;
+	let server: SesServer | undefined;
 	try {
-		// One input line prevents Piper from replacing the WAV for each paragraph.
-		await run(
-			[PIPER, "--model", model, "--output_file", wav],
-			"Ses üretilemedi, Piper kurulumunu ve ses modelini kontrol edin.",
-			options.signal,
-			`${text.replace(/\s+/g, " ").trim()}\n`,
-		);
-		await run(
-			[
-				"ffmpeg",
-				"-nostdin",
-				"-hide_banner",
-				"-loglevel",
-				"error",
-				"-y",
-				"-i",
-				wav,
-				"-c:a",
-				"libopus",
-				"-b:a",
-				"64k",
-				ogg,
-			],
-			"Ses dönüştürülemedi, FFmpeg kurulumunu kontrol edin.",
-			options.signal,
-		);
-		const size = await fs
-			.stat(ogg)
-			.then((stat) => stat.size)
-			.catch(() => 0);
-		if (size === 0) throw new Error("Ses dosyası boş oluştu, yeniden deneyin.");
+		if (!ttsServer) ttsServer = new SesServer("", true);
+		server = ttsServer;
+		const filename = await server.request(base, options.signal, {
+			metin: text, ses: process.env.AFU_TTS_SES || "tr-TR-EmelNeural",
+			model: options.model || process.env.AFU_PIPER_MODEL || DEFAULT_MODEL,
+		});
+		checkCancelled(options.signal);
+		if ((await fs.stat(filename)).size === 0) throw new Error("Ses dosyası boş oluştu, yeniden deneyin.");
+		return filename;
+	} catch (error) {
+		// A terminated worker must finish before its partial output can be removed.
+		if (server?.closed) await server.child.exited.catch(() => {});
+		await Promise.all([".mp3", ".wav"].map(ext => fs.unlink(base + ext).catch(() => {})));
+		checkCancelled(options.signal);
+		throw new Error("Ses üretilemedi, ses modelini ve kurulumu kontrol edin.", { cause: error });
+	}
+}
+
+/** Telegram keeps its OGG/Opus contract, using the same Edge → Piper engine. */
+export async function seslendir(text: string, options: SesOptions = {}): Promise<string> {
+	const source = await seslendirWav(text, options);
+	const ogg = source.replace(/\.(?:wav|mp3)$/u, ".ogg");
+	try {
+		await run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+			"-i", source, "-c:a", "libopus", "-b:a", "64k", ogg],
+			"Ses dönüştürülemedi, FFmpeg kurulumunu kontrol edin.", options.signal);
+		if ((await fs.stat(ogg)).size === 0) throw new Error("Ses dosyası boş oluştu, yeniden deneyin.");
 		return ogg;
 	} catch (error) {
 		await fs.unlink(ogg).catch(() => {});
-		throw error instanceof Error
-			? error
-			: new Error(
-					"Ses kaydedilemedi, klasörün yazılabilir olduğunu kontrol edin.",
-				);
-	} finally {
-		await fs.unlink(wav).catch(() => {});
-	}
+		throw error;
+	} finally { await fs.unlink(source).catch(() => {}); }
 }
+
+let ttsServer: SesServer | undefined;
+
+/** Keep both speech workers alive until session shutdown. */
+export function ttsKapat(): void {
+	ttsServer?.stop(new Error("Ses işlemi kapatıldı, yeniden deneyin."));
+}
+process.once("exit", ttsKapat);
 
 const WHISPER_ERROR = "Ses yazıya dökülemedi, Whisper kurulumunu ve indirilen modelleri kontrol edin.";
 const WHISPER_TIMEOUT = 180_000;
 
 class WhisperProcessError extends Error {}
 
-interface WhisperReply {
+interface SesReply {
 	id: string | null;
 	metin?: string;
 	hata?: string;
 }
 
-interface WhisperPending {
+interface SesPending {
 	resolve(text: string): void;
 	reject(error: Error): void;
 }
 
-let whisperServer: WhisperServer | undefined;
+let whisperServer: SesServer | undefined;
 
-class WhisperServer {
+class SesServer {
 	readonly child: Bun.Subprocess<"pipe", "pipe", "pipe">;
 	readonly ready = Promise.withResolvers<void>();
-	readonly pending = new Map<string, WhisperPending>();
+	readonly pending = new Map<string, SesPending>();
 	readonly dir: string;
 	#closed = false;
 	#startupTimer: Timer;
 
-	constructor(dir: string) {
+	get closed(): boolean { return this.#closed; }
+
+	constructor(dir: string, readonly tts = false) {
 		this.dir = dir;
 		this.child = Bun.spawn([
-			PYTHON, "-B", "-u", path.join(import.meta.dir, "yaziya_dok.py"),
-			"--sunucu", "--model-dir", dir,
+			PYTHON, "-B", "-u", path.join(import.meta.dir, tts ? "tts.py" : "yaziya_dok.py"),
+			...(tts ? [] : ["--sunucu", "--model-dir", dir]),
 		], {
 			cwd: import.meta.dir, stdin: "pipe", stdout: "pipe", stderr: "pipe", windowsHide: true,
 			env: { ...process.env, PYTHONUTF8: "1", PYTHONDONTWRITEBYTECODE: "1",
 				HF_HUB_OFFLINE: "1", HF_HUB_DISABLE_TELEMETRY: "1" },
 		});
-		this.#startupTimer = setTimeout(() => this.stop(new Error(WHISPER_ERROR)), WHISPER_TIMEOUT);
+		this.#startupTimer = setTimeout(() => this.stop(new Error(WHISPER_ERROR)), this.tts ? 30_000 : WHISPER_TIMEOUT);
 		// Handlers are installed immediately, including when every waiting caller aborts.
 		void this.ready.promise.catch(() => {});
 		void this.#read();
@@ -213,7 +198,7 @@ class WhisperServer {
 		try {
 			const decoder = new TextDecoder();
 			for await (const line of readLines(this.child.stdout)) {
-				const reply = JSON.parse(decoder.decode(line)) as WhisperReply;
+				const reply = JSON.parse(decoder.decode(line)) as SesReply;
 				if (reply.id === null && reply.metin === "") {
 					clearTimeout(this.#startupTimer);
 					this.ready.resolve();
@@ -222,7 +207,7 @@ class WhisperServer {
 				}
 				const pending = this.pending.get(reply.id ?? "");
 				if (!pending) continue; // Late reply to a cancelled request.
-				if (typeof reply.hata === "string") pending.reject(new Error(WHISPER_ERROR));
+				if (typeof reply.hata === "string") pending.reject(new Error(this.tts ? "Ses üretilemedi, ses modelini ve kurulumu kontrol edin." : WHISPER_ERROR));
 				else if (typeof reply.metin === "string") pending.resolve(reply.metin);
 				else throw new Error("Invalid Whisper reply");
 			}
@@ -230,7 +215,7 @@ class WhisperServer {
 		this.stop(new WhisperProcessError(WHISPER_ERROR));
 	}
 
-	request(dosya: string, signal?: AbortSignal): Promise<string> {
+	request(dosya: string, signal?: AbortSignal, tts?: { metin: string; ses: string; model: string }): Promise<string> {
 		checkCancelled(signal);
 		if (this.#closed) return Promise.reject(new WhisperProcessError(WHISPER_ERROR));
 		const id = crypto.randomUUID();
@@ -245,8 +230,9 @@ class WhisperServer {
 		const abort = () => {
 			cleanup();
 			result.reject(new Error("Ses işlemi iptal edildi, yeniden deneyin."));
+			if (this.tts) this.stop(new Error("Ses işlemi iptal edildi, yeniden deneyin."));
 		};
-		const timer = setTimeout(() => this.stop(new Error(WHISPER_ERROR)), WHISPER_TIMEOUT);
+		const timer = setTimeout(() => this.stop(new Error(WHISPER_ERROR)), this.tts ? 30_000 : WHISPER_TIMEOUT);
 		this.pending.set(id, {
 			resolve: text => { cleanup(); result.resolve(text); },
 			reject: error => { cleanup(); result.reject(error); },
@@ -256,7 +242,7 @@ class WhisperServer {
 		void this.ready.promise.then(async () => {
 			if (!this.pending.has(id)) return;
 			try {
-				this.child.stdin.write(JSON.stringify({ id, dosya }) + "\n");
+				this.child.stdin.write(JSON.stringify({ id, dosya, ...tts }) + "\n");
 				await this.child.stdin.flush();
 			} catch { this.stop(new WhisperProcessError(WHISPER_ERROR)); }
 		}, error => this.pending.get(id)?.reject(error));
@@ -268,6 +254,7 @@ class WhisperServer {
 		this.#closed = true;
 		clearTimeout(this.#startupTimer);
 		if (whisperServer === this) whisperServer = undefined;
+		if (ttsServer === this) ttsServer = undefined;
 		this.ready.reject(error);
 		for (const pending of this.pending.values()) pending.reject(error);
 		try { this.child.stdin.end(); } catch { /* Already closed. */ }
@@ -276,14 +263,14 @@ class WhisperServer {
 	}
 }
 
-function getWhisper(dir?: string): WhisperServer {
+function getWhisper(dir?: string): SesServer {
 	const resolvedDir = path.resolve(dir || process.env.AFU_WHISPER_DIR || DEFAULT_WHISPER_DIR);
 	if (whisperServer && whisperServer.dir !== resolvedDir) {
 		if (whisperServer.pending.size > 0) throw new Error("Ses işlemi sürüyor, model klasörünü değiştirmeden önce tamamlanmasını bekleyin.");
 		whisperKapat();
 	}
 	if (!whisperServer) {
-		try { whisperServer = new WhisperServer(resolvedDir); }
+		try { whisperServer = new SesServer(resolvedDir); }
 		catch { throw new Error(WHISPER_ERROR); }
 	}
 	return whisperServer;

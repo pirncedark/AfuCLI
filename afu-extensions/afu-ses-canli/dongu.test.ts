@@ -1,8 +1,91 @@
 import { expect, test } from "bun:test";
-import { Dongu, type DonguBaglari, type DonguOrtami } from "./dongu";
+import { CumleAkisi, Dongu, type DonguBaglari, type DonguOrtami } from "./dongu";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ZamanSecenekleri } from "./zaman";
+
+test("cümleler parçalı noktalama ve kod bloklarında metin kaybetmeden ayrılır", () => {
+	const akis = new CumleAkisi();
+	expect(akis.ekle("Merhaba.")).toEqual(["Merhaba."]);
+	expect(akis.ekle(".. Nasılsın? İyi! Kalan")).toEqual(["Nasılsın?", "İyi!"]);
+	expect(akis.bitir()).toEqual(["Kalan"]);
+	const kod = new CumleAkisi();
+	expect(kod.ekle("```ts\nx.y();\n")).toEqual([]);
+	expect(kod.ekle("```\nTamam. Son")).toEqual(["Tamam."]);
+	expect(kod.bitir()).toEqual(["Son"]);
+});
+
+test("ilk cümle agent_end beklemeden çalar, kuyruk bitmeden dinlenmez ve final tekrarlanmaz", async () => {
+	const h = ortam();
+	const ilk = Promise.withResolvers<void>();
+	const oynatma = Promise.withResolvers<void>();
+	const calinan: string[] = [];
+	const uretilen: string[] = [];
+	h.baglar.seslendir = async text => { uretilen.push(text); return text; };
+	h.baglar.cal = async dosya => {
+		calinan.push(dosya);
+		if (calinan.length === 1) { ilk.resolve(); await oynatma.promise; }
+	};
+	h.dongu.baslat();
+	await h.adim();
+	h.dongu.akis("Bir. İki. Kal");
+	expect(uretilen).toEqual(["Bir.", "İki."]);
+	const is = h.adim();
+	await ilk.promise;
+	expect(calinan).toEqual(["Bir."]);
+	h.dongu.cevap("Bir. İki. Kalan");
+	h.dongu.cevap("Bir. İki. Kalan");
+	expect(h.mesajlar).toHaveLength(1);
+	oynatma.resolve();
+	await is;
+	expect(calinan).toEqual(["Bir.", "İki.", "Kalan"]);
+	expect(h.kuyruk).toHaveLength(1);
+	h.dongu.durdur();
+});
+
+test("sentez ters sırada bitse de çalma sırası korunur; iptal bekleyen sesleri temizler", async () => {
+	for (const iptal of [false, true]) {
+		const h = ortam();
+		const bir = Promise.withResolvers<string>();
+		const iki = Promise.withResolvers<string>();
+		h.baglar.seslendir = text => text === "Bir." ? bir.promise : iki.promise;
+		h.dongu.baslat();
+		await h.adim();
+		h.dongu.akis("Bir. İki.");
+		const is = h.adim();
+		iki.resolve("iki.mp3");
+		await Promise.resolve();
+		expect(h.calinan).toEqual([]);
+		if (iptal) h.dongu.durdur();
+		bir.resolve("bir.mp3");
+		await is;
+		expect(h.calinan).toEqual(iptal ? [] : ["bir.mp3", "iki.mp3"]);
+		expect(h.silinen).toContain("bir.mp3");
+		expect(h.silinen).toContain("iki.mp3");
+		expect(h.mesajlar).toHaveLength(1);
+		h.dongu.durdur();
+	}
+});
+
+test("Whisper ısınmadan ilk mikrofon açılmaz; durdurma ısınma sonrasında kaydı engeller", async () => {
+	for (const dur of [false, true]) {
+		const h = ortam();
+		const isit = Promise.withResolvers<void>();
+		const basladi = Promise.withResolvers<void>();
+		const olaylar: string[] = [];
+		h.baglar.whisperIsit = async () => { basladi.resolve(); await isit.promise; olaylar.push("sıcak"); };
+		h.baglar.kaydet = async () => { olaylar.push("mikrofon"); return { dosya: "x.wav", temizle: async () => {} }; };
+		h.dongu.baslat();
+		const is = h.adim();
+		await basladi.promise;
+		expect(olaylar).toEqual([]);
+		if (dur) h.dongu.durdur();
+		isit.resolve();
+		await is;
+		expect(olaylar).toEqual(dur ? ["sıcak"] : ["sıcak", "mikrofon"]);
+		h.dongu.durdur();
+	}
+});
 
 test("dinleme, Whisper, düşünme ve oynatma durumları ses seviyeleriyle sırayla aktarılır", async () => {
 	const h = ortam();
@@ -163,7 +246,8 @@ test("iki konuşma turu ayrı ölçülür; agent beklemesi ve oynatma öncesi ge
 			await h.adim();
 			simdi += 50;
 			h.dongu.cevap("Cevap");
-			simdi += 100; // Existing scheduled TTS delay belongs to total, not synthesis.
+			await Promise.resolve(); // The sentence starts synthesis before the playback callback.
+			simdi += 100; // Scheduling now waits after synthesis, before playback.
 			await h.adim();
 		}
 		const satirlar = (await Bun.file(dosya).text())
@@ -177,7 +261,7 @@ test("iki konuşma turu ayrı ölçülür; agent beklemesi ve oynatma öncesi ge
 				yaziyaDok_ms: 20,
 				sendUserMessage_agent_end_ms: 50,
 				seslendir_ms: 40,
-				calma_basladi_ms: 10,
+				calma_basladi_ms: 110,
 				toplam_sustu_ilk_ses_ms: 1025,
 			})),
 		);

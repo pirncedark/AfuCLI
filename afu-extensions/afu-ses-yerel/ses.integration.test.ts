@@ -2,9 +2,31 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { seslendir, whisperIsit, whisperKapat, yaziyaDok } from "./ses";
+import { seslendir, seslendirWav, ttsKapat, whisperIsit, whisperKapat, yaziyaDok } from "./ses";
 
 const enabled = process.env.AFU_SES_ENTEGRASYON === "1";
+
+test.skipIf(process.env.AFU_EDGE_TTS_ENTEGRASYON !== "1")("gerçek Edge Türkçe MP3 üretir; Piper veya OGG kullanılmaz", async () => {
+	const dir = await fs.mkdtemp(path.join(import.meta.dir, ".edge-test-"));
+	const onceki = process.env.AFU_SES_DIR;
+	process.env.AFU_SES_DIR = dir;
+	try {
+		const baslangic = performance.now();
+		const dosya = await seslendirWav("Merhaba, ben Afu.", { model: path.join(dir, "olmayan.onnx") });
+		expect(path.extname(dosya)).toBe(".mp3");
+		const probe = Bun.spawn(["ffprobe", "-v", "error", "-show_entries", "stream=codec_name", "-of", "json", dosya],
+			{ stdout: "pipe", stderr: "pipe", windowsHide: true });
+		const [stdout, stderr, code] = await Promise.all([new Response(probe.stdout).text(), new Response(probe.stderr).text(), probe.exited]);
+		expect(code, stderr).toBe(0);
+		expect((JSON.parse(stdout) as { streams: { codec_name: string }[] }).streams[0]?.codec_name).toBe("mp3");
+		console.info(`Gerçek Edge + probe: ${(performance.now() - baslangic).toFixed(1)} ms`);
+	} finally {
+		ttsKapat();
+		if (onceki === undefined) delete process.env.AFU_SES_DIR;
+		else process.env.AFU_SES_DIR = onceki;
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 30_000);
 
 test.skipIf(!enabled)(
 	"Merhaba, ben Afu. → Opus → merhaba ve afu; warm transcription <1000 ms",
@@ -38,6 +60,7 @@ test.skipIf(!enabled)(
 			expect(elapsed).toBeLessThan(1000);
 		} finally {
 			whisperKapat();
+			ttsKapat();
 			if (dosya) await fs.unlink(dosya);
 		}
 	},

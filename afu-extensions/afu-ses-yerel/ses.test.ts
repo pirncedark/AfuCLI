@@ -1,9 +1,11 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import * as path from "node:path";
-import { sesIcinTemizle, seslendir, whisperIsit, whisperKapat, yaziyaDok } from "./ses";
+import * as fs from "node:fs/promises";
+import { sesIcinTemizle, seslendir, seslendirWav, ttsKapat, whisperIsit, whisperKapat, yaziyaDok } from "./ses";
 
 afterEach(() => {
 	whisperKapat();
+	ttsKapat();
 });
 
 // Controlled process with real byte streams; works when subprocesses are blocked.
@@ -158,12 +160,71 @@ test("boş metin ses süreci başlatmadan reddedilir", async () => {
 	);
 });
 
-test("eksik Piper modeli Türkçe çözüm mesajıyla bildirilir", async () => {
-	await expect(
-		seslendir("Merhaba", { model: path.join(import.meta.dir, "olmayan.onnx") }),
-	).rejects.toThrow(
-		"Ses modeli eksik, model indirmesinin tamamlanmasını bekleyin.",
-	);
+test("Edge yanıtı eksik Piper modeliyle de yerel MP3 döndürür ve süreç tekrar kullanılır", async () => {
+	const dir = await fs.mkdtemp(path.join(import.meta.dir, ".tts-test-"));
+	const onceki = process.env.AFU_SES_DIR;
+	process.env.AFU_SES_DIR = dir;
+	const output = new TransformStream<Uint8Array, Uint8Array>();
+	const writer = output.writable.getWriter();
+	const encoder = new TextEncoder();
+	const exit = Promise.withResolvers<number>();
+	const requests: Array<{ metin: string; dosya: string; model: string }> = [];
+	let yazim = Promise.resolve();
+	const emit = (reply: object) => writer.write(encoder.encode(JSON.stringify(reply) + "\n"));
+	const converted: string[][] = [];
+	const spy = spyOn(Bun, "spawn").mockImplementation(((command: string[]) => {
+		if (command[0] === "ffmpeg") {
+			converted.push(command);
+			return {
+				stdout: new Blob([]).stream(), stderr: new Blob([]).stream(),
+				exited: Bun.write(command.at(-1)!, "fake opus").then(() => 0),
+			} as unknown as Bun.Subprocess<"pipe", "pipe", "pipe">;
+		}
+		void emit({ id: null, metin: "" });
+		return {
+			stdout: output.readable, stderr: new Blob([]).stream(), exited: exit.promise,
+			stdin: {
+				write(line: string) {
+					const req = JSON.parse(line) as { id: string; metin: string; dosya: string; model: string };
+					requests.push(req);
+					yazim = (async () => {
+						await Bun.write(req.dosya + ".mp3", "fake audio");
+						await emit({ id: req.id, metin: req.dosya + ".mp3" });
+					})();
+				},
+				flush: () => yazim, end() {},
+			},
+			kill() { void writer.close(); exit.resolve(0); }, ref() {}, unref() {},
+		} as unknown as Bun.Subprocess<"pipe", "pipe", "pipe">;
+	}) as typeof Bun.spawn);
+	const files: string[] = [];
+	try {
+		for (const text of ["**Merhaba** `gizli`", "İkinci!"]) {
+			const file = await seslendirWav(text, { model: "olmayan.onnx" });
+			files.push(file);
+			expect(path.extname(file)).toBe(".mp3");
+			expect(await Bun.file(file).text()).toBe("fake audio");
+		}
+		expect(requests.map(req => req.metin)).toEqual(["Merhaba", "İkinci!"]);
+		expect(requests.map(req => req.model)).toEqual(["olmayan.onnx", "olmayan.onnx"]);
+		expect(spy).toHaveBeenCalledTimes(1); // No ffmpeg/Piper child and no reload.
+		const ogg = await seslendir("**Üçüncü** `gizli`", { model: "olmayan.onnx" });
+		files.push(ogg);
+		expect(path.extname(ogg)).toBe(".ogg");
+		expect(await Bun.file(ogg).text()).toBe("fake opus");
+		expect(requests.at(-1)?.metin).toBe("Üçüncü");
+		expect(converted).toHaveLength(1);
+		expect(converted[0]).toContain("libopus");
+		expect(await Bun.file(requests.at(-1)!.dosya + ".mp3").exists()).toBe(false);
+		expect(spy).toHaveBeenCalledTimes(2); // Same TTS worker plus one OGG conversion.
+	} finally {
+		ttsKapat();
+		spy.mockRestore();
+		for (const file of files) await Bun.file(file).delete();
+		if (onceki === undefined) delete process.env.AFU_SES_DIR;
+		else process.env.AFU_SES_DIR = onceki;
+		await fs.rm(dir, { recursive: true, force: true });
+	}
 });
 
 test("olmayan ses dosyası Python başlatılmadan reddedilir", async () => {

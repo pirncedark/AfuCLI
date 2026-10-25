@@ -14,6 +14,30 @@ function baglar(): DonguBaglari {
 	};
 }
 
+test("message_update yalnız metni cümle cümle okur; message_start sonrası final aynı cevabı tekrarlamaz", async () => {
+	const b = baglar();
+	const sesler: string[] = [];
+	b.seslendir = async text => { sesler.push(text); return "cevap.mp3"; };
+	const h = sahtePi(b);
+	await h.komut();
+	await h.adim();
+	const delta = (text: string, type = "text_delta") => h.olay("message_update", {
+		message: { role: "assistant" }, assistantMessageEvent: { type, delta: text },
+	});
+	h.olay("message_start", { message: { role: "assistant" } });
+	delta("Gizli.", "thinking_delta");
+	delta("Bir. İki");
+	await h.adim();
+	expect(sesler).toEqual(["Bir."]);
+	h.olay("agent_end", { willContinue: true, messages: [] });
+	h.olay("message_start", { message: { role: "assistant" } });
+	delta("Son. Kalan");
+	h.olay("agent_end", { messages: [{ role: "assistant", content: [{ type: "text", text: "Son. Kalan" }] }] });
+	await h.adim();
+	expect(sesler).toEqual(["Bir.", "İki", "Son.", "Kalan"]);
+	await h.komut("dur");
+});
+
 test("komut zamanlayıcıyla başlar; otomatik devam olayı atlanır ve yalnız son cevap seslenir", async () => {
 	const b = baglar();
 	const sesler: string[] = [];

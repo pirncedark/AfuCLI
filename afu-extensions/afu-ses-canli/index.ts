@@ -3,6 +3,7 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import rehber from "./README.md" with { type: "text" };
 import { SesPaneli } from "./panel";
+import { whisperKapat, ttsKapat } from "../afu-ses-yerel/ses";
 import { kayitAyarlari } from "./kayit";
 import { Dongu, type DonguBaglari } from "./dongu";
 
@@ -167,7 +168,17 @@ export default function afuSesCanli(
 		if (yonerge) return { systemPrompt: [...event.systemPrompt, yonerge] };
 	});
 
-	pi.on("agent_end", (event) => {
+	pi.on("message_start", (event, context) => {
+		if (context.agent.kind === "main" && event.message.role === "assistant") dongu.mesajBaslat();
+	});
+
+	pi.on("message_update", (event, context) => {
+		if (context.agent.kind !== "main" || event.message.role !== "assistant") return;
+		if (event.assistantMessageEvent.type === "text_delta") dongu.akis(event.assistantMessageEvent.delta);
+	});
+
+	pi.on("agent_end", (event, context) => {
+		if (context.agent.kind !== "main") return;
 		if (event.willContinue) return;
 		const son = event.messages.findLast(
 			(message) => message.role === "assistant",
@@ -195,6 +206,8 @@ export default function afuSesCanli(
 
 	pi.on("session_shutdown", async () => {
 		dongu.durdur();
+		whisperKapat();
+		ttsKapat();
 		girisiBirak?.();
 		girisiBirak = undefined;
 		panel = undefined;

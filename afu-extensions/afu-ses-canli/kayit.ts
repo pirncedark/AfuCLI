@@ -99,6 +99,8 @@ interface KayitSecenekleri {
 }
 
 export interface CalSecenekleri {
+	/** Queue owner applies the echo tail once after the final sentence. */
+	kuyruk?: boolean;
 	basladi?(): void | Promise<ZamanSatiri | void>;
 	micSeviye?: SeviyeBildir;
 	sozKesildi?(): void;
@@ -445,7 +447,7 @@ export async function cal(
 		signal.throwIfAborted();
 		if (dinlenen.status === "rejected") throw dinlenen.reason;
 		if (calinan.status === "rejected") throw calinan.reason;
-		if (!sozKesme) {
+		if (!sozKesme && !options?.kuyruk) {
 			await Bun.sleep(350);
 			signal.throwIfAborted();
 		}
