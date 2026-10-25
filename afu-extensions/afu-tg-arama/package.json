@@ -1,0 +1,13 @@
+{
+  "name": "afu-tg-arama",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "AfuCLI ikinci numara ile Telegram sesli arama",
+  "scripts": {
+    "test": "bun test",
+    "check": "tsgo --noEmit --ignoreConfig --skipLibCheck --strict --target esnext --lib esnext,dom.asynciterable --module preserve --moduleResolution bundler --resolveJsonModule --allowArbitraryExtensions --types bun ../../types/assets/index.d.ts index.ts arama-sureci.ts index.test.ts python.test.ts"
+  },
+  "peerDependencies": { "@oh-my-pi/pi-coding-agent": "*" },
+  "omp": { "extensions": ["./index.ts"] }
+}
