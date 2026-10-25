@@ -42,7 +42,7 @@ def halusinasyon_suz(text: str) -> str:
 def yaziya_dok(model, audio) -> str:
     segments, _ = model.transcribe(
         audio, language="tr", beam_size=1, vad_filter=True,
-        condition_on_previous_text=False, no_speech_threshold=0.6,
+        condition_on_previous_text=False, no_speech_threshold=0.6, initial_prompt="Afu",
     )
     return halusinasyon_suz(" ".join(
         segment.text.strip() for segment in segments if segment.no_speech_prob <= 0.6

@@ -49,14 +49,13 @@ test.skipIf(!enabled)(
 			expect(info.streams[0]?.codec_name).toBe("opus");
 			const first = await yaziyaDok(dosya);
 			expect(first.toLocaleLowerCase("tr-TR")).toContain("merhaba");
-			// Piper tr_TR-dfki "Afu"yu "Afo"ya yakın okuyor; ad sesi TTS kaynaklı, Whisper değil.
-			expect(first.toLocaleLowerCase("tr-TR")).toMatch(/af[uo]/);
+			expect(first.toLocaleLowerCase("tr-TR")).toContain("afu");
 			const start = performance.now();
 			const second = await yaziyaDok(dosya);
 			const elapsed = performance.now() - start;
 			console.info(`Whisper ikinci çağrı: ${elapsed.toFixed(1)} ms; metin: ${second}`);
 			expect(second.toLocaleLowerCase("tr-TR")).toContain("merhaba");
-			expect(second.toLocaleLowerCase("tr-TR")).toMatch(/af[uo]/);
+			expect(second.toLocaleLowerCase("tr-TR")).toContain("afu");
 			expect(elapsed).toBeLessThan(1000);
 		} finally {
 			whisperKapat();

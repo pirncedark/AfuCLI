@@ -258,6 +258,14 @@ class SesServer {
 		this.ready.reject(error);
 		for (const pending of this.pending.values()) pending.reject(error);
 		try { this.child.stdin.end(); } catch { /* Already closed. */ }
+		// Kill the whole tree on Windows so no orphan python/edge-tts worker survives.
+		if (process.platform === "win32" && this.child.pid) {
+			try {
+				Bun.spawnSync(["taskkill", "/PID", String(this.child.pid), "/T", "/F"], {
+					stdout: "ignore", stderr: "ignore", timeout: 2_000,
+				});
+			} catch { /* Fall back to kill() below. */ }
+		}
 		this.child.kill();
 		this.child.unref();
 	}
