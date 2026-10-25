@@ -32,6 +32,10 @@ test.skipIf(!ready)(
 		const dosya = await seslendir("Merhaba, ben Afu.");
 		try {
 			expect(path.extname(dosya)).toBe(".ogg");
+			const relativePath = path.relative(import.meta.dir, dosya);
+			expect(
+				relativePath === ".." || relativePath.startsWith(`..${path.sep}`) || path.isAbsolute(relativePath),
+			).toBe(true);
 			expect((await fs.stat(dosya)).size).toBeGreaterThan(0);
 			const probe = Bun.spawn(
 				["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_name", "-of", "json", dosya],

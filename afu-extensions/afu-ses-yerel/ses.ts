@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 
 const PIPER = "C:\\Program Files\\Python311\\Scripts\\piper.exe";
@@ -18,6 +19,7 @@ function checkCancelled(signal?: AbortSignal): void {
 
 async function run(command: string[], message: string, signal?: AbortSignal, input?: string): Promise<string> {
 	checkCancelled(signal);
+	let stderr = "";
 	try {
 		const child = Bun.spawn(command, {
 			cwd: import.meta.dir,
@@ -36,21 +38,22 @@ async function run(command: string[], message: string, signal?: AbortSignal, inp
 				HF_HUB_DISABLE_TELEMETRY: "1",
 			},
 		});
-		const [stdout, , code] = await Promise.all([
+		const [stdout, errorOutput, code] = await Promise.all([
 			new Response(child.stdout).text(),
 			new Response(child.stderr).text(),
 			child.exited,
 		]);
+		stderr = errorOutput;
 		checkCancelled(signal);
 		if (code !== 0) throw new Error(message);
 		return stdout.trim();
 	} catch {
 		checkCancelled(signal);
-		throw new Error(message);
+		throw new Error(message, { cause: stderr.slice(0, 500) });
 	}
 }
 
-/** Produces a persistent OGG/Opus file next to this extension; the caller owns it. */
+/** Produces a persistent OGG/Opus file in AFU_SES_DIR or ~/.omp/afu-ses; the caller owns it. */
 export async function seslendir(text: string, options: SesOptions = {}): Promise<string> {
 	checkCancelled(options.signal);
 	if (!text.trim()) throw new Error("Seslendirmek için metin yazın.");
@@ -58,7 +61,9 @@ export async function seslendir(text: string, options: SesOptions = {}): Promise
 	if (!(await Bun.file(model).exists()) || !(await Bun.file(`${model}.json`).exists())) {
 		throw new Error("Ses modeli eksik, model indirmesinin tamamlanmasını bekleyin.");
 	}
-	const base = path.join(import.meta.dir, `afu-ses-${crypto.randomUUID()}`);
+	const dir = process.env.AFU_SES_DIR || path.join(os.homedir(), ".omp", "afu-ses");
+	await fs.mkdir(dir, { recursive: true });
+	const base = path.join(dir, `afu-ses-${crypto.randomUUID()}`);
 	const wav = `${base}.wav`;
 	const ogg = `${base}.ogg`;
 	try {
