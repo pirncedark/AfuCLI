@@ -1,7 +1,9 @@
 import * as fs from "node:fs/promises";
+import { logger } from "@oh-my-pi/pi-utils";
 import { seslendir, yaziyaDok } from "../afu-ses-yerel/ses";
 import type { SesDurumu, SesKanali } from "./panel";
 import { cal, kaydet, sesSureci, type CalSecenekleri, type Kayit, type SeviyeBildir } from "./kayit";
+import { zamanBaslat, type TurZamani, type ZamanSecenekleri } from "./zaman";
 
 export interface DonguBaglari {
 	kaydet(signal: AbortSignal, options?: { seviye?: SeviyeBildir }): Promise<Kayit>;
@@ -29,6 +31,7 @@ const yerel: DonguBaglari = {
 };
 
 interface Tur {
+	olcum?: TurZamani;
 	iptal: AbortController;
 	zamanlayici?: () => void;
 }
@@ -37,11 +40,13 @@ interface Tur {
 export class Dongu {
 	#tur?: Tur;
 	#beklenen?: Tur;
+	#turSayisi = 0;
 
 	constructor(
 		readonly gonder: (text: string) => void,
 		readonly ortam: DonguOrtami,
 		readonly baglar: DonguBaglari = yerel,
+		readonly zaman: ZamanSecenekleri = {},
 	) {}
 
 	get aktif(): boolean {
@@ -72,15 +77,21 @@ export class Dongu {
 		const tur = this.#beklenen;
 		this.#beklenen = undefined;
 		if (!tur || !this.#guncel(tur)) return;
+		tur.olcum?.bitir("agent");
 		this.#zamanla(tur, async () => {
 			if (text.trim()) {
+				tur.olcum?.basla("seslendir");
 				const dosya = await this.baglar.seslendir(text, {
 					signal: tur.iptal.signal,
 				});
+				tur.olcum?.bitir("seslendir");
 				try {
 					if (this.#guncel(tur)) {
 						this.ortam.durum?.("Konuşuyor");
 						const kayit = await this.baglar.cal(dosya, tur.iptal.signal, this.#seviye(tur, "afu"), {
+							...(tur.olcum ? { basladi: () => {
+								return tur.olcum?.calmaBasladi().catch(error => logger.warn("Ses zaman kaydı yazılamadı", { error }));
+							} } : {}),
 							micSeviye: this.#seviye(tur),
 							sozKesildi: () => {
 								if (this.#guncel(tur)) this.ortam.durum?.("Dinliyorum");
@@ -140,8 +151,11 @@ export class Dongu {
 		let text: string;
 		try {
 			if (!this.#guncel(tur)) return;
+			tur.olcum = zamanBaslat(++this.#turSayisi, this.zaman, kayit.zaman);
 			this.ortam.durum?.("Anlıyorum");
+			tur.olcum?.basla("yaziyaDok");
 			text = (await this.baglar.yaziyaDok(kayit.dosya, { signal: tur.iptal.signal })).trim();
+			tur.olcum?.bitir("yaziyaDok");
 		} finally {
 			await kayit.temizle();
 		}
@@ -168,6 +182,7 @@ export class Dongu {
 		this.ortam.durum?.("Düşünüyorum");
 		this.#beklenen = tur;
 		try {
+			tur.olcum?.basla("agent");
 			this.gonder(text);
 		} catch (error) {
 			this.#beklenen = undefined;

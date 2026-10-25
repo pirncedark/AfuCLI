@@ -59,6 +59,38 @@ async function calmaSenaryosu(son: "bitti" | "iptal" | "mikrofon-hatasi") {
 }
 
 test("normal oynatma bitince bekleyen mikrofon iptal edilir, kısmi kayıt silinir", () => calmaSenaryosu("bitti"));
+
+test("kayıt ölçümü sessizlik beklemesini içerir ve EOF silence_end konuşma sonunu silmez", async () => {
+	const klasor = await fs.mkdtemp(path.join(import.meta.dir, ".kayit-zaman-"));
+	let simdi = 1000;
+	const surec: SesSureci = async (args, _signal, _timeout, satir) => {
+		await Bun.write(args.at(-1)!, "wav");
+		satir?.("silence_end: 1");
+		satir?.("silence_start: 2");
+		simdi += 50;
+		satir?.("silence_end: 2.85 | silence_duration: 0.85");
+		return { kod: 0, hata: "" };
+	};
+	try {
+		const kayit = await kaydet(new AbortController().signal, { mikrofon: "Test", klasor, surec, saat: () => simdi });
+		expect(kayit.zaman).toEqual({ konusmaBitti: 200, kayitKapandi: 1050 });
+		await kayit.temizle();
+	} finally { await fs.rm(klasor, { recursive: true, force: true }); }
+});
+
+test("oynatma başlangıcı zarf analizi bittikten sonra ve ses bitmeden bildirilir", async () => {
+	const olaylar: string[] = [];
+	const surec: SesSureci = async (args, _signal, _timeout, _satir, basladi) => {
+		if (args[0] === "ffmpeg") olaylar.push("analiz");
+		else {
+			basladi?.();
+			olaylar.push("oynatma-bitti");
+		}
+		return { kod: 0, hata: "" };
+	};
+	await cal("cevap.wav", new AbortController().signal, () => {}, surec, undefined, () => { olaylar.push("ilk-ses-gostergesi"); });
+	expect(olaylar).toEqual(["analiz", "ilk-ses-gostergesi", "oynatma-bitti"]);
+});
 test("oynatırken Esc/shutdown sinyali iki süreci de kapatır ve kısmi kaydı siler", () => calmaSenaryosu("iptal"));
 test("oynatırken mikrofon hatası FFplay'i de durdurur ve kısmi kaydı siler", () => calmaSenaryosu("mikrofon-hatasi"));
 

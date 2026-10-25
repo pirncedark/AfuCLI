@@ -1,5 +1,8 @@
 import { expect, test } from "bun:test";
 import { Dongu, type DonguBaglari, type DonguOrtami } from "./dongu";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import type { ZamanSecenekleri } from "./zaman";
 
 test("dinleme, Whisper, düşünme ve oynatma durumları ses seviyeleriyle sırayla aktarılır", async () => {
 	const h = ortam();
@@ -26,7 +29,7 @@ test("dinleme, Whisper, düşünme ve oynatma durumları ses seviyeleriyle sıra
 	expect(seviyeler).toEqual([0.7, 0.3]);
 });
 
-function ortam() {
+function ortam(zaman: ZamanSecenekleri = {}) {
 	const kuyruk: Array<() => Promise<void>> = [];
 	const mesajlar: string[] = [];
 	const sesler: string[] = [];
@@ -77,6 +80,7 @@ function ortam() {
 		},
 		ctx,
 		baglar,
+		zaman,
 	);
 	return {
 		dongu,
@@ -120,6 +124,51 @@ test("kayıt yazıya gönderilir, yalnız beklenen son cevap çalınır ve ardı
 	expect(h.mesajlar).toEqual(["Merhaba Afu", "Merhaba Afu"]);
 	h.dongu.durdur();
 	expect(h.kuyruk).toHaveLength(0);
+});
+
+test("iki konuşma turu ayrı ölçülür; agent beklemesi ve oynatma öncesi gecikme kayda katılır", async () => {
+	const klasor = await fs.mkdtemp(path.join(import.meta.dir, ".dongu-zaman-"));
+	const dosya = path.join(klasor, "zaman.log");
+	let simdi = 1000;
+	const h = ortam({ env: { AFU_SES_ZAMAN: "1" }, dosya, saat: () => simdi });
+	h.baglar.kaydet = async () => ({ dosya: "test.wav", zaman: { konusmaBitti: simdi - 800, kayitKapandi: simdi }, temizle: async () => { simdi += 5; } });
+	h.baglar.yaziyaDok = async () => { simdi += 20; return "Soru"; };
+	h.baglar.seslendir = async () => { simdi += 40; return "cevap.ogg"; };
+	h.baglar.cal = async (_dosya, _signal, _seviye, options) => {
+		simdi += 10;
+		await options?.basladi?.();
+		simdi += 500; // Playback duration must not inflate first-sound latency.
+	};
+	try {
+		h.dongu.baslat();
+		for (let i = 0; i < 2; i++) {
+			await h.adim();
+			simdi += 50;
+			h.dongu.cevap("Cevap");
+			simdi += 100; // Existing scheduled TTS delay belongs to total, not synthesis.
+			await h.adim();
+		}
+		const satirlar = (await Bun.file(dosya).text()).trim().split("\n").map(satir => JSON.parse(satir));
+		expect(satirlar).toEqual([1, 2].map(tur => ({ tur, konusma_bitti_kayit_kapandi_ms: 800, yaziyaDok_ms: 20, sendUserMessage_agent_end_ms: 50, seslendir_ms: 40, calma_basladi_ms: 10, toplam_sustu_ilk_ses_ms: 1025 })));
+	} finally {
+		h.dongu.durdur();
+		await fs.rm(klasor, { recursive: true, force: true });
+	}
+});
+
+test("ölçüm kapalıyken tam konuşma turu log veya saat okuması üretmez", async () => {
+	const dosya = path.join(import.meta.dir, `.dongu-kapali-${crypto.randomUUID()}.log`);
+	let saatOkuma = 0;
+	const h = ortam({ env: {}, dosya, saat: () => ++saatOkuma });
+	let baslamaBildirildi = false;
+	h.baglar.cal = async (_dosya, _signal, _seviye, options) => { baslamaBildirildi = options?.basladi !== undefined; };
+	try {
+		h.dongu.baslat(); await h.adim();
+		h.dongu.cevap("Cevap"); await h.adim();
+		expect(saatOkuma).toBe(0);
+		expect(baslamaBildirildi).toBe(false);
+		expect(await Bun.file(dosya).exists()).toBe(false);
+	} finally { h.dongu.durdur(); }
 });
 
 test("söz kesince eldeki kayıt yazıya dökülür, yeni mikrofon açılmaz ve panel kaldırılmaz", async () => {

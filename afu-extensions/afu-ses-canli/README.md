@@ -67,7 +67,64 @@ Agent meşgulse dinleme ertelenir; `willContinue` olayları seslendirilmez.
 Durdurulmuş sorunun cevabı gelmeden yeniden başlatma bekletilir. Alt ajanlar
 mikrofon açmaz. Model hatası veya iptali de döngüyü ve paneli durdurur.
 
-## Doğrulama
+## Aşama süresi ölçümü
+
+`AFU_SES_ZAMAN=1` ile `/konus` çalıştırıldığında oynatma başlangıcına ulaşan
+her konuşma turu için `~/.omp/afu-ses/zaman.log` dosyasına tek JSON satırı
+eklenir. Değişken yoksa (veya `1` değilse) ölçüm saati okunmaz, ölçüm dosyası
+açılmaz, ölçüm zamanlayıcısı veya süreci oluşturulmaz. Ses akışındaki mevcut
+beklemeler, kayıt ayarları ve söz kesme davranışı korunur.
+
+Log yolu `AFU_SES_ZAMAN_LOG` ile; test/SDK kullanımında `Dongu` dördüncü
+parametresindeki `{ dosya, saat, env }` ile enjekte edilebilir.
+`tur`, aynı `Dongu` nesnesinde işlenen kayıtların artan numarasıdır.
+Boş/durduran konuşma, iptal veya ses başlamadan hata olursa tamamlanmış
+gecikme satırı oluşmaz; tur numaralarında boşluk olabilir.
+
+| JSON alanı | Ölçülen aralık (ms) |
+| --- | --- |
+| `konusma_bitti_kayit_kapandi_ms` | Konuşma sonu tahmini → kayıt sürecinin kapanması |
+| `yaziyaDok_ms` | Gerçek Whisper çağrısının başlangıcı → sonucu |
+| `sendUserMessage_agent_end_ms` | Mesaj gönderimi → son `agent_end` cevabının alınması |
+| `seslendir_ms` | Gerçek Piper/Opus çağrısının başlangıcı → dosyanın hazır olması |
+| `calma_basladi_ms` | Ses dosyasının hazır olması → FFplay sürecinin başlatılması |
+| `toplam_sustu_ilk_ses_ms` | Konuşma sonu tahmini → FFplay sürecinin başlatılması |
+
+Konuşma sonu, FFmpeg `silence_start` bildiriminin alınma saatinden yapılandırılmış
+sessizlik süresi çıkarılarak tahmin edilir; süreç/boru tampon gecikmesi ölçüme
+dahil olabilir. Sessizlik bildirimi gelmeden süre sınırı dolarsa başlangıç
+olarak kayıt kapanışı kullanılır (ilk alan `0`). Söz kesmede kayıt kapanışı,
+kırpma işleminden önce alınır; kırpma gecikmesi toplam süreye dahildir.
+
+**İlk ses göstergesi FFplay sürecinin başlatılmasıdır.** Ses kartından gerçekten
+duyulan ilk örnek ölçülmez; FFplay açılışı, tamponlama veya ses aygıtı hatası
+bu göstergeden sonra olabilir. Zarf analizi ve mevcut 100 ms planlama beklemesi
+toplam süreye dahildir; çalmanın tamamlanması beklenmez. Log yazımı ses akışını
+bekletmez; yazma hatası merkezi uygulama günlüğüne bildirilir.
+
+### Hazır WAV ile tek tur
+
+```powershell
+cd afu-extensions/afu-ses-canli
+bun olc.ts
+bun olc.ts hazir.wav
+bun olc.ts hazir.wav --cal
+```
+
+Betik ölçümü kendisi açar. Argüman yoksa gerçek
+`seslendir("Merhaba ben Afu, bugün hava nasıl?")` sonucunu mono 16 kHz WAV'a
+dönüştürür. Gerçek `yaziyaDok` ve gerçek cevap seslendirmesi kullanılır;
+agent cevabı sabittir: “Bugün hava güzel, dışarı çıkabilirsin.” Mikrofon açılmaz.
+Varsayılan çalıştırma sesi çalmaz, başlangıcı taklit eder; `--cal` gerçekten
+FFplay çalıştırır. Hazır WAV'da konuşma sonu/kayıt kapanışı başlangıç kabul edilir,
+ilk alan `0` olur. Kaynak üretimi toplam gecikmeye katılmaz.
+
+Tek turun aynı JSON satırı stdout'a ve loga yazılır. Geçici sesler eklenti
+klasöründe oluşturulur ve sonunda silinir; argümanla verilen WAV silinmez.
+Log varsayılan olarak `~/.omp/afu-ses/zaman.log` yolundadır. Yalnız bu klasöre
+yazılacak ölçüm için önce `$env:AFU_SES_ZAMAN_LOG = "$PWD/zaman.log"` ayarlayın.
+
+## Doğrulama komutları
 
 ```powershell
 cd afu-extensions/afu-ses-canli
@@ -85,8 +142,15 @@ hoparlör bu çalışma sırasında denenmedi.
 
 ```text
 bun run check: exit 0
-bun test: 31 pass, 1 skip, 0 fail
+bun test: 37 pass, 1 skip, 0 fail
+olc.ts + zaman.test.ts ek tip kontrolü: exit 0
+bun olc.ts: exit 1
+Ses üretilemedi, Piper kurulumunu ve ses modelini kontrol edin.
 ```
+
+Ölçüm betiği bu oturumda gerçek süre JSON'u üretemedi. Hata mesajı EPERM
+kodunu dışarı aktarmadığından nedenin sandbox olduğu doğrulanmadı. Gerçek
+ölçümü ses araçlarına erişebilen Claude oturumunda `bun olc.ts` ile çalıştırın.
 
 Elle kontrol (2 dakika): `/konus` → soru sor → cevap sürerken yeni soru sor →
 sesin kesilip yeni sorunun işlendiğini kontrol et → sonraki turda “dur” de →

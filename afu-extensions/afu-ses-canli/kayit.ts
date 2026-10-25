@@ -2,9 +2,11 @@ import { readLines } from "@oh-my-pi/pi-utils/stream";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { KayitZamani, ZamanSatiri } from "./zaman";
 
 export interface Kayit {
 	dosya: string;
+	zaman?: KayitZamani;
 	temizle(): Promise<void>;
 }
 export interface SurecSonucu {
@@ -16,10 +18,11 @@ export type SesSureci = (
 	signal: AbortSignal,
 	timeoutMs: number,
 	satirOku?: (satir: string) => false | "dur" | void,
+	basladi?: () => void,
 ) => Promise<SurecSonucu>;
 
 /** Bounded, hidden subprocess; abort terminates capture/playback without a new window. */
-export const sesSureci: SesSureci = async (args, signal, timeoutMs, satirOku) => {
+export const sesSureci: SesSureci = async (args, signal, timeoutMs, satirOku, basladi) => {
 	signal.throwIfAborted();
 	const child = Bun.spawn(args, {
 		stdin: "pipe",
@@ -29,6 +32,7 @@ export const sesSureci: SesSureci = async (args, signal, timeoutMs, satirOku) =>
 		signal,
 		timeout: timeoutMs,
 	});
+	basladi?.();
 	const oku = async (): Promise<string> => {
 		const decoder = new TextDecoder();
 		let hata = "";
@@ -75,6 +79,7 @@ export function mikrofonSec(liste: string): string {
 
 export type SeviyeBildir = (seviye: number) => void;
 interface KayitSecenekleri {
+	saat?: () => number;
 	mikrofon?: string;
 	klasor?: string;
 	surec?: SesSureci;
@@ -83,6 +88,7 @@ interface KayitSecenekleri {
 }
 
 export interface CalSecenekleri {
+	basladi?(): void | Promise<ZamanSatiri | void>;
 	micSeviye?: SeviyeBildir;
 	sozKesildi?(): void;
 	kayit?: Omit<KayitSecenekleri, "sozKesme" | "seviye" | "surec">;
@@ -148,6 +154,9 @@ export async function kaydet(signal: AbortSignal, options: KayitSecenekleri = {}
 	let sozBaslangici: number | undefined;
 	const esik = options.sozKesme?.db ?? sozKesmeEsigi();
 	const ust = options.sozKesme ? 180 + ayar.ust : ayar.ust;
+	const saat = options.saat ?? (process.env.AFU_SES_ZAMAN === "1" ? () => performance.now() : undefined);
+	let konusmaBitti: number | undefined;
+	let kayitZamani: KayitZamani | undefined;
 	try {
 		const sonuc = await surec(
 			[
@@ -176,6 +185,10 @@ export async function kaydet(signal: AbortSignal, options: KayitSecenekleri = {}
 			signal,
 			(ust + 5) * 1000,
 			satir => {
+				if (saat) {
+					// FFmpeg emits silence_end again at EOF; retain the detected speech end.
+					if (satir.includes("silence_start:")) konusmaBitti = saat() - ayar.sessizlik * 1000;
+				}
 				const pts = /pts_time:([\d.]+)/u.exec(satir);
 				if (pts) zaman = Number(pts[1]);
 				const seviye = rmsSeviye(satir);
@@ -188,6 +201,7 @@ export async function kaydet(signal: AbortSignal, options: KayitSecenekleri = {}
 							yuksekBaslangic ??= zaman;
 							if (zaman - yuksekBaslangic >= 0.3 - 1e-6) {
 								sozBaslangici = Math.max(0, yuksekBaslangic - 0.1);
+								konusmaBitti = undefined;
 								options.sozKesme.basladi();
 							}
 						} else yuksekBaslangic = undefined;
@@ -199,6 +213,10 @@ export async function kaydet(signal: AbortSignal, options: KayitSecenekleri = {}
 				return undefined;
 			},
 		);
+		if (saat) {
+			const kapandi = saat();
+			kayitZamani = { konusmaBitti: konusmaBitti ?? kapandi, kayitKapandi: kapandi };
+		}
 		signal.throwIfAborted();
 		if (sonuc.kod !== 0 || (await fs.stat(dosya)).size === 0) {
 			throw new Error("Mikrofon kaydedilemedi, mikrofon iznini ve FFmpeg kurulumunu kontrol edin.");
@@ -229,9 +247,9 @@ export async function kaydet(signal: AbortSignal, options: KayitSecenekleri = {}
 			if (kirp.kod !== 0 || (await fs.stat(kirpilmis)).size === 0)
 				throw new Error("Konuşma hazırlanamadı, /konus ile tekrar deneyin.");
 			await fs.rm(dosya, { force: true });
-			return { dosya: kirpilmis, temizle };
+			return { dosya: kirpilmis, temizle, ...(kayitZamani ? { zaman: kayitZamani } : {}) };
 		}
-		return { dosya, temizle };
+		return { dosya, temizle, ...(kayitZamani ? { zaman: kayitZamani } : {}) };
 	} catch (error) {
 		await temizle();
 		throw error;
@@ -244,6 +262,7 @@ export async function cal(
 	seviye?: SeviyeBildir,
 	surec: SesSureci = sesSureci,
 	options?: CalSecenekleri,
+	basladi?: () => void,
 ): Promise<Kayit | void> {
 	const zarf: Array<{ zaman: number; seviye: number }> = [];
 	let zaman = 0;
@@ -323,6 +342,8 @@ export async function cal(
 					["ffplay", "-nodisp", "-autoexit", "-loglevel", "error", dosya],
 					oynatma.signal,
 					180_000,
+					undefined,
+					basladi ?? options?.basladi,
 				);
 				if (sonuc.kod !== 0) throw new Error("Ses çalınamadı, hoparlörü ve FFplay kurulumunu kontrol edin.");
 			} catch (error) {
